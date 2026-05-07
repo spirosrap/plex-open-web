@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plex Open Web</title>
+    <link rel="stylesheet" href="/styles.css?v=8" />
+  </head>
+  <body>
+    <main id="login" class="login-shell" hidden>
+      <form id="login-form" class="login-panel">
+        <div class="brand-mark">POW</div>
+        <h1>Plex Open Web</h1>
+        <label for="password">Password</label>
+        <div class="login-row">
+          <input id="password" name="password" type="password" autocomplete="current-password" autofocus />
+          <button type="submit">Sign in</button>
+        </div>
+        <p id="login-error" class="error-text" aria-live="polite"></p>
+      </form>
+    </main>
+
+    <main id="app" class="app-shell" hidden>
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">POW</div>
+          <div>
+            <strong>Plex Open Web</strong>
+            <span id="server-name">Media server</span>
+          </div>
+        </div>
+        <nav id="libraries" class="library-list" aria-label="Libraries"></nav>
+        <button id="logout" class="ghost-button">Sign out</button>
+      </aside>
+
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <div id="breadcrumbs" class="breadcrumbs"></div>
+            <h1 id="view-title">Library</h1>
+          </div>
+          <form id="search-form" class="search">
+            <input id="search-input" type="search" placeholder="Search" autocomplete="off" />
+            <button type="submit">Search</button>
+          </form>
+        </header>
+
+        <div class="toolbar">
+          <div class="segmented" role="tablist" aria-label="View">
+            <button class="view-button" data-view="recent">Recent</button>
+            <button class="view-button active" data-view="all">All</button>
+            <button class="view-button" data-view="unwatched">Unwatched</button>
+          </div>
+          <select id="sort">
+            <option value="addedAt:desc">Recently added</option>
+            <option value="titleSort">Title</option>
+            <option value="year:desc">Year</option>
+            <option value="lastViewedAt:desc">Recently watched</option>
+          </select>
+        </div>
+
+        <div id="status" class="status" aria-live="polite"></div>
+        <section id="grid" class="media-grid" aria-live="polite"></section>
+        <button id="load-more" class="load-more-button" type="button" hidden>Load more</button>
+      </section>
+    </main>
+
+    <dialog id="details-dialog" class="details-dialog">
+      <div class="details-layout">
+        <img id="details-poster" alt="" />
+        <section>
+          <div class="details-head">
+            <div>
+              <p id="details-kicker"></p>
+              <h2 id="details-title"></h2>
+            </div>
+            <button id="details-close" class="icon-button" aria-label="Close">x</button>
+          </div>
+          <p id="details-summary"></p>
+          <div id="details-meta" class="meta-row"></div>
+          <div class="details-actions">
+            <button id="details-play" class="primary-button">Play</button>
+            <button id="details-open" class="secondary-button">Open</button>
+            <button id="details-subtitles" class="secondary-button">Subtitles</button>
+          </div>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog id="player-dialog" class="player-dialog">
+      <header>
+        <strong id="player-title"></strong>
+        <div class="player-controls">
+          <span id="playback-mode" class="playback-mode"></span>
+          <label id="subtitle-select-label" for="subtitle-select">Subtitles</label>
+          <select id="subtitle-select"></select>
+          <button id="player-subtitle-search" class="secondary-button" type="button" hidden>Find</button>
+          <button id="player-close" class="icon-button" aria-label="Close">x</button>
+        </div>
+      </header>
+      <video id="player" controls playsinline></video>
+    </dialog>
+
+    <dialog id="subtitle-dialog" class="subtitle-dialog">
+      <header class="subtitle-head">
+        <div>
+          <p>OpenSubtitles</p>
+          <h2>Find subtitles</h2>
+        </div>
+        <button id="subtitle-close" class="icon-button" aria-label="Close">x</button>
+      </header>
+      <form id="subtitle-form" class="subtitle-form">
+        <select id="subtitle-language" aria-label="Language">
+          <option value="el">Greek</option>
+          <option value="en">English</option>
+          <option value="all">All languages</option>
+        </select>
+        <input id="subtitle-query" type="search" placeholder="Title or release" autocomplete="off" />
+        <button type="submit" class="primary-button">Search</button>
+      </form>
+      <div id="subtitle-status" class="subtitle-status" aria-live="polite"></div>
+      <section id="subtitle-results" class="subtitle-results" aria-live="polite"></section>
+    </dialog>
+
+    <script src="/app.js?v=8" type="module"></script>
+  </body>
+</html>
