@@ -12,10 +12,21 @@ const state = {
   playerItem: null,
   subtitleTrackElements: [],
   savePollTimer: null,
+  progressTimer: null,
+  lastProgressReportAt: 0,
+  lastReportedTimeMs: 0,
   usingSavedPlayback: false,
+  usingDevicePlayback: false,
+  deviceSaveInProgress: false,
+  deviceObjectUrls: [],
   subtitleItem: null,
   subtitleResults: [],
 };
+
+const DEVICE_CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024;
+const DEVICE_CACHE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+const LOCAL_PROGRESS_KEY = "plex-open-web-progress-v1";
+const PROGRESS_REPORT_INTERVAL_MS = 15000;
 
 const el = {
   login: document.querySelector("#login"),
@@ -53,6 +64,8 @@ const el = {
   subtitleSelect: document.querySelector("#subtitle-select"),
   playerSave: document.querySelector("#player-save"),
   playerDeleteSave: document.querySelector("#player-delete-save"),
+  playerDeviceSave: document.querySelector("#player-device-save"),
+  playerDeviceDelete: document.querySelector("#player-device-delete"),
   playerSubtitleSearch: document.querySelector("#player-subtitle-search"),
   player: document.querySelector("#player"),
   subtitleDialog: document.querySelector("#subtitle-dialog"),
@@ -398,9 +411,488 @@ function savedPlaybackUrlFor(item) {
     : null;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isSavedPlaybackUrl(item, streamUrl) {
   const savedUrl = savedPlaybackUrlFor(item);
   return Boolean(savedUrl && streamUrl === savedUrl);
+}
+
+function progressStore() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_PROGRESS_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function saveProgressStore(store) {
+  try {
+    localStorage.setItem(LOCAL_PROGRESS_KEY, JSON.stringify(store));
+  } catch {
+    // Resume still works through Plex even if browser storage is full or blocked.
+  }
+}
+
+function localProgressFor(item) {
+  if (!item?.ratingKey) return null;
+  const entry = progressStore()[item.ratingKey];
+  if (!entry || Date.now() - Number(entry.updatedAt || 0) > 30 * 24 * 60 * 60 * 1000) {
+    return null;
+  }
+  return entry;
+}
+
+function rememberLocalProgress(item, timeMs, durationMs) {
+  if (!item?.ratingKey || !durationMs || durationMs <= 0) return;
+  const remainingMs = durationMs - timeMs;
+  const store = progressStore();
+  if (timeMs < 10000 || remainingMs < 30000) {
+    delete store[item.ratingKey];
+  } else {
+    store[item.ratingKey] = { timeMs, durationMs, updatedAt: Date.now() };
+  }
+  saveProgressStore(store);
+}
+
+function clearLocalProgress(item) {
+  if (!item?.ratingKey) return;
+  const store = progressStore();
+  delete store[item.ratingKey];
+  saveProgressStore(store);
+}
+
+function playbackDurationMs(item = state.playerItem) {
+  if (Number.isFinite(el.player.duration) && el.player.duration > 0) {
+    return Math.floor(el.player.duration * 1000);
+  }
+  return item?.duration || item?.media?.duration || 0;
+}
+
+function playbackTimeMs() {
+  if (!Number.isFinite(el.player.currentTime) || el.player.currentTime < 0) {
+    return 0;
+  }
+  return Math.floor(el.player.currentTime * 1000);
+}
+
+function resumeTimeFor(item) {
+  if (item?.viewCount) return 0;
+  const durationMs = item?.duration || item?.media?.duration || 0;
+  const plexOffset = Number(item?.viewOffset || 0);
+  const local = localProgressFor(item);
+  const localOffset = Number(local?.timeMs || 0);
+  const offset = Math.max(plexOffset, localOffset);
+  if (offset < 10000) return 0;
+  if (durationMs && durationMs - offset < 30000) return 0;
+  return offset / 1000;
+}
+
+async function reportPlaybackProgress(stateName = "stopped", { force = false, keepalive = false } = {}) {
+  const item = state.playerItem;
+  if (!item?.ratingKey) return;
+  const timeMs = stateName === "ended" ? playbackDurationMs(item) : playbackTimeMs();
+  const durationMs = playbackDurationMs(item);
+  if (!force && Math.abs(timeMs - state.lastReportedTimeMs) < 5000) {
+    return;
+  }
+  rememberLocalProgress(item, timeMs, durationMs);
+  state.lastProgressReportAt = Date.now();
+  state.lastReportedTimeMs = timeMs;
+  const payload = {
+    ratingKey: item.ratingKey,
+    timeMs,
+    durationMs,
+    state: stateName,
+  };
+  if (stateName === "ended" || (durationMs && durationMs - timeMs < 30000)) {
+    clearLocalProgress(item);
+  }
+  const body = JSON.stringify(payload);
+  try {
+    const response = await fetch("/api/playback-progress", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive,
+    });
+    if (response.ok) {
+      const data = await response.json();
+      if (data.watched) {
+        item.viewCount = Math.max(1, item.viewCount || 0);
+        item.viewOffset = 0;
+        clearLocalProgress(item);
+      } else if (data.progressSaved || timeMs >= 10000) {
+        item.viewOffset = timeMs;
+      }
+    }
+  } catch {
+    // Local progress has already been stored for same-browser resume.
+  }
+}
+
+function startProgressReporting() {
+  stopProgressReporting();
+  state.progressTimer = setInterval(() => {
+    if (!el.player.paused && !el.player.ended) {
+      reportPlaybackProgress("playing").catch(() => {});
+    }
+  }, PROGRESS_REPORT_INTERVAL_MS);
+}
+
+function stopProgressReporting() {
+  if (state.progressTimer) {
+    clearInterval(state.progressTimer);
+    state.progressTimer = null;
+  }
+}
+
+function deviceStorageSupported() {
+  return Boolean(window.isSecureContext && navigator.storage?.getDirectory);
+}
+
+async function deviceStorageRoot() {
+  const root = await navigator.storage.getDirectory();
+  return root.getDirectoryHandle("plex-open-web-device-cache-v1", { create: true });
+}
+
+function deviceCacheIdFor(item) {
+  return item?.savedPlayback?.id || null;
+}
+
+function deviceMetaFileName(id) {
+  return `${id}.json`;
+}
+
+function deviceVideoFileName(id) {
+  return `${id}.mp4`;
+}
+
+function deviceSubtitleFileName(id, index) {
+  return `${id}-sub-${index}.vtt`;
+}
+
+async function fileExists(root, name) {
+  try {
+    await root.getFileHandle(name);
+    return true;
+  } catch (error) {
+    if (error?.name === "NotFoundError") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function readDeviceMetadata(item) {
+  const id = deviceCacheIdFor(item);
+  if (!id || !deviceStorageSupported()) {
+    return null;
+  }
+  try {
+    const root = await deviceStorageRoot();
+    const file = await (await root.getFileHandle(deviceMetaFileName(id))).getFile();
+    return JSON.parse(await file.text());
+  } catch (error) {
+    if (error?.name === "NotFoundError") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function writeDeviceMetadata(root, id, metadata) {
+  const handle = await root.getFileHandle(deviceMetaFileName(id), { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(JSON.stringify(metadata, null, 2));
+  await writable.close();
+}
+
+async function removeDeviceEntry(root, name) {
+  try {
+    await root.removeEntry(name);
+  } catch (error) {
+    if (error?.name !== "NotFoundError") {
+      throw error;
+    }
+  }
+}
+
+async function listDeviceCacheEntries(root = null) {
+  if (!deviceStorageSupported()) return [];
+  const cacheRoot = root || await deviceStorageRoot();
+  const entries = [];
+  for await (const [name, handle] of cacheRoot.entries()) {
+    if (!name.endsWith(".json")) continue;
+    try {
+      const file = await handle.getFile();
+      const metadata = JSON.parse(await file.text());
+      entries.push({
+        ...metadata,
+        metaFile: name,
+        savedAt: Number(metadata.savedAt) || 0,
+        bytes: Number(metadata.bytes) || 0,
+      });
+    } catch {
+      entries.push({ metaFile: name, savedAt: 0, bytes: 0, invalid: true });
+    }
+  }
+  return entries;
+}
+
+async function deleteDeviceMetadataEntry(root, metadata) {
+  if (metadata?.videoFile) {
+    await removeDeviceEntry(root, metadata.videoFile);
+  }
+  for (const subtitle of metadata?.subtitles || []) {
+    if (subtitle.file) {
+      await removeDeviceEntry(root, subtitle.file);
+    }
+  }
+  if (metadata?.metaFile) {
+    await removeDeviceEntry(root, metadata.metaFile);
+  } else if (metadata?.id) {
+    await removeDeviceEntry(root, deviceMetaFileName(metadata.id));
+  }
+}
+
+async function pruneDeviceCache() {
+  if (!deviceStorageSupported()) return;
+  const root = await deviceStorageRoot();
+  const now = Date.now();
+  let entries = await listDeviceCacheEntries(root);
+  for (const entry of entries) {
+    if (entry.invalid || (entry.savedAt && now - entry.savedAt > DEVICE_CACHE_MAX_AGE_MS)) {
+      await deleteDeviceMetadataEntry(root, entry);
+    }
+  }
+  entries = (await listDeviceCacheEntries(root)).sort((a, b) => (a.savedAt || 0) - (b.savedAt || 0));
+  let total = entries.reduce((sum, entry) => sum + (entry.bytes || 0), 0);
+  for (const entry of entries) {
+    if (total <= DEVICE_CACHE_MAX_BYTES) break;
+    await deleteDeviceMetadataEntry(root, entry);
+    total -= entry.bytes || 0;
+  }
+}
+
+async function devicePlaybackStatus(item) {
+  if (!deviceStorageSupported()) {
+    return { state: "unsupported", ready: false, supported: false };
+  }
+  const id = deviceCacheIdFor(item);
+  if (!id) {
+    return { state: "missing", ready: false, supported: true };
+  }
+  const metadata = await readDeviceMetadata(item);
+  if (!metadata?.videoFile) {
+    return { id, state: "missing", ready: false, supported: true };
+  }
+  const root = await deviceStorageRoot();
+  const ready = await fileExists(root, metadata.videoFile);
+  return {
+    id,
+    state: ready ? "ready" : "missing",
+    ready,
+    supported: true,
+    bytes: metadata.bytes,
+    savedAt: metadata.savedAt,
+    subtitles: metadata.subtitles || [],
+  };
+}
+
+async function refreshDevicePlayback(item) {
+  item.devicePlayback = await devicePlaybackStatus(item);
+  return item.devicePlayback;
+}
+
+async function writeResponseToDeviceFile(response, root, fileName, onProgress) {
+  if (!response.ok || !response.body) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+  const total = Number(response.headers.get("Content-Length")) || 0;
+  const handle = await root.getFileHandle(fileName, { create: true });
+  const writable = await handle.createWritable();
+  const reader = response.body.getReader();
+  let written = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writable.write(value);
+      written += value.byteLength;
+      if (total && onProgress) {
+        onProgress(written, total);
+      }
+    }
+    await writable.close();
+  } catch (error) {
+    try {
+      await writable.abort();
+    } catch {
+      // Ignore abort errors; the original write error is more useful.
+    }
+    throw error;
+  }
+  return written;
+}
+
+async function ensureSavedPlaybackReady(item) {
+  if (item.savedPlayback?.ready) {
+    return item.savedPlayback;
+  }
+  const data = await api("/api/saved-playback", {
+    method: "POST",
+    body: JSON.stringify({ ratingKey: item.ratingKey }),
+  });
+  item.savedPlayback = data.savedPlayback;
+  updateSaveControls(item);
+  while (item.savedPlayback?.state === "saving") {
+    el.playerDeviceSave.textContent = "Waiting";
+    await sleep(2500);
+    await refreshSavedPlayback(item);
+    updateSaveControls(item);
+  }
+  if (!item.savedPlayback?.ready) {
+    throw new Error(item.savedPlayback?.message || "Saved server copy is not ready.");
+  }
+  return item.savedPlayback;
+}
+
+async function saveDevicePlayback(item = state.playerItem) {
+  if (!item?.ratingKey || !deviceStorageSupported()) return;
+  state.deviceSaveInProgress = true;
+  updateDeviceControls(item);
+  await navigator.storage?.persist?.();
+  await pruneDeviceCache();
+  await ensureSavedPlaybackReady(item);
+  const id = deviceCacheIdFor(item);
+  const root = await deviceStorageRoot();
+  const videoFile = deviceVideoFileName(id);
+  await removeDeviceEntry(root, `${videoFile}.tmp`);
+  const response = await fetch(item.savedPlayback.streamUrl, { credentials: "same-origin" });
+  const bytes = await writeResponseToDeviceFile(response, root, videoFile, (written, total) => {
+    const percent = Math.max(1, Math.min(99, Math.floor((written / total) * 100)));
+    el.playerDeviceSave.textContent = `${percent}%`;
+  });
+  const subtitleMetadata = [];
+  const subtitles = supportedSubtitles(item);
+  for (let index = 0; index < subtitles.length; index += 1) {
+    const subtitle = subtitles[index];
+    const subtitleFile = deviceSubtitleFileName(id, index);
+    const subtitleResponse = await fetch(subtitle.subtitleUrl, { credentials: "same-origin" });
+    if (!subtitleResponse.ok) {
+      continue;
+    }
+    const handle = await root.getFileHandle(subtitleFile, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(await subtitleResponse.blob());
+    await writable.close();
+    subtitleMetadata.push({
+      id: subtitle.id,
+      index,
+      file: subtitleFile,
+      label: subtitle.label || subtitle.displayTitle || subtitle.language || `Subtitle ${index + 1}`,
+      srclang: subtitle.srclang || "und",
+      selected: Boolean(subtitle.selected),
+      default: Boolean(subtitle.default),
+      forced: Boolean(subtitle.forced),
+    });
+  }
+  await writeDeviceMetadata(root, id, {
+    id,
+    ratingKey: item.ratingKey,
+    title: displayTitle(item),
+    videoFile,
+    bytes,
+    savedAt: Date.now(),
+    subtitles: subtitleMetadata,
+  });
+  state.deviceSaveInProgress = false;
+  await refreshDevicePlayback(item);
+  await pruneDeviceCache();
+  await refreshDevicePlayback(item);
+  updateDeviceControls(item);
+  await switchToDevicePlayback(item);
+}
+
+function revokeDeviceObjectUrls() {
+  for (const url of state.deviceObjectUrls) {
+    URL.revokeObjectURL(url);
+  }
+  state.deviceObjectUrls = [];
+}
+
+async function prepareDevicePlayback(item) {
+  const metadata = await readDeviceMetadata(item);
+  if (!metadata?.videoFile) {
+    throw new Error("Device copy is missing.");
+  }
+  const root = await deviceStorageRoot();
+  const videoFile = await (await root.getFileHandle(metadata.videoFile)).getFile();
+  const videoUrl = URL.createObjectURL(videoFile);
+  const objectUrls = [videoUrl];
+  const subtitleUrls = new Map();
+  for (const subtitle of metadata.subtitles || []) {
+    try {
+      const file = await (await root.getFileHandle(subtitle.file)).getFile();
+      const url = URL.createObjectURL(file);
+      objectUrls.push(url);
+      subtitleUrls.set(subtitle.id || subtitle.index, url);
+    } catch {
+      // A missing subtitle file should not block local video playback.
+    }
+  }
+  const localSubtitles = (item.subtitles || []).map((subtitle, index) => {
+    const meta = (metadata.subtitles || []).find(
+      (candidate) => candidate.id === subtitle.id || candidate.index === index
+    );
+    const url = meta ? subtitleUrls.get(meta.id || meta.index) : null;
+    return {
+      ...subtitle,
+      supported: Boolean(url),
+      subtitleUrl: url || subtitle.subtitleUrl,
+      source: url ? "device" : subtitle.source,
+    };
+  });
+  return {
+    item: { ...item, subtitles: localSubtitles },
+    streamUrl: videoUrl,
+    objectUrls,
+  };
+}
+
+async function deleteDevicePlayback(item = state.playerItem) {
+  if (!item?.ratingKey || !deviceStorageSupported()) return;
+  const wasUsingDevice = state.usingDevicePlayback;
+  const resumeTime = el.player.currentTime || 0;
+  const autoplay = !el.player.paused;
+  if (wasUsingDevice) {
+    const fallbackUrl = savedPlaybackUrlFor(item) || liveStreamUrlFor(item);
+    state.usingDevicePlayback = false;
+    state.usingSavedPlayback = isSavedPlaybackUrl(item, fallbackUrl);
+    setPlaybackMode(item, state.usingSavedPlayback ? "saved" : "live");
+    revokeDeviceObjectUrls();
+    loadPlayerSource(item, fallbackUrl, { resumeTime, autoplay });
+  }
+  const metadata = await readDeviceMetadata(item);
+  const id = deviceCacheIdFor(item);
+  const root = await deviceStorageRoot();
+  if (metadata?.videoFile) {
+    await removeDeviceEntry(root, metadata.videoFile);
+    for (const subtitle of metadata.subtitles || []) {
+      if (subtitle.file) {
+        await removeDeviceEntry(root, subtitle.file);
+      }
+    }
+  }
+  if (id) {
+    await removeDeviceEntry(root, deviceMetaFileName(id));
+  }
+  await refreshDevicePlayback(item);
+  updateDeviceControls(item);
 }
 
 function clearSubtitleTracks() {
@@ -487,11 +979,19 @@ function liveStreamUrlFor(item) {
 }
 
 function streamUrlFor(item) {
-  return savedPlaybackUrlFor(item) || liveStreamUrlFor(item);
+  return item?.devicePlayback?.ready ? null : savedPlaybackUrlFor(item) || liveStreamUrlFor(item);
 }
 
-function setPlaybackMode(item, usingSaved) {
-  if (usingSaved) {
+function setPlaybackMode(item, mode) {
+  if (mode === "device" || mode === true) {
+    el.playbackMode.textContent = mode === "device" ? "On device" : "Saved copy";
+    el.playbackMode.title = mode === "device"
+      ? "Playing from this device's browser storage."
+      : "Playing the saved browser-friendly file for smoother seeking.";
+    el.playbackMode.hidden = false;
+    return;
+  }
+  if (mode === "saved") {
     el.playbackMode.textContent = "Saved copy";
     el.playbackMode.title = "Playing the saved browser-friendly file for smoother seeking.";
     el.playbackMode.hidden = false;
@@ -503,6 +1003,31 @@ function setPlaybackMode(item, usingSaved) {
     el.playbackMode.hidden = false;
   } else {
     el.playbackMode.hidden = true;
+  }
+}
+
+function updateDeviceControls(item = state.playerItem) {
+  const supported = deviceStorageSupported();
+  const canUse = supported && Boolean(item?.ratingKey);
+  const status = item?.devicePlayback;
+  el.playerDeviceSave.hidden = !canUse;
+  el.playerDeviceDelete.hidden = !canUse || !status?.ready;
+  if (!canUse) {
+    return;
+  }
+  el.playerDeviceSave.title = "Keeps local copies for 14 days and prunes oldest items above 4 GB.";
+  el.playerDeviceDelete.title = "";
+  el.playerDeviceSave.disabled = state.deviceSaveInProgress;
+  el.playerDeviceDelete.disabled = false;
+  if (state.deviceSaveInProgress) {
+    if (!/%$|Waiting/.test(el.playerDeviceSave.textContent)) {
+      el.playerDeviceSave.textContent = "Saving";
+    }
+  } else if (status?.ready) {
+    el.playerDeviceSave.textContent = state.usingDevicePlayback ? "On device" : "Play device";
+    el.playerDeviceSave.disabled = state.usingDevicePlayback;
+  } else {
+    el.playerDeviceSave.textContent = "Save device";
   }
 }
 
@@ -569,10 +1094,28 @@ async function switchToSavedPlayback(item = state.playerItem) {
   if (!item || !streamUrl) return;
   const resumeTime = el.player.currentTime || 0;
   const autoplay = !el.player.paused;
+  revokeDeviceObjectUrls();
+  state.usingDevicePlayback = false;
   state.usingSavedPlayback = true;
-  setPlaybackMode(item, true);
+  setPlaybackMode(item, "saved");
   loadPlayerSource(item, streamUrl, { resumeTime, autoplay });
   updateSaveControls(item);
+  updateDeviceControls(item);
+}
+
+async function switchToDevicePlayback(item = state.playerItem) {
+  if (!item?.ratingKey || !item.devicePlayback?.ready) return;
+  const resumeTime = el.player.currentTime || 0;
+  const autoplay = !el.player.paused;
+  const prepared = await prepareDevicePlayback(item);
+  revokeDeviceObjectUrls();
+  state.deviceObjectUrls = prepared.objectUrls;
+  state.usingDevicePlayback = true;
+  state.usingSavedPlayback = false;
+  setPlaybackMode(item, "device");
+  loadPlayerSource(prepared.item, prepared.streamUrl, { resumeTime, autoplay });
+  updateSaveControls(item);
+  updateDeviceControls(item);
 }
 
 function pollSavedPlayback(item, switchWhenReady = false) {
@@ -584,12 +1127,13 @@ function pollSavedPlayback(item, switchWhenReady = false) {
     try {
       await refreshSavedPlayback(state.playerItem);
       updateSaveControls(state.playerItem);
-      if (state.playerItem.savedPlayback?.ready) {
-        if (switchWhenReady && !state.usingSavedPlayback) {
-          await switchToSavedPlayback(state.playerItem);
-        }
-        return;
+    if (state.playerItem.savedPlayback?.ready) {
+      if (switchWhenReady && !state.usingSavedPlayback) {
+        await switchToSavedPlayback(state.playerItem);
       }
+      updateDeviceControls(state.playerItem);
+      return;
+    }
       if (state.playerItem.savedPlayback?.state === "saving") {
         pollSavedPlayback(state.playerItem, switchWhenReady);
       }
@@ -630,10 +1174,11 @@ async function deleteSavedPlayback(item = state.playerItem) {
   if (wasUsingSaved) {
     const liveUrl = liveStreamUrlFor(item);
     state.usingSavedPlayback = false;
-    setPlaybackMode(item, false);
+    setPlaybackMode(item, "live");
     loadPlayerSource(item, liveUrl, { resumeTime, autoplay });
   }
   updateSaveControls(item);
+  updateDeviceControls(item);
 }
 
 async function playItem(item) {
@@ -643,16 +1188,37 @@ async function playItem(item) {
   } catch {
     item.savedPlayback = item.savedPlayback || { state: "unavailable", ready: false };
   }
-  const streamUrl = streamUrlFor(item);
-  if (!streamUrl) return;
+  try {
+    await pruneDeviceCache();
+    await refreshDevicePlayback(item);
+  } catch {
+    item.devicePlayback = { state: "unsupported", ready: false, supported: false };
+  }
   state.playerItem = item;
-  state.usingSavedPlayback = isSavedPlaybackUrl(item, streamUrl);
+  state.lastProgressReportAt = 0;
+  state.lastReportedTimeMs = 0;
   el.playerTitle.textContent = displayTitle(item);
-  setPlaybackMode(item, state.usingSavedPlayback);
-  loadPlayerSource(item, streamUrl);
+  const resumeTime = resumeTimeFor(item);
+  if (item.devicePlayback?.ready) {
+    state.usingDevicePlayback = true;
+    state.usingSavedPlayback = false;
+    setPlaybackMode(item, "device");
+    const prepared = await prepareDevicePlayback(item);
+    revokeDeviceObjectUrls();
+    state.deviceObjectUrls = prepared.objectUrls;
+    loadPlayerSource(prepared.item, prepared.streamUrl, { resumeTime });
+  } else {
+    const streamUrl = streamUrlFor(item);
+    if (!streamUrl) return;
+    state.usingDevicePlayback = false;
+    state.usingSavedPlayback = isSavedPlaybackUrl(item, streamUrl);
+    setPlaybackMode(item, state.usingSavedPlayback ? "saved" : "live");
+    loadPlayerSource(item, streamUrl, { resumeTime });
+  }
   el.playerSubtitleSearch.hidden = !item.ratingKey;
   el.playerSubtitleSearch.onclick = () => openSubtitleDialog(item);
   updateSaveControls(item);
+  updateDeviceControls(item);
   if (item.savedPlayback?.state === "saving") {
     pollSavedPlayback(item, false);
   }
@@ -856,7 +1422,9 @@ for (const button of el.viewButtons) {
 }
 
 el.detailsClose.addEventListener("click", () => el.detailsDialog.close());
-el.playerClose.addEventListener("click", () => {
+el.playerClose.addEventListener("click", async () => {
+  await reportPlaybackProgress("stopped", { force: true });
+  stopProgressReporting();
   stopSavePolling();
   el.player.pause();
   el.player.removeAttribute("src");
@@ -864,13 +1432,19 @@ el.playerClose.addEventListener("click", () => {
   el.playerSubtitleSearch.hidden = true;
   el.playerSave.hidden = true;
   el.playerDeleteSave.hidden = true;
+  el.playerDeviceSave.hidden = true;
+  el.playerDeviceDelete.hidden = true;
   state.usingSavedPlayback = false;
+  state.usingDevicePlayback = false;
+  revokeDeviceObjectUrls();
   state.playerItem = null;
   clearSubtitleTracks();
   el.player.load();
   el.playerDialog.close();
 });
 el.playerDialog.addEventListener("close", () => {
+  reportPlaybackProgress("stopped", { force: true, keepalive: true }).catch(() => {});
+  stopProgressReporting();
   stopSavePolling();
   el.player.pause();
   el.player.removeAttribute("src");
@@ -878,13 +1452,37 @@ el.playerDialog.addEventListener("close", () => {
   el.playerSubtitleSearch.hidden = true;
   el.playerSave.hidden = true;
   el.playerDeleteSave.hidden = true;
+  el.playerDeviceSave.hidden = true;
+  el.playerDeviceDelete.hidden = true;
   state.usingSavedPlayback = false;
+  state.usingDevicePlayback = false;
+  revokeDeviceObjectUrls();
   state.playerItem = null;
   clearSubtitleTracks();
   el.player.load();
 });
 el.subtitleSelect.addEventListener("change", () => {
   setActiveSubtitle(Number(el.subtitleSelect.value));
+});
+el.player.addEventListener("play", () => {
+  startProgressReporting();
+});
+el.player.addEventListener("pause", () => {
+  if (!el.player.ended) {
+    reportPlaybackProgress("paused", { force: true }).catch(() => {});
+  }
+});
+el.player.addEventListener("timeupdate", () => {
+  const item = state.playerItem;
+  if (!item?.ratingKey) return;
+  rememberLocalProgress(item, playbackTimeMs(), playbackDurationMs(item));
+});
+el.player.addEventListener("ended", () => {
+  stopProgressReporting();
+  reportPlaybackProgress("ended", { force: true }).catch(() => {});
+});
+window.addEventListener("pagehide", () => {
+  reportPlaybackProgress("stopped", { force: true, keepalive: true }).catch(() => {});
 });
 el.playerSave.addEventListener("click", async () => {
   try {
@@ -905,6 +1503,28 @@ el.playerDeleteSave.addEventListener("click", async () => {
   } catch (error) {
     el.playerDeleteSave.disabled = false;
     el.playerDeleteSave.title = error.message;
+  }
+});
+el.playerDeviceSave.addEventListener("click", async () => {
+  try {
+    if (state.playerItem?.devicePlayback?.ready && !state.usingDevicePlayback) {
+      await switchToDevicePlayback();
+    } else {
+      await saveDevicePlayback();
+    }
+  } catch (error) {
+    state.deviceSaveInProgress = false;
+    el.playerDeviceSave.disabled = false;
+    el.playerDeviceSave.textContent = "Retry device";
+    el.playerDeviceSave.title = error.message;
+  }
+});
+el.playerDeviceDelete.addEventListener("click", async () => {
+  try {
+    await deleteDevicePlayback();
+  } catch (error) {
+    el.playerDeviceDelete.disabled = false;
+    el.playerDeviceDelete.title = error.message;
   }
 });
 el.subtitleClose.addEventListener("click", () => el.subtitleDialog.close());

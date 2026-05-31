@@ -262,6 +262,7 @@ class PlexClient:
         params: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout: Optional[int] = None,
+        method: Optional[str] = None,
     ):
         if not self.token:
             raise RuntimeError("PLEX_TOKEN is not configured and could not be read from Preferences.xml")
@@ -271,7 +272,7 @@ class PlexClient:
             "X-Plex-Client-Identifier": "plex-open-web",
         }
         request_headers.update(headers or {})
-        request = urllib.request.Request(self._url(path, params), headers=request_headers)
+        request = urllib.request.Request(self._url(path, params), headers=request_headers, method=method)
         return urllib.request.urlopen(request, timeout=timeout or Settings.request_timeout)
 
     def xml(self, path: str, params: Optional[Dict[str, Any]] = None) -> ET.Element:
@@ -655,6 +656,35 @@ def playback_info(part_key: Optional[str], media: Dict[str, Any]) -> Dict[str, A
     }
 
 
+def watched_threshold_reached(time_ms: Optional[int], duration_ms: Optional[int]) -> bool:
+    if not time_ms or not duration_ms or duration_ms <= 0:
+        return False
+    remaining_ms = max(0, duration_ms - time_ms)
+    return time_ms >= duration_ms * 0.9 or remaining_ms <= 120000
+
+
+def update_plex_progress(rating_key: str, time_ms: int) -> None:
+    PLEX.open(
+        "/:/progress",
+        params={
+            "key": rating_key,
+            "identifier": "com.plexapp.plugins.library",
+            "time": max(60001, time_ms),
+            "state": "stopped",
+        },
+        method="PUT",
+        timeout=Settings.request_timeout,
+    ).close()
+
+
+def mark_plex_watched(rating_key: str) -> None:
+    PLEX.open(
+        "/:/scrobble",
+        params={"identifier": "com.plexapp.plugins.library", "key": rating_key},
+        timeout=Settings.request_timeout,
+    ).close()
+
+
 def saved_playback_dir(create: bool = False) -> Path:
     path = Path(Settings.saved_media_dir).expanduser()
     if not path.is_absolute():
@@ -942,6 +972,7 @@ def item_from_xml(elem: ET.Element) -> Dict[str, Any]:
         "audienceRating": to_float(elem.get("audienceRating")),
         "duration": to_int(elem.get("duration")),
         "durationText": duration_text(to_int(elem.get("duration"))),
+        "viewOffset": to_int(elem.get("viewOffset")) or 0,
         "addedAt": to_int(elem.get("addedAt")),
         "addedDate": unix_date(elem.get("addedAt")),
         "updatedAt": to_int(elem.get("updatedAt")),
@@ -1629,6 +1660,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/saved-playback":
             self.api_saved_playback(method, query)
             return
+        if path == "/api/playback-progress":
+            self.api_playback_progress(method)
+            return
         if method not in {"GET", "HEAD"}:
             self.send_json({"error": "method_not_allowed"}, status=405)
             return
@@ -1959,6 +1993,40 @@ class AppHandler(BaseHTTPRequestHandler):
                     "partKey": item.get("partKey"),
                     "media": item.get("media"),
                 },
+            }
+        )
+
+    def api_playback_progress(self, method: str) -> None:
+        if method != "POST":
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload = self.read_json()
+        rating_key = str(payload.get("ratingKey") or "").strip()
+        time_ms = max(0, to_int(str(payload.get("timeMs") or "0")) or 0)
+        duration_ms = max(0, to_int(str(payload.get("durationMs") or "0")) or 0)
+        state = str(payload.get("state") or "stopped").strip().lower()
+        if not rating_key:
+            self.send_json({"error": "missing_rating_key"}, status=400)
+            return
+        if metadata_item_element(rating_key) is None:
+            self.send_json({"error": "not_found"}, status=404)
+            return
+
+        watched = state == "ended" or watched_threshold_reached(time_ms, duration_ms)
+        progress_saved = False
+        if watched:
+            mark_plex_watched(rating_key)
+        elif time_ms >= 60000:
+            update_plex_progress(rating_key, time_ms)
+            progress_saved = True
+        self.send_json(
+            {
+                "ok": True,
+                "watched": watched,
+                "progressSaved": progress_saved,
+                "timeMs": time_ms,
+                "durationMs": duration_ms,
+                "state": state,
             }
         )
 
