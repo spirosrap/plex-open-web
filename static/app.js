@@ -5,11 +5,14 @@ const state = {
   sort: "addedAt:desc",
   stack: [],
   currentItems: [],
-  pageSize: 180,
+  pageSize: 24,
   libraryStart: 0,
   libraryTotal: 0,
   libraryLoadingMore: false,
   playerItem: null,
+  subtitleTrackElements: [],
+  savePollTimer: null,
+  usingSavedPlayback: false,
   subtitleItem: null,
   subtitleResults: [],
 };
@@ -48,6 +51,8 @@ const el = {
   playerClose: document.querySelector("#player-close"),
   subtitleLabel: document.querySelector("#subtitle-select-label"),
   subtitleSelect: document.querySelector("#subtitle-select"),
+  playerSave: document.querySelector("#player-save"),
+  playerDeleteSave: document.querySelector("#player-delete-save"),
   playerSubtitleSearch: document.querySelector("#player-subtitle-search"),
   player: document.querySelector("#player"),
   subtitleDialog: document.querySelector("#subtitle-dialog"),
@@ -314,6 +319,13 @@ async function loadLibrary({ append = false } = {}) {
     state.libraryTotal = data.totalSize || data.size || 0;
     const incoming = data.items || [];
     renderItems(append ? [...state.currentItems, ...incoming] : incoming);
+  } catch (error) {
+    if (!append) {
+      state.currentItems = [];
+      state.libraryTotal = 0;
+      el.grid.innerHTML = "";
+    }
+    setStatus(`Could not load media: ${error.message}`, "error");
   } finally {
     state.libraryLoadingMore = false;
     updateLoadMore();
@@ -371,20 +383,58 @@ async function hydrateItem(item) {
   return item;
 }
 
+async function refreshSavedPlayback(item) {
+  if (!item?.ratingKey) {
+    return null;
+  }
+  const data = await api(`/api/saved-playback?${new URLSearchParams({ ratingKey: item.ratingKey })}`);
+  item.savedPlayback = data.savedPlayback;
+  return item.savedPlayback;
+}
+
+function savedPlaybackUrlFor(item) {
+  return item.savedPlayback?.ready && item.savedPlayback?.streamUrl
+    ? item.savedPlayback.streamUrl
+    : null;
+}
+
+function isSavedPlaybackUrl(item, streamUrl) {
+  const savedUrl = savedPlaybackUrlFor(item);
+  return Boolean(savedUrl && streamUrl === savedUrl);
+}
+
 function clearSubtitleTracks() {
+  disableAllTextTracks();
   for (const track of [...el.player.querySelectorAll("track")]) {
     track.remove();
   }
+  state.subtitleTrackElements = [];
   el.subtitleSelect.innerHTML = "";
   el.subtitleSelect.hidden = true;
   el.subtitleLabel.hidden = true;
 }
 
-function setActiveSubtitle(index) {
-  const tracks = [...el.player.textTracks];
-  tracks.forEach((track, i) => {
-    track.mode = i === index ? "showing" : "disabled";
-  });
+function disableAllTextTracks() {
+  for (const track of [...el.player.textTracks]) {
+    track.mode = "disabled";
+  }
+}
+
+function currentSubtitleIndex() {
+  const value = Number(el.subtitleSelect.value);
+  return Number.isFinite(value) ? value : -1;
+}
+
+function setActiveSubtitle(index = currentSubtitleIndex()) {
+  disableAllTextTracks();
+  const trackElement = state.subtitleTrackElements[index];
+  if (trackElement?.track) {
+    trackElement.track.mode = "showing";
+  }
+}
+
+function reapplyActiveSubtitle() {
+  requestAnimationFrame(() => setActiveSubtitle());
 }
 
 function configureSubtitles(item) {
@@ -414,28 +464,39 @@ function configureSubtitles(item) {
     track.src = subtitle.subtitleUrl;
     track.srclang = subtitle.srclang || "und";
     track.label = option.textContent;
-    if (index === selectedIndex) {
-      track.default = true;
-    }
+    track.addEventListener("load", reapplyActiveSubtitle);
+    state.subtitleTrackElements[index] = track;
     el.player.append(track);
   });
   el.subtitleSelect.value = selectedIndex >= 0 ? String(selectedIndex) : "-1";
-  requestAnimationFrame(() => setActiveSubtitle(selectedIndex));
+  reapplyActiveSubtitle();
+}
+
+function liveStreamUrlFor(item) {
+  const url = item.playback?.audioTranscodeRequired && item.playback.compatibleStreamUrl
+    ? item.playback.compatibleStreamUrl
+    : item.streamUrl;
+  if (!url) {
+    return url;
+  }
+  const streamUrl = new URL(url, window.location.origin);
+  if (window.location.protocol === "http:" && /^100\./.test(window.location.hostname)) {
+    streamUrl.searchParams.set("quality", "remote");
+  }
+  return `${streamUrl.pathname}${streamUrl.search}`;
 }
 
 function streamUrlFor(item) {
-  if (item.playback?.audioTranscodeRequired && item.playback.compatibleStreamUrl) {
-    return item.playback.compatibleStreamUrl;
-  }
-  return item.streamUrl;
+  return savedPlaybackUrlFor(item) || liveStreamUrlFor(item);
 }
 
-async function playItem(item) {
-  item = await hydrateItem(item);
-  const streamUrl = streamUrlFor(item);
-  if (!streamUrl) return;
-  state.playerItem = item;
-  el.playerTitle.textContent = displayTitle(item);
+function setPlaybackMode(item, usingSaved) {
+  if (usingSaved) {
+    el.playbackMode.textContent = "Saved copy";
+    el.playbackMode.title = "Playing the saved browser-friendly file for smoother seeking.";
+    el.playbackMode.hidden = false;
+    return;
+  }
   if (item.playback?.audioTranscodeRequired) {
     el.playbackMode.textContent = "AAC audio";
     el.playbackMode.title = item.playback.audioTranscodeReason || "Audio is being converted for browser playback.";
@@ -443,13 +504,159 @@ async function playItem(item) {
   } else {
     el.playbackMode.hidden = true;
   }
+}
+
+function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } = {}) {
   clearSubtitleTracks();
+  const applyResume = () => {
+    reapplyActiveSubtitle();
+    if (resumeTime > 0 && Number.isFinite(resumeTime)) {
+      try {
+        el.player.currentTime = Math.max(0, resumeTime);
+      } catch {
+        // Some streams reject seeking until more metadata arrives.
+      }
+    }
+    if (autoplay) {
+      el.player.play().catch(() => {});
+    }
+  };
+  el.player.addEventListener("loadedmetadata", applyResume, { once: true });
+  el.player.addEventListener("loadeddata", reapplyActiveSubtitle, { once: true });
   el.player.src = streamUrl;
   configureSubtitles(item);
+  el.player.load();
+  if (autoplay) {
+    el.player.play().catch(() => {});
+  }
+}
+
+function stopSavePolling() {
+  if (state.savePollTimer) {
+    clearTimeout(state.savePollTimer);
+    state.savePollTimer = null;
+  }
+}
+
+function updateSaveControls(item = state.playerItem) {
+  const status = item?.savedPlayback;
+  const canSave = Boolean(item?.ratingKey && item?.partKey);
+  el.playerSave.hidden = !canSave;
+  el.playerDeleteSave.hidden = !canSave || !status?.ready;
+  if (!canSave) {
+    return;
+  }
+  el.playerSave.title = "";
+  el.playerDeleteSave.title = "";
+  el.playerSave.disabled = false;
+  el.playerDeleteSave.disabled = false;
+  if (status?.state === "saving") {
+    el.playerSave.textContent = "Saving";
+    el.playerSave.disabled = true;
+    el.playerDeleteSave.hidden = true;
+  } else if (status?.ready) {
+    el.playerSave.textContent = state.usingSavedPlayback ? "Saved" : "Play saved";
+    el.playerSave.disabled = state.usingSavedPlayback;
+  } else if (status?.state === "error") {
+    el.playerSave.textContent = "Retry save";
+  } else {
+    el.playerSave.textContent = "Save";
+  }
+}
+
+async function switchToSavedPlayback(item = state.playerItem) {
+  const streamUrl = savedPlaybackUrlFor(item);
+  if (!item || !streamUrl) return;
+  const resumeTime = el.player.currentTime || 0;
+  const autoplay = !el.player.paused;
+  state.usingSavedPlayback = true;
+  setPlaybackMode(item, true);
+  loadPlayerSource(item, streamUrl, { resumeTime, autoplay });
+  updateSaveControls(item);
+}
+
+function pollSavedPlayback(item, switchWhenReady = false) {
+  stopSavePolling();
+  state.savePollTimer = setTimeout(async () => {
+    if (!state.playerItem || state.playerItem.ratingKey !== item.ratingKey) {
+      return;
+    }
+    try {
+      await refreshSavedPlayback(state.playerItem);
+      updateSaveControls(state.playerItem);
+      if (state.playerItem.savedPlayback?.ready) {
+        if (switchWhenReady && !state.usingSavedPlayback) {
+          await switchToSavedPlayback(state.playerItem);
+        }
+        return;
+      }
+      if (state.playerItem.savedPlayback?.state === "saving") {
+        pollSavedPlayback(state.playerItem, switchWhenReady);
+      }
+    } catch {
+      pollSavedPlayback(item, switchWhenReady);
+    }
+  }, 2500);
+}
+
+async function savePlayback(item = state.playerItem) {
+  if (!item?.ratingKey) return;
+  el.playerSave.disabled = true;
+  el.playerSave.textContent = "Saving";
+  const data = await api("/api/saved-playback", {
+    method: "POST",
+    body: JSON.stringify({ ratingKey: item.ratingKey }),
+  });
+  item.savedPlayback = data.savedPlayback;
+  updateSaveControls(item);
+  if (item.savedPlayback?.ready) {
+    await switchToSavedPlayback(item);
+  } else if (item.savedPlayback?.state === "saving") {
+    pollSavedPlayback(item, true);
+  }
+}
+
+async function deleteSavedPlayback(item = state.playerItem) {
+  if (!item?.ratingKey) return;
+  const resumeTime = el.player.currentTime || 0;
+  const wasUsingSaved = state.usingSavedPlayback;
+  const autoplay = !el.player.paused;
+  el.playerDeleteSave.disabled = true;
+  const data = await api("/api/saved-playback", {
+    method: "POST",
+    body: JSON.stringify({ ratingKey: item.ratingKey, action: "delete" }),
+  });
+  item.savedPlayback = data.savedPlayback;
+  if (wasUsingSaved) {
+    const liveUrl = liveStreamUrlFor(item);
+    state.usingSavedPlayback = false;
+    setPlaybackMode(item, false);
+    loadPlayerSource(item, liveUrl, { resumeTime, autoplay });
+  }
+  updateSaveControls(item);
+}
+
+async function playItem(item) {
+  item = await hydrateItem(item);
+  try {
+    await refreshSavedPlayback(item);
+  } catch {
+    item.savedPlayback = item.savedPlayback || { state: "unavailable", ready: false };
+  }
+  const streamUrl = streamUrlFor(item);
+  if (!streamUrl) return;
+  state.playerItem = item;
+  state.usingSavedPlayback = isSavedPlaybackUrl(item, streamUrl);
+  el.playerTitle.textContent = displayTitle(item);
+  setPlaybackMode(item, state.usingSavedPlayback);
+  loadPlayerSource(item, streamUrl);
   el.playerSubtitleSearch.hidden = !item.ratingKey;
   el.playerSubtitleSearch.onclick = () => openSubtitleDialog(item);
+  updateSaveControls(item);
+  if (item.savedPlayback?.state === "saving") {
+    pollSavedPlayback(item, false);
+  }
   el.playerDialog.showModal();
-  el.player.play().catch(() => {});
 }
 
 function setSubtitleStatus(message = "", kind = "") {
@@ -650,26 +857,55 @@ for (const button of el.viewButtons) {
 
 el.detailsClose.addEventListener("click", () => el.detailsDialog.close());
 el.playerClose.addEventListener("click", () => {
+  stopSavePolling();
   el.player.pause();
   el.player.removeAttribute("src");
   el.playbackMode.hidden = true;
   el.playerSubtitleSearch.hidden = true;
+  el.playerSave.hidden = true;
+  el.playerDeleteSave.hidden = true;
+  state.usingSavedPlayback = false;
   state.playerItem = null;
   clearSubtitleTracks();
   el.player.load();
   el.playerDialog.close();
 });
 el.playerDialog.addEventListener("close", () => {
+  stopSavePolling();
   el.player.pause();
   el.player.removeAttribute("src");
   el.playbackMode.hidden = true;
   el.playerSubtitleSearch.hidden = true;
+  el.playerSave.hidden = true;
+  el.playerDeleteSave.hidden = true;
+  state.usingSavedPlayback = false;
   state.playerItem = null;
   clearSubtitleTracks();
   el.player.load();
 });
 el.subtitleSelect.addEventListener("change", () => {
   setActiveSubtitle(Number(el.subtitleSelect.value));
+});
+el.playerSave.addEventListener("click", async () => {
+  try {
+    if (state.playerItem?.savedPlayback?.ready && !state.usingSavedPlayback) {
+      await switchToSavedPlayback();
+    } else {
+      await savePlayback();
+    }
+  } catch (error) {
+    el.playerSave.disabled = false;
+    el.playerSave.textContent = "Retry save";
+    el.playerSave.title = error.message;
+  }
+});
+el.playerDeleteSave.addEventListener("click", async () => {
+  try {
+    await deleteSavedPlayback();
+  } catch (error) {
+    el.playerDeleteSave.disabled = false;
+    el.playerDeleteSave.title = error.message;
+  }
 });
 el.subtitleClose.addEventListener("click", () => el.subtitleDialog.close());
 el.subtitleForm.addEventListener("submit", async (event) => {

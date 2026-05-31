@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Plex Open Web</title>
-    <link rel="stylesheet" href="/styles.css?v=8" />
+    <link rel="stylesheet" href="/styles.css?v=13" />
   </head>
   <body>
     <main id="login" class="login-shell" hidden>
@@ -94,6 +94,8 @@
           <span id="playback-mode" class="playback-mode"></span>
           <label id="subtitle-select-label" for="subtitle-select">Subtitles</label>
           <select id="subtitle-select"></select>
+          <button id="player-save" class="secondary-button" type="button" hidden>Save</button>
+          <button id="player-delete-save" class="secondary-button danger-button" type="button" hidden>Delete saved</button>
           <button id="player-subtitle-search" class="secondary-button" type="button" hidden>Find</button>
           <button id="player-close" class="icon-button" aria-label="Close">x</button>
         </div>
@@ -122,6 +124,6 @@
       <section id="subtitle-results" class="subtitle-results" aria-live="polite"></section>
     </dialog>
 
-    <script src="/app.js?v=8" type="module"></script>
+    <script src="/app.js?v=13" type="module"></script>
   </body>
 </html>

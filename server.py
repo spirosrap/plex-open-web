@@ -20,9 +20,9 @@ import mimetypes
 import os
 import re
 import secrets
-import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -38,6 +38,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 COOKIE_NAME = "plex_open_session"
+STREAM_CHUNK_SIZE = 64 * 1024
+TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
 DEFAULT_PREFS = (
     "/var/lib/plexmediaserver/Library/Application Support/"
     "Plex Media Server/Preferences.xml"
@@ -92,6 +94,7 @@ class Settings:
     request_timeout = env_int("PLEX_REQUEST_TIMEOUT", 30)
     stream_timeout = env_int("PLEX_STREAM_TIMEOUT", 3600)
     ffmpeg_path = os.environ.get("FFMPEG_PATH", "ffmpeg")
+    saved_media_dir = os.environ.get("SAVED_MEDIA_DIR", str(ROOT.parent / "plex-open-web-saved"))
     opensubtitles_base_url = os.environ.get(
         "OPENSUBTITLES_BASE_URL", "https://api.opensubtitles.com/api/v1"
     )
@@ -194,6 +197,44 @@ def to_float(value: Optional[str]) -> Optional[float]:
         return float(value)
     except ValueError:
         return None
+
+
+def read_stream_chunk(stream: Any, chunk_size: int = STREAM_CHUNK_SIZE) -> bytes:
+    read1 = getattr(stream, "read1", None)
+    if callable(read1):
+        return read1(chunk_size)
+    return stream.read(chunk_size)
+
+
+def copy_stream(stream: Any, output: Any, chunk_size: int = STREAM_CHUNK_SIZE) -> None:
+    while True:
+        chunk = read_stream_chunk(stream, chunk_size)
+        if not chunk:
+            break
+        output.write(chunk)
+        output.flush()
+
+
+def write_chunked(output: Any, chunk: bytes) -> None:
+    if not chunk:
+        return
+    output.write(f"{len(chunk):x}\r\n".encode("ascii"))
+    output.write(chunk)
+    output.write(b"\r\n")
+    output.flush()
+
+
+def copy_chunked_stream(stream: Any, output: Any, chunk_size: int = STREAM_CHUNK_SIZE) -> None:
+    while True:
+        chunk = read_stream_chunk(stream, chunk_size)
+        if not chunk:
+            break
+        write_chunked(output, chunk)
+
+
+def finish_chunked(output: Any) -> None:
+    output.write(b"0\r\n\r\n")
+    output.flush()
 
 
 def unix_date(value: Optional[str]) -> Optional[str]:
@@ -305,7 +346,24 @@ LANGUAGE_NAMES = {
 TEXT_SUBTITLE_CODECS = {"srt", "subrip", "vtt", "webvtt", "ass", "ssa"}
 LOCAL_SUBTITLE_EXTENSIONS = {"srt", "vtt", "ass", "ssa"}
 BROWSER_AUDIO_CODECS = {"aac", "mp3", "mp4a", "opus"}
+BROWSER_VIDEO_CODECS = {"h264", "avc1"}
 TRANSCODE_AUDIO_CODECS = {"ac3", "eac3", "dca", "dts", "truehd", "mlp", "flac"}
+SAVE_JOBS: Dict[str, Dict[str, Any]] = {}
+SAVE_JOBS_LOCK = threading.Lock()
+
+
+def subtitle_codec_aliases(codec: Optional[str]) -> set:
+    normalized = (codec or "").strip().lower()
+    aliases = {normalized} if normalized else set()
+    if normalized == "srt":
+        aliases.add("subrip")
+    elif normalized == "subrip":
+        aliases.add("srt")
+    elif normalized == "vtt":
+        aliases.add("webvtt")
+    elif normalized == "webvtt":
+        aliases.add("vtt")
+    return aliases
 
 
 def part_stream_url(part_key: Optional[str]) -> Optional[str]:
@@ -325,6 +383,26 @@ def subtitle_url(stream_key: Optional[str], codec: Optional[str]) -> Optional[st
         return None
     return "/api/subtitle?" + urllib.parse.urlencode(
         {"streamKey": stream_key, "codec": (codec or "").lower()}
+    )
+
+
+def embedded_subtitle_url(
+    rating_key: Optional[str],
+    part_id: Optional[str],
+    stream_id: Optional[str],
+    stream_index: Optional[str],
+    codec: Optional[str],
+) -> Optional[str]:
+    if not rating_key or not part_id or not stream_id or stream_index in (None, ""):
+        return None
+    return "/api/embedded-subtitle?" + urllib.parse.urlencode(
+        {
+            "ratingKey": rating_key,
+            "partId": part_id,
+            "streamId": stream_id,
+            "streamIndex": stream_index,
+            "codec": (codec or "").lower(),
+        }
     )
 
 
@@ -357,12 +435,26 @@ def truthy(value: Any) -> bool:
     return bool(value)
 
 
-def subtitle_from_stream(elem: ET.Element) -> Optional[Dict[str, Any]]:
+def subtitle_from_stream(
+    elem: ET.Element,
+    rating_key: Optional[str] = None,
+    part_elem: Optional[ET.Element] = None,
+) -> Optional[Dict[str, Any]]:
     if elem.get("streamType") != "3":
         return None
     codec = (elem.get("codec") or elem.get("format") or "").lower()
     stream_key = elem.get("key")
-    supported = codec in TEXT_SUBTITLE_CODECS and bool(stream_key)
+    stream_id = elem.get("id")
+    stream_index = elem.get("index")
+    part_id = part_elem.get("id") if part_elem is not None else None
+    sidecar_url = subtitle_url(stream_key, codec) if codec in TEXT_SUBTITLE_CODECS else None
+    embedded_url = (
+        embedded_subtitle_url(rating_key, part_id, stream_id, stream_index, codec)
+        if codec in TEXT_SUBTITLE_CODECS and not sidecar_url
+        else None
+    )
+    subtitle_stream_url = sidecar_url or embedded_url
+    supported = codec in TEXT_SUBTITLE_CODECS and bool(subtitle_stream_url)
     label_parts = [
         elem.get("displayTitle") or elem.get("language") or elem.get("title") or "Subtitle",
         elem.get("title") if elem.get("title") != elem.get("displayTitle") else None,
@@ -375,6 +467,9 @@ def subtitle_from_stream(elem: ET.Element) -> Optional[Dict[str, Any]]:
     return {
         "id": elem.get("id"),
         "key": stream_key,
+        "partId": part_id,
+        "streamId": stream_id,
+        "streamIndex": to_int(stream_index),
         "codec": codec or None,
         "language": elem.get("language"),
         "languageCode": elem.get("languageCode"),
@@ -387,8 +482,10 @@ def subtitle_from_stream(elem: ET.Element) -> Optional[Dict[str, Any]]:
         "forced": bool_attr(elem, "forced"),
         "hearingImpaired": bool_attr(elem, "hearingImpaired"),
         "external": bool_attr(elem, "external") or bool(stream_key),
+        "embedded": bool(embedded_url),
         "supported": supported,
-        "subtitleUrl": subtitle_url(stream_key, codec) if supported else None,
+        "source": "embedded" if embedded_url else ("plex" if stream_key else None),
+        "subtitleUrl": subtitle_stream_url if supported else None,
     }
 
 
@@ -483,24 +580,31 @@ def local_subtitles_for_part(rating_key: Optional[str], part_file: Optional[str]
     return subtitles
 
 
-def first_part(elem: ET.Element) -> Tuple[Optional[str], Dict[str, Any], List[Dict[str, Any]]]:
-    part_elem: Optional[ET.Element] = None
-    media_elem: Optional[ET.Element] = None
+def subtitles_for_part(
+    rating_key: Optional[str],
+    part_elem: ET.Element,
+) -> List[Dict[str, Any]]:
     subtitles: List[Dict[str, Any]] = []
-    for media in elem.findall("Media"):
-        part = media.find("Part")
-        if part is not None:
-            for stream in part.findall("Stream"):
-                subtitle = subtitle_from_stream(stream)
-                if subtitle is not None:
-                    subtitles.append(subtitle)
-        if part is not None and part_elem is None:
-            media_elem = media
-            part_elem = part
-    if part_elem is None:
-        return None, {}, subtitles
-    subtitles.extend(local_subtitles_for_part(elem.get("ratingKey"), part_elem.get("file")))
-    details = {
+    for stream in part_elem.findall("Stream"):
+        subtitle = subtitle_from_stream(stream, rating_key, part_elem)
+        if subtitle is not None:
+            subtitles.append(subtitle)
+    subtitles.extend(local_subtitles_for_part(rating_key, part_elem.get("file")))
+    return subtitles
+
+
+def has_preferred_supported_subtitle(subtitles: List[Dict[str, Any]]) -> bool:
+    return any(
+        subtitle.get("supported")
+        and (subtitle.get("selected") or subtitle.get("default") or subtitle.get("forced"))
+        for subtitle in subtitles
+    )
+
+
+def media_details(media_elem: Optional[ET.Element], part_elem: ET.Element) -> Dict[str, Any]:
+    return {
+        "partId": part_elem.get("id"),
+        "partKey": part_elem.get("key"),
         "container": media_elem.get("container") if media_elem is not None else None,
         "videoCodec": media_elem.get("videoCodec") if media_elem is not None else None,
         "audioCodec": media_elem.get("audioCodec") if media_elem is not None else None,
@@ -510,7 +614,25 @@ def first_part(elem: ET.Element) -> Tuple[Optional[str], Dict[str, Any], List[Di
         "size": to_int(part_elem.get("size")),
         "duration": to_int(part_elem.get("duration")),
     }
-    return part_elem.get("key"), details, subtitles
+
+
+def first_part(elem: ET.Element) -> Tuple[Optional[str], Dict[str, Any], List[Dict[str, Any]]]:
+    candidates: List[Tuple[ET.Element, ET.Element, List[Dict[str, Any]]]] = []
+    for media in elem.findall("Media"):
+        part = media.find("Part")
+        if part is not None:
+            candidates.append((media, part, subtitles_for_part(elem.get("ratingKey"), part)))
+    if not candidates:
+        return None, {}, []
+
+    selected_media, selected_part, selected_subtitles = candidates[0]
+    if not has_preferred_supported_subtitle(selected_subtitles):
+        for media, part, subtitles in candidates[1:]:
+            if has_preferred_supported_subtitle(subtitles):
+                selected_media, selected_part, selected_subtitles = media, part, subtitles
+                break
+
+    return selected_part.get("key"), media_details(selected_media, selected_part), selected_subtitles
 
 
 def playback_info(part_key: Optional[str], media: Dict[str, Any]) -> Dict[str, Any]:
@@ -531,6 +653,257 @@ def playback_info(part_key: Optional[str], media: Dict[str, Any]) -> Dict[str, A
             else None
         ),
     }
+
+
+def saved_playback_dir(create: bool = False) -> Path:
+    path = Path(Settings.saved_media_dir).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def saved_playback_id(rating_key: Optional[str], part_key: Optional[str]) -> Optional[str]:
+    if not rating_key or not part_key:
+        return None
+    return hashlib.sha256(f"{rating_key}:{part_key}".encode("utf-8")).hexdigest()[:24]
+
+
+def saved_playback_paths(playback_id: str, create: bool = False) -> Tuple[Path, Path, Path]:
+    base = saved_playback_dir(create=create)
+    return base / f"{playback_id}.mp4", base / f"{playback_id}.tmp.mp4", base / f"{playback_id}.json"
+
+
+def saved_playback_stream_url(playback_id: str) -> str:
+    return "/api/saved-stream?" + urllib.parse.urlencode({"id": playback_id})
+
+
+def saved_playback_status(
+    rating_key: Optional[str],
+    part_key: Optional[str],
+    media: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    playback_id = saved_playback_id(rating_key, part_key)
+    if not playback_id:
+        return {"state": "unavailable", "ready": False}
+
+    final_path, _, _ = saved_playback_paths(playback_id)
+    with SAVE_JOBS_LOCK:
+        job = dict(SAVE_JOBS.get(playback_id) or {})
+    if final_path.is_file():
+        return {
+            "id": playback_id,
+            "state": "ready",
+            "ready": True,
+            "streamUrl": saved_playback_stream_url(playback_id),
+            "bytes": final_path.stat().st_size,
+            "updatedAt": int(final_path.stat().st_mtime),
+            "media": media or {},
+        }
+    if job:
+        return {
+            "id": playback_id,
+            "state": job.get("state", "saving"),
+            "ready": False,
+            "startedAt": job.get("startedAt"),
+            "message": job.get("message"),
+            "media": media or {},
+        }
+    return {"id": playback_id, "state": "missing", "ready": False, "media": media or {}}
+
+
+def saved_playback_command(part_key: str, media: Dict[str, Any], output_path: Path) -> List[str]:
+    plex_path = safe_plex_path(part_key, prefix="/library/parts/")
+    if not plex_path:
+        raise ValueError("bad_part_key")
+    input_url = PLEX._url(plex_path, {"download": "1"})
+    video_codec = (media.get("videoCodec") or "").lower()
+    audio_codec = (media.get("audioCodec") or "").lower()
+    transcode_video = video_codec not in BROWSER_VIDEO_CODECS
+    transcode_audio = audio_codec in TRANSCODE_AUDIO_CODECS or (
+        audio_codec and audio_codec not in BROWSER_AUDIO_CODECS
+    )
+    command = [
+        Settings.ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-nostdin",
+        "-fflags",
+        "+genpts",
+        "-i",
+        input_url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+    ]
+    if transcode_video:
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+            ]
+        )
+    else:
+        command.extend(["-c:v", "copy"])
+    if transcode_audio:
+        command.extend(["-c:a", "aac", "-b:a", "160k", "-ac", "2"])
+    else:
+        command.extend(["-c:a", "copy"])
+    command.extend(["-movflags", "+faststart", "-f", "mp4", str(output_path)])
+    return command
+
+
+def metadata_item_for_rating_key(rating_key: str) -> Optional[Dict[str, Any]]:
+    elem = metadata_item_element(rating_key)
+    return item_from_xml(elem) if elem is not None else None
+
+
+def run_saved_playback_job(
+    playback_id: str,
+    rating_key: str,
+    part_key: str,
+    media: Dict[str, Any],
+    title: Optional[str],
+) -> None:
+    final_path, temp_path, meta_path = saved_playback_paths(playback_id, create=True)
+    try:
+        if final_path.is_file():
+            with SAVE_JOBS_LOCK:
+                SAVE_JOBS.pop(playback_id, None)
+            return
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        command = saved_playback_command(part_key, media, temp_path)
+        process = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            timeout=Settings.stream_timeout,
+        )
+        if process.returncode != 0:
+            message = process.stderr.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(message or "ffmpeg could not save a compatible playback file")
+        temp_path.replace(final_path)
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "id": playback_id,
+                    "ratingKey": rating_key,
+                    "partKey": part_key,
+                    "title": title,
+                    "media": media,
+                    "createdAt": int(time.time()),
+                    "bytes": final_path.stat().st_size,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    except Exception as exc:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        with SAVE_JOBS_LOCK:
+            SAVE_JOBS[playback_id] = {
+                "state": "error",
+                "ready": False,
+                "startedAt": SAVE_JOBS.get(playback_id, {}).get("startedAt"),
+                "message": str(exc)[:500],
+            }
+        return
+    with SAVE_JOBS_LOCK:
+        SAVE_JOBS.pop(playback_id, None)
+
+
+def start_saved_playback(item: Dict[str, Any]) -> Dict[str, Any]:
+    rating_key = item.get("ratingKey")
+    part_key = item.get("partKey")
+    media = item.get("media") or {}
+    playback_id = saved_playback_id(rating_key, part_key)
+    if not playback_id or not part_key:
+        return {"state": "unavailable", "ready": False}
+    status = saved_playback_status(rating_key, part_key, media)
+    if status.get("ready"):
+        return status
+    already_saving = False
+    with SAVE_JOBS_LOCK:
+        existing = SAVE_JOBS.get(playback_id)
+        if existing and existing.get("state") == "saving":
+            already_saving = True
+        else:
+            SAVE_JOBS[playback_id] = {"state": "saving", "ready": False, "startedAt": int(time.time())}
+    if already_saving:
+        return saved_playback_status(rating_key, part_key, media)
+    thread = threading.Thread(
+        target=run_saved_playback_job,
+        args=(playback_id, str(rating_key), str(part_key), media, item.get("title")),
+        daemon=True,
+    )
+    thread.start()
+    return saved_playback_status(rating_key, part_key, media)
+
+
+def delete_saved_playback(item: Dict[str, Any]) -> Dict[str, Any]:
+    rating_key = item.get("ratingKey")
+    part_key = item.get("partKey")
+    media = item.get("media") or {}
+    playback_id = saved_playback_id(rating_key, part_key)
+    if not playback_id:
+        return {"state": "unavailable", "ready": False}
+    with SAVE_JOBS_LOCK:
+        job = SAVE_JOBS.get(playback_id)
+        if job and job.get("state") == "saving":
+            delete_blocked = True
+        else:
+            delete_blocked = False
+            SAVE_JOBS.pop(playback_id, None)
+    if delete_blocked:
+        return {**saved_playback_status(rating_key, part_key, media), "deleteBlocked": True}
+    for path in saved_playback_paths(playback_id):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    return saved_playback_status(rating_key, part_key, media)
+
+
+def parse_range_header(value: Optional[str], size: int) -> Optional[Tuple[int, int]]:
+    if not value:
+        return None
+    match = re.match(r"bytes=(\d*)-(\d*)$", value.strip())
+    if not match:
+        return None
+    start_raw, end_raw = match.groups()
+    if not start_raw and not end_raw:
+        return None
+    if start_raw:
+        start = int(start_raw)
+        end = int(end_raw) if end_raw else size - 1
+    else:
+        suffix = int(end_raw)
+        if suffix <= 0:
+            return None
+        start = max(0, size - suffix)
+        end = size - 1
+    if start >= size or end < start:
+        return None
+    return start, min(end, size - 1)
 
 
 def external_ids_from_xml(elem: ET.Element) -> Tuple[List[Dict[str, str]], Dict[str, str]]:
@@ -595,6 +968,7 @@ def item_from_xml(elem: ET.Element) -> Dict[str, Any]:
         "streamUrl": part_stream_url(part_key),
         "compatibleStreamUrl": compatible_stream_url(part_key),
         "playback": playback_info(part_key, media),
+        "savedPlayback": saved_playback_status(elem.get("ratingKey"), part_key, media),
         "subtitles": subtitles,
         "media": media,
         "guids": guids,
@@ -1003,6 +1377,69 @@ def resolve_local_subtitle(rating_key: str, filename: str) -> Tuple[Optional[Pat
     return media_path, candidate
 
 
+def resolve_embedded_subtitle(
+    rating_key: str,
+    part_id: str,
+    stream_id: str,
+    stream_index: Optional[int],
+    requested_codec: str,
+) -> Optional[Tuple[Path, int, str]]:
+    if not rating_key or not part_id or not stream_id or stream_index is None:
+        return None
+    elem = metadata_item_element(rating_key)
+    if elem is None:
+        return None
+    requested_aliases = subtitle_codec_aliases(requested_codec)
+    for media in elem.findall("Media"):
+        part = media.find("Part")
+        if part is None or part.get("id") != part_id:
+            continue
+        media_path = Path(part.get("file", ""))
+        if not media_path.is_absolute() or not media_path.is_file():
+            return None
+        for stream in part.findall("Stream"):
+            if stream.get("streamType") != "3" or stream.get("id") != stream_id:
+                continue
+            actual_index = to_int(stream.get("index"))
+            actual_codec = (stream.get("codec") or stream.get("format") or "").lower()
+            if actual_index != stream_index or actual_codec not in TEXT_SUBTITLE_CODECS:
+                return None
+            if requested_aliases and actual_codec not in requested_aliases:
+                return None
+            return media_path, actual_index, actual_codec
+    return None
+
+
+def extract_embedded_subtitle(media_path: Path, stream_index: int) -> bytes:
+    command = [
+        Settings.ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        str(media_path),
+        "-map",
+        f"0:{stream_index}",
+        "-f",
+        "webvtt",
+        "pipe:1",
+    ]
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        timeout=min(Settings.stream_timeout, 120),
+    )
+    if process.returncode != 0:
+        message = process.stderr.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(message or "ffmpeg could not extract the embedded subtitle stream")
+    if len(process.stdout) > 30 * 1024 * 1024:
+        raise ValueError("subtitle_too_large")
+    return process.stdout
+
+
 def items_from_container(root: ET.Element, recursive: bool = False) -> List[Dict[str, Any]]:
     nodes: Iterable[ET.Element]
     if recursive:
@@ -1116,7 +1553,10 @@ class AppHandler(BaseHTTPRequestHandler):
         mime, _ = mimetypes.guess_type(str(target))
         self.send_response(200)
         self.send_header("Content-Type", mime or "application/octet-stream")
-        self.send_header("Cache-Control", "no-cache" if target.name == "index.html" else "public, max-age=3600")
+        cache_control = "public, max-age=3600"
+        if target.name == "index.html" or target.suffix in {".css", ".js"}:
+            cache_control = "no-cache"
+        self.send_header("Cache-Control", cache_control)
         self.send_header("Content-Length", str(target.stat().st_size))
         self.end_headers()
         if method != "HEAD":
@@ -1186,6 +1626,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/subtitle-download":
             self.api_subtitle_download(method)
             return
+        if path == "/api/saved-playback":
+            self.api_saved_playback(method, query)
+            return
         if method not in {"GET", "HEAD"}:
             self.send_json({"error": "method_not_allowed"}, status=405)
             return
@@ -1209,10 +1652,14 @@ class AppHandler(BaseHTTPRequestHandler):
             self.handle_stream(method, query)
         elif path == "/api/stream-compatible":
             self.handle_stream_compatible(method, query)
+        elif path == "/api/saved-stream":
+            self.handle_saved_stream(method, query)
         elif path == "/api/subtitle":
             self.handle_subtitle(method, query)
         elif path == "/api/local-subtitle":
             self.handle_local_subtitle(method, query)
+        elif path == "/api/embedded-subtitle":
+            self.handle_embedded_subtitle(method, query)
         elif path == "/api/subtitle-search":
             self.api_subtitle_search(method, query)
         else:
@@ -1242,7 +1689,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         view = one(query, "view", "all")
         start = max(0, to_int(one(query, "start", "0")) or 0)
-        limit = min(300, max(1, to_int(one(query, "limit", "120")) or 120))
+        limit = min(300, max(1, to_int(one(query, "limit", "48")) or 48))
         sort = one(query, "sort", "")
         params: Dict[str, Any] = {
             "includeGuids": "1",
@@ -1350,7 +1797,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if method == "HEAD":
                 return
             try:
-                shutil.copyfileobj(response, self.wfile, length=1024 * 1024)
+                copy_stream(response, self.wfile)
             except (BrokenPipeError, ConnectionResetError):
                 return
 
@@ -1372,6 +1819,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         input_url = PLEX._url(plex_path, {"download": "1"})
+        quality = one(query, "quality", "").strip().lower()
+        remote_quality = quality in {"remote", "low", "480p"}
         command = [
             Settings.ffmpeg_path,
             "-hide_banner",
@@ -1388,20 +1837,54 @@ class AppHandler(BaseHTTPRequestHandler):
             "0:a:0?",
             "-sn",
             "-dn",
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-ac",
-            "2",
-            "-movflags",
-            "frag_keyframe+empty_moov+default_base_moof",
-            "-f",
-            "mp4",
-            "pipe:1",
         ]
+        if remote_quality:
+            command.extend(
+                [
+                    "-vf",
+                    "scale=-2:480",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-profile:v",
+                    "main",
+                    "-b:v",
+                    "900k",
+                    "-maxrate",
+                    "1100k",
+                    "-bufsize",
+                    "1800k",
+                    "-g",
+                    "48",
+                    "-keyint_min",
+                    "48",
+                    "-sc_threshold",
+                    "0",
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "-c:v",
+                    "copy",
+                ]
+            )
+        command.extend(
+            [
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k" if remote_quality else "192k",
+                "-ac",
+                "2",
+                "-movflags",
+                "frag_keyframe+empty_moov+default_base_moof",
+                "-f",
+                "mp4",
+                "pipe:1",
+            ]
+        )
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -1410,7 +1893,7 @@ class AppHandler(BaseHTTPRequestHandler):
         )
         assert process.stdout is not None
         try:
-            first_chunk = process.stdout.read(1024 * 128)
+            first_chunk = read_stream_chunk(process.stdout, TRANSCODE_STARTUP_CHUNK_SIZE)
             if not first_chunk:
                 process.wait(timeout=3)
                 self.send_json({"error": "transcode_failed"}, status=502)
@@ -1418,10 +1901,16 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
             self.send_header("Cache-Control", "private, max-age=0")
-            self.send_header("X-Playback-Mode", "audio-transcode-aac")
+            self.send_header("Accept-Ranges", "none")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header(
+                "X-Playback-Mode",
+                "remote-480p-aac" if remote_quality else "audio-transcode-aac",
+            )
             self.end_headers()
-            self.wfile.write(first_chunk)
-            shutil.copyfileobj(process.stdout, self.wfile, length=1024 * 1024)
+            write_chunked(self.wfile, first_chunk)
+            copy_chunked_stream(process.stdout, self.wfile)
+            finish_chunked(self.wfile)
         except (BrokenPipeError, ConnectionResetError):
             return
         finally:
@@ -1431,6 +1920,94 @@ class AppHandler(BaseHTTPRequestHandler):
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.terminate()
+
+    def api_saved_playback(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method not in {"GET", "HEAD", "POST"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload: Dict[str, Any] = {}
+        if method == "POST":
+            payload = self.read_json()
+            rating_key = str(payload.get("ratingKey") or "").strip()
+        else:
+            rating_key = one(query, "ratingKey", "").strip()
+        if not rating_key:
+            self.send_json({"error": "missing_rating_key"}, status=400)
+            return
+        item = metadata_item_for_rating_key(rating_key)
+        if not item:
+            self.send_json({"error": "not_found"}, status=404)
+            return
+
+        action = str(payload.get("action") or "save").strip().lower() if method == "POST" else "status"
+        if method == "POST" and action == "delete":
+            status = delete_saved_playback(item)
+            if status.get("deleteBlocked"):
+                self.send_json({"error": "save_in_progress", "savedPlayback": status}, status=409)
+                return
+        elif method == "POST":
+            status = start_saved_playback(item)
+        else:
+            status = saved_playback_status(item.get("ratingKey"), item.get("partKey"), item.get("media"))
+        item["savedPlayback"] = status
+        self.send_json(
+            {
+                "savedPlayback": status,
+                "item": {
+                    "ratingKey": item.get("ratingKey"),
+                    "title": item.get("title"),
+                    "partKey": item.get("partKey"),
+                    "media": item.get("media"),
+                },
+            }
+        )
+
+    def handle_saved_stream(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method not in {"GET", "HEAD"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        self.require_auth()
+        playback_id = one(query, "id", "").strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{24}", playback_id):
+            self.send_json({"error": "bad_saved_id"}, status=400)
+            return
+        final_path, _, _ = saved_playback_paths(playback_id)
+        if not final_path.is_file():
+            self.send_json({"error": "saved_playback_not_found"}, status=404)
+            return
+        size = final_path.stat().st_size
+        range_header = self.headers.get("Range")
+        selected_range = parse_range_header(range_header, size)
+        if range_header and selected_range is None:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        start, end = selected_range or (0, size - 1)
+        length = end - start + 1
+        self.send_response(206 if selected_range else 200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "private, max-age=0")
+        self.send_header("Content-Length", str(length))
+        if selected_range:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if method == "HEAD":
+            return
+        try:
+            with final_path.open("rb") as handle:
+                handle.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = handle.read(min(STREAM_CHUNK_SIZE, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def handle_subtitle(self, method: str, query: Dict[str, List[str]]) -> None:
         if method not in {"GET", "HEAD"}:
@@ -1471,6 +2048,45 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         raw = b"" if method == "HEAD" else subtitle_path.read_bytes()
         body = b"" if method == "HEAD" else subtitle_to_vtt(raw, codec)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/vtt; charset=utf-8")
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if method != "HEAD":
+            self.wfile.write(body)
+
+    def handle_embedded_subtitle(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method not in {"GET", "HEAD"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        self.require_auth()
+        rating_key = one(query, "ratingKey", "")
+        part_id = one(query, "partId", "")
+        stream_id = one(query, "streamId", "")
+        stream_index = to_int(one(query, "streamIndex", ""))
+        codec = one(query, "codec", "").lower()
+        resolved = resolve_embedded_subtitle(rating_key, part_id, stream_id, stream_index, codec)
+        if resolved is None:
+            self.send_json({"error": "bad_embedded_subtitle"}, status=400)
+            return
+        media_path, actual_index, _ = resolved
+        try:
+            body = b"" if method == "HEAD" else extract_embedded_subtitle(media_path, actual_index)
+        except FileNotFoundError:
+            self.send_json({"error": "ffmpeg_unavailable"}, status=500)
+            return
+        except subprocess.TimeoutExpired:
+            self.send_json({"error": "subtitle_extract_timeout"}, status=504)
+            return
+        except ValueError as exc:
+            if str(exc) == "subtitle_too_large":
+                self.send_json({"error": "subtitle_too_large"}, status=413)
+                return
+            raise
+        except RuntimeError as exc:
+            self.send_json({"error": "subtitle_extract_failed", "message": str(exc)[:500]}, status=502)
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/vtt; charset=utf-8")
         self.send_header("Cache-Control", "private, max-age=3600")
