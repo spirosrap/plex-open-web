@@ -23,7 +23,7 @@ const state = {
   subtitleResults: [],
 };
 
-const DEVICE_CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024;
+const DEVICE_CACHE_MAX_BYTES = 12 * 1024 * 1024 * 1024;
 const DEVICE_CACHE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const LOCAL_PROGRESS_KEY = "plex-open-web-progress-v1";
 const PROGRESS_REPORT_INTERVAL_MS = 15000;
@@ -1015,7 +1015,7 @@ function updateDeviceControls(item = state.playerItem) {
   if (!canUse) {
     return;
   }
-  el.playerDeviceSave.title = "Keeps local copies for 14 days and prunes oldest items above 4 GB.";
+  el.playerDeviceSave.title = "Keeps local copies for 14 days and prunes oldest items above 12 GB.";
   el.playerDeviceDelete.title = "";
   el.playerDeviceSave.disabled = state.deviceSaveInProgress;
   el.playerDeviceDelete.disabled = false;
