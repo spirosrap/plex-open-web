@@ -379,6 +379,12 @@ def compatible_stream_url(part_key: Optional[str]) -> Optional[str]:
     return "/api/stream-compatible?" + urllib.parse.urlencode({"partKey": part_key})
 
 
+def original_download_url(rating_key: Optional[str]) -> Optional[str]:
+    if not rating_key:
+        return None
+    return "/api/download-original?" + urllib.parse.urlencode({"ratingKey": rating_key})
+
+
 def subtitle_url(stream_key: Optional[str], codec: Optional[str]) -> Optional[str]:
     if not stream_key:
         return None
@@ -998,6 +1004,7 @@ def item_from_xml(elem: ET.Element) -> Dict[str, Any]:
         "partKey": part_key,
         "streamUrl": part_stream_url(part_key),
         "compatibleStreamUrl": compatible_stream_url(part_key),
+        "downloadOriginalUrl": original_download_url(elem.get("ratingKey")) if part_key else None,
         "playback": playback_info(part_key, media),
         "savedPlayback": saved_playback_status(elem.get("ratingKey"), part_key, media),
         "subtitles": subtitles,
@@ -1239,6 +1246,14 @@ def first_part_file(elem: ET.Element) -> Optional[Path]:
     return None
 
 
+def first_part_element(elem: ET.Element) -> Optional[ET.Element]:
+    for media in elem.findall("Media"):
+        part = media.find("Part")
+        if part is not None:
+            return part
+    return None
+
+
 def imdb_numeric(imdb_id: Optional[str]) -> Optional[str]:
     if not imdb_id:
         return None
@@ -1313,6 +1328,105 @@ def content_disposition_filename(value: Optional[str]) -> Optional[str]:
     if match:
         return match.group(1).strip()
     return None
+
+
+def safe_download_filename(value: Optional[str], fallback: str = "download") -> str:
+    cleaned = re.sub(r"[\x00-\x1f/\\:*?\"<>|]+", " ", str(value or "")).strip(" .")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned[:180] or fallback
+
+
+def content_disposition_attachment(filename: str) -> str:
+    ascii_name = filename.encode("ascii", errors="ignore").decode("ascii") or "download"
+    ascii_name = safe_download_filename(ascii_name, "download")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{urllib.parse.quote(filename)}"
+
+
+def subtitle_download_extension(codec: Optional[str]) -> str:
+    normalized = (codec or "srt").strip().lower()
+    if normalized in {"subrip", "srt"}:
+        return "srt"
+    if normalized in {"webvtt", "vtt"}:
+        return "vtt"
+    return normalized if normalized in LOCAL_SUBTITLE_EXTENSIONS else "srt"
+
+
+def subtitle_download_label(subtitle: Dict[str, Any], index: int) -> str:
+    parts = [
+        subtitle.get("srclang") or subtitle.get("languageCode") or "und",
+        subtitle.get("source") or "subtitle",
+    ]
+    if subtitle.get("forced"):
+        parts.append("forced")
+    if subtitle.get("hearingImpaired"):
+        parts.append("sdh")
+    parts.append(str(index + 1))
+    return ".".join(safe_download_filename(str(part).lower(), "subtitle") for part in parts if part)
+
+
+def unique_zip_name(name: str, used: set) -> str:
+    candidate = name
+    stem = str(Path(name).with_suffix(""))
+    suffix = Path(name).suffix
+    counter = 2
+    while candidate in used:
+        candidate = f"{stem}-{counter}{suffix}"
+        counter += 1
+    used.add(candidate)
+    return candidate
+
+
+def subtitle_download_entries(
+    rating_key: str,
+    media_path: Path,
+    subtitles: List[Dict[str, Any]],
+) -> List[Tuple[str, bytes]]:
+    entries: List[Tuple[str, bytes]] = []
+    used = {media_path.name}
+    for index, subtitle in enumerate(subtitles):
+        if not subtitle.get("supported"):
+            continue
+        try:
+            source = subtitle.get("source")
+            codec = subtitle_download_extension(subtitle.get("codec"))
+            if source in {"local", "opensubtitles"} or str(subtitle.get("id") or "").startswith("local:"):
+                _, subtitle_path = resolve_local_subtitle(rating_key, str(subtitle.get("key") or ""))
+                if subtitle_path is None or subtitle_path.stat().st_size > 30 * 1024 * 1024:
+                    continue
+                name = subtitle_path.name
+                data = subtitle_path.read_bytes()
+            elif source == "embedded":
+                resolved = resolve_embedded_subtitle(
+                    rating_key,
+                    str(subtitle.get("partId") or ""),
+                    str(subtitle.get("streamId") or ""),
+                    to_int(str(subtitle.get("streamIndex") if subtitle.get("streamIndex") is not None else "")),
+                    str(subtitle.get("codec") or ""),
+                )
+                if resolved is None:
+                    continue
+                resolved_media_path, stream_index, _ = resolved
+                if resolved_media_path != media_path:
+                    continue
+                codec = "vtt"
+                data = extract_embedded_subtitle(media_path, stream_index)
+                name = f"{media_path.stem}.{subtitle_download_label(subtitle, index)}.{codec}"
+            else:
+                stream_key = str(subtitle.get("key") or "")
+                plex_path = safe_plex_path(stream_key, prefix="/library/streams/")
+                if not plex_path:
+                    continue
+                with PLEX.open(plex_path, timeout=Settings.request_timeout) as response:
+                    data = response.read(30 * 1024 * 1024 + 1)
+                if len(data) > 30 * 1024 * 1024:
+                    continue
+                name = f"{media_path.stem}.{subtitle_download_label(subtitle, index)}.{codec}"
+            safe_name = safe_download_filename(name, f"subtitle-{index + 1}.{codec}")
+            entries.append((unique_zip_name(safe_name, used), data))
+        except Exception:
+            traceback.print_exc()
+            continue
+    return entries
 
 
 def subtitle_payload_ext(filename: Optional[str], data: bytes) -> str:
@@ -1688,6 +1802,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.handle_stream_compatible(method, query)
         elif path == "/api/saved-stream":
             self.handle_saved_stream(method, query)
+        elif path == "/api/download-original":
+            self.handle_original_download(method, query)
         elif path == "/api/subtitle":
             self.handle_subtitle(method, query)
         elif path == "/api/local-subtitle":
@@ -2074,6 +2190,46 @@ class AppHandler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def handle_original_download(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method not in {"GET", "HEAD"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        self.require_auth()
+        rating_key = one(query, "ratingKey", "").strip()
+        if not rating_key:
+            self.send_json({"error": "missing_rating_key"}, status=400)
+            return
+        elem = metadata_item_element(rating_key)
+        if elem is None:
+            self.send_json({"error": "metadata_not_found"}, status=404)
+            return
+        part = first_part_element(elem)
+        media_path = Path(part.get("file", "")) if part is not None and part.get("file") else None
+        if media_path is None or not media_path.is_absolute() or not media_path.is_file():
+            self.send_json({"error": "media_file_unavailable"}, status=404)
+            return
+
+        subtitles = subtitles_for_part(rating_key, part)
+        zip_name = safe_download_filename(f"{media_path.stem} + subtitles.zip", "media-with-subtitles.zip")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", content_disposition_attachment(zip_name))
+        self.send_header("Cache-Control", "private, max-age=0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        if method == "HEAD":
+            return
+        try:
+            with zipfile.ZipFile(self.wfile, mode="w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                archive.write(media_path, arcname=safe_download_filename(media_path.name, "video"))
+                for name, data in subtitle_download_entries(rating_key, media_path, subtitles):
+                    info = zipfile.ZipInfo(name)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    archive.writestr(info, data)
         except (BrokenPipeError, ConnectionResetError):
             return
 

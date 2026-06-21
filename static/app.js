@@ -66,6 +66,7 @@ const el = {
   playerDeleteSave: document.querySelector("#player-delete-save"),
   playerDeviceSave: document.querySelector("#player-device-save"),
   playerDeviceDelete: document.querySelector("#player-device-delete"),
+  playerDownloadOriginal: document.querySelector("#player-download-original"),
   playerSubtitleSearch: document.querySelector("#player-subtitle-search"),
   player: document.querySelector("#player"),
   subtitleDialog: document.querySelector("#subtitle-dialog"),
@@ -1031,6 +1032,27 @@ function updateDeviceControls(item = state.playerItem) {
   }
 }
 
+function updateDownloadControls(item = state.playerItem) {
+  const canDownload = Boolean(item?.downloadOriginalUrl);
+  el.playerDownloadOriginal.hidden = !canDownload;
+  el.playerDownloadOriginal.disabled = !canDownload;
+  el.playerDownloadOriginal.title = canDownload
+    ? "Download the original media file in a zip with available subtitle files."
+    : "";
+  el.playerDownloadOriginal.textContent = "Download";
+}
+
+function downloadOriginalFiles(item = state.playerItem) {
+  if (!item?.downloadOriginalUrl) return;
+  const link = document.createElement("a");
+  link.href = item.downloadOriginalUrl;
+  link.rel = "noopener";
+  link.style.display = "none";
+  document.body.append(link);
+  link.click();
+  link.remove();
+}
+
 function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } = {}) {
   clearSubtitleTracks();
   const applyResume = () => {
@@ -1219,6 +1241,7 @@ async function playItem(item) {
   el.playerSubtitleSearch.onclick = () => openSubtitleDialog(item);
   updateSaveControls(item);
   updateDeviceControls(item);
+  updateDownloadControls(item);
   if (item.savedPlayback?.state === "saving") {
     pollSavedPlayback(item, false);
   }
@@ -1434,6 +1457,7 @@ el.playerClose.addEventListener("click", async () => {
   el.playerDeleteSave.hidden = true;
   el.playerDeviceSave.hidden = true;
   el.playerDeviceDelete.hidden = true;
+  el.playerDownloadOriginal.hidden = true;
   state.usingSavedPlayback = false;
   state.usingDevicePlayback = false;
   revokeDeviceObjectUrls();
@@ -1454,6 +1478,7 @@ el.playerDialog.addEventListener("close", () => {
   el.playerDeleteSave.hidden = true;
   el.playerDeviceSave.hidden = true;
   el.playerDeviceDelete.hidden = true;
+  el.playerDownloadOriginal.hidden = true;
   state.usingSavedPlayback = false;
   state.usingDevicePlayback = false;
   revokeDeviceObjectUrls();
@@ -1526,6 +1551,9 @@ el.playerDeviceDelete.addEventListener("click", async () => {
     el.playerDeviceDelete.disabled = false;
     el.playerDeviceDelete.title = error.message;
   }
+});
+el.playerDownloadOriginal.addEventListener("click", () => {
+  downloadOriginalFiles();
 });
 el.subtitleClose.addEventListener("click", () => el.subtitleDialog.close());
 el.subtitleForm.addEventListener("submit", async (event) => {
