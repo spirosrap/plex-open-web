@@ -4,14 +4,14 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Plex Open Web</title>
-    <link rel="stylesheet" href="/styles.css?v=17" />
+    <link rel="stylesheet" href="/styles.css?v=__APP_VERSION__" />
   </head>
   <body>
     <main id="login" class="login-shell" hidden>
       <form id="login-form" class="login-panel">
         <div class="brand-mark">POW</div>
         <h1>Plex Open Web</h1>
-        <p id="login-version" class="app-version">Version</p>
+        <p id="login-version" class="app-version">Version __APP_VERSION__</p>
         <label for="password">Password</label>
         <div class="login-row">
           <input id="password" name="password" type="password" autocomplete="current-password" autofocus />
@@ -28,12 +28,12 @@
           <div>
             <strong>Plex Open Web</strong>
             <span id="server-name">Media server</span>
+            <span id="app-version" class="app-version">Version __APP_VERSION__</span>
           </div>
         </div>
         <nav id="libraries" class="library-list" aria-label="Libraries"></nav>
         <div class="sidebar-footer">
           <button id="logout" class="ghost-button">Sign out</button>
-          <span id="app-version" class="app-version">Version</span>
         </div>
       </aside>
 
@@ -131,6 +131,6 @@
       <section id="subtitle-results" class="subtitle-results" aria-live="polite"></section>
     </dialog>
 
-    <script src="/app.js?v=17" type="module"></script>
+    <script src="/app.js?v=__APP_VERSION__" type="module"></script>
   </body>
 </html>

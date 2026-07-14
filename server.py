@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 COOKIE_NAME = "plex_open_session"
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
@@ -1697,7 +1697,9 @@ class AppHandler(BaseHTTPRequestHandler):
         target = safe_static_path(path)
         if target is None:
             target = STATIC_DIR / "index.html"
-        body = b"" if method == "HEAD" else target.read_bytes()
+        body = target.read_bytes()
+        if target.name == "index.html":
+            body = body.replace(b"__APP_VERSION__", APP_VERSION.encode("utf-8"))
         mime, _ = mimetypes.guess_type(str(target))
         self.send_response(200)
         self.send_header("Content-Type", mime or "application/octet-stream")
@@ -1705,7 +1707,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if target.name == "index.html" or target.suffix in {".css", ".js"}:
             cache_control = "no-cache"
         self.send_header("Cache-Control", cache_control)
-        self.send_header("Content-Length", str(target.stat().st_size))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if method != "HEAD":
             self.wfile.write(body)
