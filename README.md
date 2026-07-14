@@ -9,6 +9,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Password-protected web UI with signed HttpOnly session cookies.
 - Library list, continue/recent/all/unwatched views, sorting, and search.
 - Resume-progress indicators and manual watched/unwatched controls synchronized with Plex.
+- Persistent System, Light, and Dark color themes available before and after login.
 - One-tap scanning for the selected Plex library with progress feedback and an automatic result reload.
 - Movie playback in the browser through a Range-aware stream proxy.
 - TV show navigation from show to season to episode.
@@ -22,6 +23,24 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.5.0
+
+**Added**
+
+- Added System, Light, and Dark color-theme selectors to the login and signed-in app.
+- Added per-browser theme persistence across reloads and sign-out.
+
+**Improved**
+
+- System mode follows the browser or operating-system color preference automatically.
+- Theme colors now cover forms, navigation, cards, dialogs, subtitle tools, playback controls, status messages, and focus states.
+- The saved theme is applied before the first paint to prevent a light-to-dark or dark-to-light flash.
+
+**Fixed**
+
+- Fixed low-contrast fields, metadata labels, danger actions, and selected controls when using the Light theme.
+- Theme changes remain usable for the current page even when browser storage is unavailable.
 
 ### 0.4.0
 

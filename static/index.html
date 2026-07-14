@@ -4,6 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Plex Open Web</title>
+    <script>
+      (() => {
+        const key = "plex-open-web-theme-v1";
+        let theme = "system";
+        try {
+          const stored = localStorage.getItem(key);
+          theme = ["system", "light", "dark"].includes(stored) ? stored : "system";
+        } catch {}
+        const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.dataset.resolvedTheme = theme === "system" ? (systemDark ? "dark" : "light") : theme;
+      })();
+    </script>
     <link rel="stylesheet" href="/styles.css?v=__APP_VERSION__" />
   </head>
   <body>
@@ -12,6 +25,14 @@
         <div class="brand-mark">POW</div>
         <h1>Plex Open Web</h1>
         <p id="login-version" class="app-version">Version __APP_VERSION__</p>
+        <div class="theme-field">
+          <label for="login-theme">Color theme</label>
+          <select id="login-theme">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
         <label for="password">Password</label>
         <div class="login-row">
           <input id="password" name="password" type="password" autocomplete="current-password" autofocus />
@@ -33,6 +54,14 @@
         </div>
         <nav id="libraries" class="library-list" aria-label="Libraries"></nav>
         <div class="sidebar-footer">
+          <label class="theme-field" for="app-theme">
+            <span>Color theme</span>
+            <select id="app-theme">
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
           <button id="logout" class="ghost-button">Sign out</button>
         </div>
       </aside>

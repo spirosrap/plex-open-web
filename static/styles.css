@@ -1,6 +1,6 @@
 :root {
   color-scheme: dark;
-  --bg: #101010;
+  --bg: #101214;
   --panel: #191a1c;
   --panel-2: #222326;
   --text: #f4f1e8;
@@ -10,6 +10,58 @@
   --accent-2: #31c6b1;
   --danger: #ef6f5e;
   --shadow: 0 22px 70px rgba(0, 0, 0, 0.36);
+  --page-background: #101214;
+  --panel-glass: rgba(25, 26, 28, 0.94);
+  --sidebar-background: rgba(13, 15, 16, 0.9);
+  --field: #111315;
+  --segmented: rgba(17, 19, 21, 0.9);
+  --on-accent: #151515;
+  --active-border: rgba(245, 182, 66, 0.48);
+  --poster-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  --poster-fallback: linear-gradient(135deg, #303835, #172724);
+  --watched-background: rgba(49, 198, 177, 0.94);
+  --on-watched: #07110f;
+  --progress-track: rgba(8, 10, 11, 0.78);
+  --badge-background: rgba(16, 18, 20, 0.86);
+  --danger-background: rgba(239, 111, 94, 0.16);
+  --danger-text: #ffb7ad;
+  --backdrop: rgba(0, 0, 0, 0.72);
+  --summary: #d6d1c6;
+  --meta-surface: #101214;
+  --playback-background: rgba(49, 198, 177, 0.18);
+}
+
+:root[data-resolved-theme="light"] {
+  color-scheme: light;
+  --bg: #f3f5f4;
+  --panel: #ffffff;
+  --panel-2: #e5e9e7;
+  --text: #1b1f1d;
+  --muted: #5f6763;
+  --line: #cbd2ce;
+  --accent: #d99000;
+  --accent-2: #007f72;
+  --danger: #b43b2f;
+  --shadow: 0 20px 60px rgba(28, 39, 34, 0.16);
+  --page-background: #f3f5f4;
+  --panel-glass: rgba(255, 255, 255, 0.96);
+  --sidebar-background: rgba(247, 249, 248, 0.94);
+  --field: #ffffff;
+  --segmented: #e6eae8;
+  --on-accent: #171717;
+  --active-border: rgba(190, 125, 0, 0.58);
+  --poster-shadow: 0 10px 24px rgba(25, 41, 34, 0.16);
+  --poster-fallback: linear-gradient(135deg, #dfe8e4, #cbd9d4);
+  --watched-background: rgba(0, 127, 114, 0.95);
+  --on-watched: #ffffff;
+  --progress-track: rgba(20, 30, 26, 0.24);
+  --badge-background: rgba(255, 255, 255, 0.92);
+  --danger-background: rgba(180, 59, 47, 0.12);
+  --danger-text: #a32f25;
+  --backdrop: rgba(20, 27, 24, 0.48);
+  --summary: #3e4743;
+  --meta-surface: #edf0ef;
+  --playback-background: rgba(0, 127, 114, 0.12);
 }
 
 * {
@@ -23,9 +75,7 @@
 body {
   margin: 0;
   min-height: 100vh;
-  background:
-    radial-gradient(circle at top left, rgba(245, 182, 66, 0.14), transparent 30rem),
-    linear-gradient(135deg, #101010 0%, #17140f 45%, #111817 100%);
+  background: var(--page-background);
   color: var(--text);
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -66,7 +116,7 @@ select:focus-visible {
   padding: 28px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: rgba(25, 26, 28, 0.92);
+  background: var(--panel-glass);
   box-shadow: var(--shadow);
 }
 
@@ -77,7 +127,7 @@ select:focus-visible {
   place-items: center;
   border-radius: 7px;
   background: var(--accent);
-  color: #111;
+  color: var(--on-accent);
   font-weight: 900;
   letter-spacing: 0;
 }
@@ -106,13 +156,14 @@ select:focus-visible {
 
 .login-row input,
 .search input,
-.toolbar select {
+.toolbar select,
+.theme-field select {
   min-width: 0;
   width: 100%;
   min-height: 42px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #111;
+  background: var(--field);
   color: var(--text);
   padding: 0 12px;
 }
@@ -124,7 +175,7 @@ select:focus-visible {
   min-height: 42px;
   border-radius: 6px;
   background: var(--accent);
-  color: #111;
+  color: var(--on-accent);
   padding: 0 14px;
   font-weight: 800;
 }
@@ -136,6 +187,21 @@ select:focus-visible {
 .error-text {
   min-height: 22px;
   color: var(--danger);
+}
+
+.theme-field {
+  display: grid;
+  gap: 6px;
+}
+
+.login-panel .theme-field {
+  margin-bottom: 16px;
+}
+
+.theme-field span,
+.theme-field label {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .app-shell {
@@ -153,7 +219,7 @@ select:focus-visible {
   gap: 24px;
   padding: 22px 16px;
   border-right: 1px solid var(--line);
-  background: rgba(16, 16, 16, 0.86);
+  background: var(--sidebar-background);
   backdrop-filter: blur(18px);
 }
 
@@ -201,7 +267,7 @@ select:focus-visible {
 
 .library-button[data-active="true"] {
   background: var(--panel-2);
-  border-color: rgba(245, 182, 66, 0.45);
+  border-color: var(--active-border);
 }
 
 .library-button span,
@@ -294,7 +360,7 @@ select:focus-visible {
   padding: 4px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: rgba(17, 17, 17, 0.8);
+  background: var(--segmented);
 }
 
 .segmented button {
@@ -379,7 +445,7 @@ select:focus-visible {
   overflow: hidden;
   border-radius: 8px;
   background: var(--panel-2);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  box-shadow: var(--poster-shadow);
 }
 
 .poster-button img,
@@ -392,7 +458,7 @@ select:focus-visible {
 }
 
 .poster-fallback {
-  background: linear-gradient(135deg, #30332e, #192927);
+  background: var(--poster-fallback);
   color: var(--accent);
   font-size: 54px;
   font-weight: 900;
@@ -404,8 +470,8 @@ select:focus-visible {
   top: 8px;
   padding: 4px 7px;
   border-radius: 4px;
-  background: rgba(49, 198, 177, 0.92);
-  color: #07110f;
+  background: var(--watched-background);
+  color: var(--on-watched);
   font-size: 12px;
   font-weight: 800;
 }
@@ -418,7 +484,7 @@ select:focus-visible {
   height: 5px;
   overflow: hidden;
   border-radius: 3px;
-  background: rgba(16, 16, 16, 0.78);
+  background: var(--progress-track);
 }
 
 .resume-progress span {
@@ -434,7 +500,7 @@ select:focus-visible {
   top: 8px;
   padding: 4px 7px;
   border-radius: 4px;
-  background: rgba(16, 16, 16, 0.82);
+  background: var(--badge-background);
   color: var(--accent);
   font-size: 12px;
   font-weight: 900;
@@ -488,8 +554,8 @@ select:focus-visible {
 }
 
 .danger-button {
-  background: rgba(239, 111, 94, 0.16);
-  color: #ffb7ad;
+  background: var(--danger-background);
+  color: var(--danger-text);
 }
 
 .details-dialog,
@@ -506,7 +572,7 @@ select:focus-visible {
 .details-dialog::backdrop,
 .player-dialog::backdrop,
 .subtitle-dialog::backdrop {
-  background: rgba(0, 0, 0, 0.72);
+  background: var(--backdrop);
 }
 
 .details-layout {
@@ -544,7 +610,7 @@ select:focus-visible {
 }
 
 #details-summary {
-  color: #d6d1c6;
+  color: var(--summary);
   line-height: 1.55;
 }
 
@@ -558,7 +624,7 @@ select:focus-visible {
 .meta-row span {
   padding: 5px 8px;
   border-radius: 5px;
-  background: #101010;
+  background: var(--meta-surface);
   color: var(--muted);
 }
 
@@ -616,7 +682,7 @@ select:focus-visible {
 .playback-mode {
   padding: 5px 8px;
   border-radius: 5px;
-  background: rgba(49, 198, 177, 0.18);
+  background: var(--playback-background);
   color: var(--accent-2);
   font-size: 12px;
   font-weight: 800;
@@ -628,7 +694,7 @@ select:focus-visible {
   min-height: 32px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #111;
+  background: var(--field);
   color: var(--text);
   padding: 0 8px;
 }
@@ -684,7 +750,7 @@ select:focus-visible {
   min-height: 42px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #111;
+  background: var(--field);
   color: var(--text);
   padding: 0 12px;
 }

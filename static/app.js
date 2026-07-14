@@ -28,6 +28,8 @@ const state = {
 const DEVICE_CACHE_MAX_BYTES = 12 * 1024 * 1024 * 1024;
 const DEVICE_CACHE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const LOCAL_PROGRESS_KEY = "plex-open-web-progress-v1";
+const THEME_KEY = "plex-open-web-theme-v1";
+const THEME_VALUES = new Set(["system", "light", "dark"]);
 const PROGRESS_REPORT_INTERVAL_MS = 15000;
 
 const el = {
@@ -36,10 +38,12 @@ const el = {
   loginForm: document.querySelector("#login-form"),
   loginError: document.querySelector("#login-error"),
   loginVersion: document.querySelector("#login-version"),
+  loginTheme: document.querySelector("#login-theme"),
   password: document.querySelector("#password"),
   libraries: document.querySelector("#libraries"),
   logout: document.querySelector("#logout"),
   appVersion: document.querySelector("#app-version"),
+  appTheme: document.querySelector("#app-theme"),
   serverName: document.querySelector("#server-name"),
   breadcrumbs: document.querySelector("#breadcrumbs"),
   viewTitle: document.querySelector("#view-title"),
@@ -123,6 +127,29 @@ function showVersion(version) {
   el.loginVersion.textContent = label;
   el.appVersion.textContent = label;
 }
+
+function applyTheme(value, { persist = true } = {}) {
+  const theme = THEME_VALUES.has(value) ? value : "system";
+  const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.dataset.resolvedTheme = theme === "system" ? (systemDark ? "dark" : "light") : theme;
+  el.loginTheme.value = theme;
+  el.appTheme.value = theme;
+  if (persist) {
+    try {
+      localStorage.setItem(THEME_KEY, theme);
+    } catch {
+      // The selected theme still applies for this page when storage is unavailable.
+    }
+  }
+}
+
+applyTheme(document.documentElement.dataset.theme, { persist: false });
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+  if (document.documentElement.dataset.theme === "system") {
+    applyTheme("system", { persist: false });
+  }
+});
 
 function setStatus(message = "", kind = "") {
   el.status.textContent = message;
@@ -1537,6 +1564,9 @@ el.logout.addEventListener("click", async () => {
   await api("/api/logout", { method: "POST", body: "{}" });
   window.location.reload();
 });
+
+el.loginTheme.addEventListener("change", () => applyTheme(el.loginTheme.value));
+el.appTheme.addEventListener("change", () => applyTheme(el.appTheme.value));
 
 el.searchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
