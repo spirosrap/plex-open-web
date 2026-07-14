@@ -7,7 +7,8 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Features
 
 - Password-protected web UI with signed HttpOnly session cookies.
-- Library list, recent/all/unwatched views, sorting, and search.
+- Library list, continue/recent/all/unwatched views, sorting, and search.
+- Resume-progress indicators and manual watched/unwatched controls synchronized with Plex.
 - One-tap scanning for the selected Plex library with progress feedback and an automatic result reload.
 - Movie playback in the browser through a Range-aware stream proxy.
 - TV show navigation from show to season to episode.
@@ -21,6 +22,28 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.4.0
+
+**Added**
+
+- Added a Continue view for in-progress media and the next available TV episodes in each library.
+- Added Mark watched and Mark unwatched actions to movie and episode details.
+- Added resume-progress bars to media posters and progress status to details.
+
+**Improved**
+
+- Continue preserves Plex's On Deck ordering and disables the unrelated library sort control.
+- Continue and Unwatched automatically reload after playback or a manual watched-state change.
+- Added regression tests for Continue paging, watched-state validation, and Plex watched/unwatched actions.
+
+**Fixed**
+
+- Manual watched-state changes now clear stale browser resume positions.
+- Media cards now refresh their progress and watched state after the player closes.
+- Player cleanup and progress reporting now also run when the dialog is dismissed with browser-native controls.
+- Continue excludes fully watched entries even when Plex retains an old On Deck offset.
+- Unsupported media types and invalid watched-state requests are rejected before changing Plex data.
 
 ### 0.3.0
 

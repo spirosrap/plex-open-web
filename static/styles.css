@@ -410,6 +410,24 @@ select:focus-visible {
   font-weight: 800;
 }
 
+.resume-progress {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  left: 8px;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: rgba(16, 16, 16, 0.78);
+}
+
+.resume-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
 .subtitle-badge {
   position: absolute;
   right: 8px;
@@ -546,6 +564,7 @@ select:focus-visible {
 
 .details-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 18px;
 }
@@ -749,7 +768,12 @@ select:focus-visible {
   }
 
   .segmented {
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  .segmented button {
+    padding: 0 7px;
+    font-size: 13px;
   }
 
   .media-grid {

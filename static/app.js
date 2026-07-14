@@ -10,6 +10,7 @@ const state = {
   libraryTotal: 0,
   libraryLoadingMore: false,
   scanInProgress: false,
+  watchStateRatingKey: null,
   playerItem: null,
   subtitleTrackElements: [],
   savePollTimer: null,
@@ -59,6 +60,7 @@ const el = {
   detailsPlay: document.querySelector("#details-play"),
   detailsOpen: document.querySelector("#details-open"),
   detailsSubtitles: document.querySelector("#details-subtitles"),
+  detailsWatchState: document.querySelector("#details-watch-state"),
   detailsClose: document.querySelector("#details-close"),
   playerDialog: document.querySelector("#player-dialog"),
   playerTitle: document.querySelector("#player-title"),
@@ -142,6 +144,21 @@ function labelFor(item) {
   return [item.year, item.durationText].filter(Boolean).join(" • ");
 }
 
+function progressPercent(item) {
+  if (!item || item.viewCount) return 0;
+  const durationMs = Number(item.duration || item.media?.duration || 0);
+  const localOffset = Number(localProgressFor(item)?.timeMs || 0);
+  const offsetMs = Math.max(Number(item.viewOffset || 0), localOffset);
+  if (durationMs <= 0 || offsetMs < 10000) return 0;
+  return Math.min(99, Math.max(1, Math.round((offsetMs / durationMs) * 100)));
+}
+
+function progressMarkup(item) {
+  const percent = progressPercent(item);
+  if (!percent) return "";
+  return `<span class="resume-progress" aria-label="${percent}% watched"><span style="width:${percent}%"></span></span>`;
+}
+
 function displayTitle(item) {
   return item.type === "episode" && item.grandparentTitle
     ? `${item.grandparentTitle}: ${item.title}`
@@ -222,7 +239,8 @@ function renderItems(items) {
   el.viewTitle.textContent = current?.title || state.selectedLibrary?.title || "Library";
   el.grid.innerHTML = "";
   if (!items.length) {
-    setStatus("No items found.", "muted");
+    const emptyContinueView = state.stack.length === 0 && state.selectedView === "continue";
+    setStatus(emptyContinueView ? "Nothing to continue." : "No items found.", "muted");
     updateLoadMore();
     return;
   }
@@ -236,6 +254,7 @@ function renderItems(items) {
         ${posterMarkup(item)}
         ${item.viewCount ? '<span class="watched">Watched</span>' : ""}
         ${supportedSubtitles(item).length ? '<span class="subtitle-badge">CC</span>' : ""}
+        ${progressMarkup(item)}
       </button>
       <div class="card-body">
         <h3>${escapeHtml(item.title)}</h3>
@@ -409,7 +428,14 @@ function openDetails(item) {
   el.detailsKicker.textContent = [item.type, item.year || item.originallyAvailableAt].filter(Boolean).join(" / ");
   el.detailsTitle.textContent = displayTitle(item);
   el.detailsSummary.textContent = item.summary || "";
-  const meta = [item.contentRating, item.durationText, item.rating ? `${item.rating}/10` : "", item.media?.videoResolution]
+  const percent = progressPercent(item);
+  const meta = [
+    item.contentRating,
+    item.durationText,
+    item.rating ? `${item.rating}/10` : "",
+    item.media?.videoResolution,
+    item.viewCount ? "Watched" : percent ? `${percent}% watched` : "",
+  ]
     .filter(Boolean)
     .map((value) => `<span>${escapeHtml(String(value))}</span>`)
     .join("");
@@ -423,7 +449,53 @@ function openDetails(item) {
   };
   el.detailsSubtitles.hidden = !item.streamUrl;
   el.detailsSubtitles.onclick = () => openSubtitleDialog(item);
-  el.detailsDialog.showModal();
+  const canChangeWatchState = Boolean(item.ratingKey && ["movie", "episode"].includes(item.type));
+  el.detailsWatchState.hidden = !canChangeWatchState;
+  el.detailsWatchState.disabled = state.watchStateRatingKey === item.ratingKey;
+  el.detailsWatchState.textContent = state.watchStateRatingKey === item.ratingKey
+    ? "Updating..."
+    : item.viewCount
+      ? "Mark unwatched"
+      : "Mark watched";
+  el.detailsWatchState.onclick = () => setWatchState(item, !Boolean(item.viewCount));
+  if (!el.detailsDialog.open) {
+    el.detailsDialog.showModal();
+  }
+}
+
+async function setWatchState(item, watched) {
+  if (!item?.ratingKey || state.watchStateRatingKey) return;
+  state.watchStateRatingKey = item.ratingKey;
+  openDetails(item);
+  try {
+    const data = await api("/api/watch-state", {
+      method: "POST",
+      body: JSON.stringify({ ratingKey: item.ratingKey, watched }),
+    });
+    Object.assign(item, data.item || {}, {
+      viewCount: watched ? Math.max(1, data.item?.viewCount || item.viewCount || 0) : 0,
+      viewOffset: watched ? 0 : Number(data.item?.viewOffset || 0),
+    });
+    clearLocalProgress(item);
+    if (state.playerItem?.ratingKey === item.ratingKey) {
+      Object.assign(state.playerItem, item);
+    }
+    const reloadFilteredView = state.stack.length === 0 && ["continue", "unwatched"].includes(state.selectedView);
+    if (reloadFilteredView) {
+      el.detailsDialog.close();
+      await loadLibrary();
+    } else {
+      renderItems([...state.currentItems]);
+    }
+    setStatus(`${displayTitle(item)} marked ${watched ? "watched" : "unwatched"}.`, "success");
+  } catch (error) {
+    setStatus(`Could not update watched state: ${error.message}`, "error");
+  } finally {
+    state.watchStateRatingKey = null;
+    if (el.detailsDialog.open) {
+      openDetails(item);
+    }
+  }
 }
 
 function supportedSubtitles(item) {
@@ -1489,6 +1561,7 @@ for (const button of el.viewButtons) {
   button.addEventListener("click", async () => {
     state.selectedView = button.dataset.view;
     el.viewButtons.forEach((candidate) => candidate.classList.toggle("active", candidate === button));
+    el.sort.disabled = state.selectedView === "continue";
     state.stack = [];
     resetLibraryPaging();
     await loadLibrary();
@@ -1496,8 +1569,12 @@ for (const button of el.viewButtons) {
 }
 
 el.detailsClose.addEventListener("click", () => el.detailsDialog.close());
-el.playerClose.addEventListener("click", async () => {
-  await reportPlaybackProgress("stopped", { force: true });
+el.playerClose.addEventListener("click", () => el.playerDialog.close());
+el.playerDialog.addEventListener("close", async () => {
+  const hadPlayer = Boolean(state.playerItem);
+  const reloadFilteredView = state.stack.length === 0 && ["continue", "unwatched"].includes(state.selectedView);
+  const progressReport = reportPlaybackProgress("stopped", { force: true, keepalive: true });
+  state.playerItem = null;
   stopProgressReporting();
   stopSavePolling();
   el.player.pause();
@@ -1512,30 +1589,15 @@ el.playerClose.addEventListener("click", async () => {
   state.usingSavedPlayback = false;
   state.usingDevicePlayback = false;
   revokeDeviceObjectUrls();
-  state.playerItem = null;
   clearSubtitleTracks();
   el.player.load();
-  el.playerDialog.close();
-});
-el.playerDialog.addEventListener("close", () => {
-  reportPlaybackProgress("stopped", { force: true, keepalive: true }).catch(() => {});
-  stopProgressReporting();
-  stopSavePolling();
-  el.player.pause();
-  el.player.removeAttribute("src");
-  el.playbackMode.hidden = true;
-  el.playerSubtitleSearch.hidden = true;
-  el.playerSave.hidden = true;
-  el.playerDeleteSave.hidden = true;
-  el.playerDeviceSave.hidden = true;
-  el.playerDeviceDelete.hidden = true;
-  el.playerDownloadOriginal.hidden = true;
-  state.usingSavedPlayback = false;
-  state.usingDevicePlayback = false;
-  revokeDeviceObjectUrls();
-  state.playerItem = null;
-  clearSubtitleTracks();
-  el.player.load();
+  await progressReport;
+  if (!hadPlayer) return;
+  if (reloadFilteredView) {
+    await loadLibrary();
+  } else {
+    renderItems([...state.currentItems]);
+  }
 });
 el.subtitleSelect.addEventListener("change", () => {
   setActiveSubtitle(Number(el.subtitleSelect.value));

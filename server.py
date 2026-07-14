@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 COOKIE_NAME = "plex_open_session"
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
@@ -689,6 +689,14 @@ def update_plex_progress(rating_key: str, time_ms: int) -> None:
 def mark_plex_watched(rating_key: str) -> None:
     PLEX.open(
         "/:/scrobble",
+        params={"identifier": "com.plexapp.plugins.library", "key": rating_key},
+        timeout=Settings.request_timeout,
+    ).close()
+
+
+def mark_plex_unwatched(rating_key: str) -> None:
+    PLEX.open(
+        "/:/unscrobble",
         params={"identifier": "com.plexapp.plugins.library", "key": rating_key},
         timeout=Settings.request_timeout,
     ).close()
@@ -1778,6 +1786,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/library-scan":
             self.api_library_scan(method)
             return
+        if path == "/api/watch-state":
+            self.api_watch_state(method)
+            return
         if path == "/api/subtitle-download":
             self.api_subtitle_download(method)
             return
@@ -1872,6 +1883,38 @@ class AppHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def api_watch_state(self, method: str) -> None:
+        if method != "POST":
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload = self.read_json()
+        rating_key = str(payload.get("ratingKey") or "").strip()
+        watched = payload.get("watched")
+        if not rating_key:
+            self.send_json({"error": "missing_rating_key"}, status=400)
+            return
+        if not isinstance(watched, bool):
+            self.send_json({"error": "invalid_watched_state"}, status=400)
+            return
+        item = metadata_item_for_rating_key(rating_key)
+        if item is None:
+            self.send_json({"error": "metadata_not_found"}, status=404)
+            return
+        if item.get("type") not in {"movie", "episode"}:
+            self.send_json({"error": "unsupported_media_type"}, status=400)
+            return
+
+        if watched:
+            mark_plex_watched(rating_key)
+        else:
+            mark_plex_unwatched(rating_key)
+
+        refreshed = metadata_item_for_rating_key(rating_key) or item
+        refreshed["viewCount"] = max(1, refreshed.get("viewCount") or 0) if watched else 0
+        if not watched:
+            refreshed["viewOffset"] = 0
+        self.send_json({"ok": True, "watched": watched, "item": refreshed})
+
     def api_library(self, path: str, query: Dict[str, List[str]]) -> None:
         section_key = path[len("/api/library/") :].strip("/").split("/", 1)[0]
         if not section_key:
@@ -1888,22 +1931,31 @@ class AppHandler(BaseHTTPRequestHandler):
             "X-Plex-Container-Size": limit,
         }
         endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/all"
-        if view == "recent":
+        if view == "continue":
+            endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/onDeck"
+            start = 0
+            limit = 300
+            params["X-Plex-Container-Start"] = start
+            params["X-Plex-Container-Size"] = limit
+        elif view == "recent":
             endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/recentlyAdded"
         elif view == "unwatched":
             params["unwatched"] = "1"
-        if sort:
+        if sort and view != "continue":
             params["sort"] = sort
         root = PLEX.xml(endpoint, params=params)
+        items = items_from_container(root)
+        if view == "continue":
+            items = [item for item in items if not item.get("viewCount")]
         self.send_json(
             {
                 "library": section_key,
                 "view": view,
                 "start": start,
                 "limit": limit,
-                "size": to_int(root.get("size")),
-                "totalSize": to_int(root.get("totalSize")),
-                "items": items_from_container(root),
+                "size": len(items) if view == "continue" else to_int(root.get("size")),
+                "totalSize": len(items) if view == "continue" else to_int(root.get("totalSize")),
+                "items": items,
             }
         )
 
