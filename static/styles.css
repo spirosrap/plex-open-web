@@ -464,7 +464,8 @@ select:focus-visible {
   font-weight: 900;
 }
 
-.watched {
+.watched,
+.collection-badge {
   position: absolute;
   left: 8px;
   top: 8px;
@@ -474,6 +475,11 @@ select:focus-visible {
   color: var(--on-watched);
   font-size: 12px;
   font-weight: 800;
+}
+
+.collection-badge {
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 .resume-progress {
@@ -834,12 +840,19 @@ select:focus-visible {
   }
 
   .segmented {
-    grid-template-columns: repeat(4, 1fr);
+    width: 100%;
+    grid-auto-flow: row;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
   }
 
   .segmented button {
+    grid-column: span 2;
     padding: 0 7px;
     font-size: 13px;
+  }
+
+  .segmented button:nth-child(n + 4) {
+    grid-column: span 3;
   }
 
   .media-grid {

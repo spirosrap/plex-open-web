@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 COOKIE_NAME = "plex_open_session"
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
@@ -182,6 +182,23 @@ def safe_plex_path(path: str, prefix: str = "/") -> Optional[str]:
     if not path or not path.startswith(prefix) or "\x00" in path:
         return None
     return urllib.parse.quote(path, safe="/:@!$&'()*+,;=-._~%")
+
+
+PLEX_IMAGE_QUERY_KEYS = {"width", "height", "minSize", "upscale", "quality"}
+
+
+def plex_image_request(path: str) -> Tuple[Optional[str], Dict[str, str]]:
+    parsed = urllib.parse.urlsplit(path)
+    plex_path = safe_plex_path(parsed.path)
+    if not plex_path:
+        return None, {}
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+    params = {
+        key: values[-1]
+        for key, values in query.items()
+        if key in PLEX_IMAGE_QUERY_KEYS and values
+    }
+    return plex_path, params
 
 
 def to_int(value: Optional[str]) -> Optional[int]:
@@ -1941,7 +1958,10 @@ class AppHandler(BaseHTTPRequestHandler):
             endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/recentlyAdded"
         elif view == "unwatched":
             params["unwatched"] = "1"
-        if sort and view != "continue":
+        elif view == "collections":
+            endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/collections"
+            params["sort"] = "titleSort"
+        if sort and view not in {"continue", "collections"}:
             params["sort"] = sort
         root = PLEX.xml(endpoint, params=params)
         items = items_from_container(root)
@@ -1989,11 +2009,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         self.require_auth()
         raw_path = one(query, "path", "")
-        plex_path = safe_plex_path(raw_path)
+        plex_path, image_params = plex_image_request(raw_path)
         if not plex_path:
             self.send_json({"error": "bad_image_path"}, status=400)
             return
-        with PLEX.open(plex_path, timeout=Settings.request_timeout) as response:
+        with PLEX.open(plex_path, params=image_params, timeout=Settings.request_timeout) as response:
             data = b"" if method == "HEAD" else response.read()
             self.send_response(response.status)
             self.send_header("Content-Type", response.headers.get("Content-Type", "image/jpeg"))
@@ -2001,7 +2021,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", response.headers.get("Content-Length", str(len(data))))
             self.end_headers()
             if method != "HEAD":
-                self.wfile.write(data)
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    return
 
     def handle_stream(self, method: str, query: Dict[str, List[str]]) -> None:
         if method not in {"GET", "HEAD"}:

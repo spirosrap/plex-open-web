@@ -20,6 +20,15 @@ class FakePlex:
 
     def xml(self, path, params=None):
         self.xml_calls.append((path, dict(params or {})))
+        if path.endswith("/collections"):
+            return ET.fromstring(
+                '<MediaContainer size="2" totalSize="9">'
+                '<Directory ratingKey="101" key="/library/collections/101/children" type="collection" '
+                'title="A Collection" childCount="4" thumb="/library/collections/101/composite/1?width=400&amp;height=600" />'
+                '<Directory ratingKey="102" key="/library/collections/102/children" type="collection" '
+                'title="B Collection" childCount="7" />'
+                '</MediaContainer>'
+            )
         if path.startswith("/library/metadata/"):
             rating_key = path.rsplit("/", 1)[-1]
             return ET.fromstring(
@@ -66,6 +75,33 @@ class LibraryViewTests(unittest.TestCase):
         self.assertEqual(0, params["X-Plex-Container-Start"])
         self.assertEqual(300, params["X-Plex-Container-Size"])
         self.assertNotIn("sort", params)
+
+    def test_collections_view_uses_native_collection_directory(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library(
+                "/api/library/7",
+                {"view": ["collections"], "sort": ["year:desc"], "start": ["0"], "limit": ["2"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("collections", responses[0][1]["view"])
+        self.assertEqual(9, responses[0][1]["totalSize"])
+        self.assertEqual("collection", responses[0][1]["items"][0]["type"])
+        self.assertEqual(4, responses[0][1]["items"][0]["childCount"])
+        path, params = plex.xml_calls[0]
+        self.assertEqual("/library/sections/7/collections", path)
+        self.assertEqual("titleSort", params["sort"])
+        self.assertEqual(2, params["X-Plex-Container-Size"])
+
+    def test_collection_composite_image_query_is_forwarded_safely(self):
+        path, params = server.plex_image_request(
+            "/library/collections/101/composite/1?width=400&height=600&X-Plex-Token=ignored"
+        )
+
+        self.assertEqual("/library/collections/101/composite/1", path)
+        self.assertEqual({"width": "400", "height": "600"}, params)
 
 
 class WatchStateTests(unittest.TestCase):

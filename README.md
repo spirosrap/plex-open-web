@@ -8,6 +8,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 - Password-protected web UI with signed HttpOnly session cookies.
 - Library list, continue/recent/all/unwatched views, sorting, and search.
+- Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
 - Resume-progress indicators and manual watched/unwatched controls synchronized with Plex.
 - Persistent System, Light, and Dark color themes available before and after login.
 - One-tap scanning for the selected Plex library with progress feedback and an automatic result reload.
@@ -23,6 +24,25 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.6.0
+
+**Added**
+
+- Added a Collections view for each Plex library, including native collection artwork and item counts.
+- Collection cards open directly into their movies while preserving breadcrumb and back navigation.
+
+**Improved**
+
+- Collections are listed alphabetically and use the same paging behavior as the rest of the library.
+- The five library views use a balanced two-row layout on narrow screens, keeping every option visible without horizontal page overflow.
+- Collection cards have a clear badge and dedicated Open action.
+
+**Fixed**
+
+- Fixed Plex composite collection posters whose source URLs contain width and height parameters.
+- Cancelled lazy-image requests no longer produce avoidable server errors.
+- Collection directories are now treated as browsable containers instead of unplayable media details.
 
 ### 0.5.0
 

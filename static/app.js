@@ -168,6 +168,10 @@ function labelFor(item) {
   if (item.type === "show") {
     return `${item.viewedLeafCount || 0}/${item.leafCount || 0} watched`;
   }
+  if (item.type === "collection") {
+    const count = item.childCount || item.leafCount || 0;
+    return `${count} ${count === 1 ? "item" : "items"}`;
+  }
   return [item.year, item.durationText].filter(Boolean).join(" • ");
 }
 
@@ -209,7 +213,7 @@ function posterMarkup(item) {
 }
 
 function itemCanOpen(item) {
-  return ["show", "season"].includes(item.type);
+  return ["show", "season", "collection"].includes(item.type);
 }
 
 function renderLibraries() {
@@ -267,7 +271,8 @@ function renderItems(items) {
   el.grid.innerHTML = "";
   if (!items.length) {
     const emptyContinueView = state.stack.length === 0 && state.selectedView === "continue";
-    setStatus(emptyContinueView ? "Nothing to continue." : "No items found.", "muted");
+    const emptyCollectionsView = state.stack.length === 0 && state.selectedView === "collections";
+    setStatus(emptyContinueView ? "Nothing to continue." : emptyCollectionsView ? "No collections found." : "No items found.", "muted");
     updateLoadMore();
     return;
   }
@@ -279,6 +284,7 @@ function renderItems(items) {
     card.innerHTML = `
       <button class="poster-button" data-action="open">
         ${posterMarkup(item)}
+        ${item.type === "collection" ? '<span class="collection-badge">Collection</span>' : ""}
         ${item.viewCount ? '<span class="watched">Watched</span>' : ""}
         ${supportedSubtitles(item).length ? '<span class="subtitle-badge">CC</span>' : ""}
         ${progressMarkup(item)}
@@ -288,7 +294,9 @@ function renderItems(items) {
         <p>${escapeHtml(labelFor(item))}</p>
         <div class="card-actions">
           ${item.streamUrl ? '<button data-action="play" class="mini-primary">Play</button>' : ""}
-          <button data-action="details" class="mini-secondary">Details</button>
+          ${item.type === "collection"
+            ? '<button data-action="open" class="mini-secondary">Open</button>'
+            : '<button data-action="details" class="mini-secondary">Details</button>'}
         </div>
       </div>
     `;
@@ -316,10 +324,12 @@ function renderItems(items) {
 }
 
 function statusTextForItems(count) {
+  const collectionsView = state.stack.length === 0 && state.selectedView === "collections";
+  const noun = collectionsView ? "collections" : "items";
   if (state.libraryTotal && state.libraryTotal > count) {
-    return `${count} of ${state.libraryTotal} items`;
+    return `${count} of ${state.libraryTotal} ${noun}`;
   }
-  return `${count} items`;
+  return `${count} ${noun}`;
 }
 
 function updateLoadMore() {
@@ -1591,7 +1601,7 @@ for (const button of el.viewButtons) {
   button.addEventListener("click", async () => {
     state.selectedView = button.dataset.view;
     el.viewButtons.forEach((candidate) => candidate.classList.toggle("active", candidate === button));
-    el.sort.disabled = state.selectedView === "continue";
+    el.sort.disabled = ["continue", "collections"].includes(state.selectedView);
     state.stack = [];
     resetLibraryPaging();
     await loadLibrary();
