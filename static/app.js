@@ -33,9 +33,11 @@ const el = {
   app: document.querySelector("#app"),
   loginForm: document.querySelector("#login-form"),
   loginError: document.querySelector("#login-error"),
+  loginVersion: document.querySelector("#login-version"),
   password: document.querySelector("#password"),
   libraries: document.querySelector("#libraries"),
   logout: document.querySelector("#logout"),
+  appVersion: document.querySelector("#app-version"),
   serverName: document.querySelector("#server-name"),
   breadcrumbs: document.querySelector("#breadcrumbs"),
   viewTitle: document.querySelector("#view-title"),
@@ -109,6 +111,13 @@ function showLogin() {
 function showApp() {
   el.login.hidden = true;
   el.app.hidden = false;
+}
+
+function showVersion(version) {
+  if (!version) return;
+  const label = `Version ${version}`;
+  el.loginVersion.textContent = label;
+  el.appVersion.textContent = label;
 }
 
 function setStatus(message = "", kind = "") {
@@ -1387,6 +1396,7 @@ function escapeAttr(value = "") {
 
 async function boot() {
   const me = await api("/api/me");
+  showVersion(me.version);
   if (!me.authenticated && me.authRequired) {
     showLogin();
     return;

@@ -88,6 +88,10 @@ select:focus-visible {
   letter-spacing: 0;
 }
 
+.login-panel .app-version {
+  margin: -16px 0 22px;
+}
+
 .login-panel label {
   display: block;
   margin-bottom: 8px;
@@ -123,6 +127,10 @@ select:focus-visible {
   color: #111;
   padding: 0 14px;
   font-weight: 800;
+}
+
+.login-row button {
+  white-space: nowrap;
 }
 
 .error-text {
@@ -205,6 +213,22 @@ select:focus-visible {
   margin-top: auto;
   border: 1px solid var(--line);
   color: var(--muted);
+  text-align: center;
+}
+
+.sidebar-footer {
+  display: grid;
+  gap: 10px;
+  margin-top: auto;
+}
+
+.sidebar-footer .ghost-button {
+  margin-top: 0;
+}
+
+.app-version {
+  color: var(--muted);
+  font-size: 12px;
   text-align: center;
 }
 

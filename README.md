@@ -12,6 +12,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - TV show navigation from show to season to episode.
 - Browser subtitle selection from Plex subtitle streams and sidecar subtitle files.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
+- Original media download as a ZIP containing the untouched video file and available subtitles.
 - FFmpeg fallback that copies browser-compatible video and converts unsupported audio, such as AC3, to AAC.
 - Poster/artwork proxy so the browser only needs this app URL.
 - No runtime dependencies beyond Python 3 standard library.

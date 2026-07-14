@@ -37,6 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
+APP_VERSION = "0.2.0"
 COOKIE_NAME = "plex_open_session"
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
@@ -101,7 +102,9 @@ class Settings:
     opensubtitles_api_key = os.environ.get("OPENSUBTITLES_API_KEY", "")
     opensubtitles_username = os.environ.get("OPENSUBTITLES_USERNAME", "")
     opensubtitles_password = os.environ.get("OPENSUBTITLES_PASSWORD", "")
-    opensubtitles_user_agent = os.environ.get("OPENSUBTITLES_USER_AGENT", "PlexOpenWeb v0.1")
+    opensubtitles_user_agent = os.environ.get(
+        "OPENSUBTITLES_USER_AGENT", f"PlexOpenWeb v{APP_VERSION}"
+    )
 
 
 def read_plex_token_from_preferences(path: str) -> str:
@@ -1605,7 +1608,7 @@ def items_from_container(root: ET.Element, recursive: bool = False) -> List[Dict
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "PlexOpenWeb/0.1"
+    server_version = f"PlexOpenWeb/{APP_VERSION}"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -1713,6 +1716,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         payload = {
             "ok": True,
+            "version": APP_VERSION,
             "authRequired": not Settings.disable_auth,
             "plexConfigured": bool(Settings.plex_token),
             "plexBaseUrl": Settings.plex_base_url,
@@ -1729,6 +1733,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 "authenticated": self.is_authenticated(),
                 "authRequired": not Settings.disable_auth,
                 "serverName": os.environ.get("APP_NAME", "Plex Open Web"),
+                "version": APP_VERSION,
             }
         )
 
