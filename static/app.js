@@ -9,6 +9,7 @@ const state = {
   libraryStart: 0,
   libraryTotal: 0,
   libraryLoadingMore: false,
+  scanInProgress: false,
   playerItem: null,
   subtitleTrackElements: [],
   savePollTimer: null,
@@ -47,6 +48,7 @@ const el = {
   grid: document.querySelector("#grid"),
   loadMore: document.querySelector("#load-more"),
   sort: document.querySelector("#sort"),
+  scanLibrary: document.querySelector("#scan-library"),
   viewButtons: [...document.querySelectorAll(".view-button")],
   detailsDialog: document.querySelector("#details-dialog"),
   detailsPoster: document.querySelector("#details-poster"),
@@ -176,6 +178,13 @@ function renderLibraries() {
     button.addEventListener("click", () => selectLibrary(library.key));
     el.libraries.append(button);
   }
+  updateScanButton();
+}
+
+function updateScanButton() {
+  if (!el.scanLibrary) return;
+  el.scanLibrary.disabled = !state.selectedLibrary || state.scanInProgress;
+  el.scanLibrary.textContent = state.scanInProgress ? "Scanning..." : "Scan library";
 }
 
 function renderBreadcrumbs() {
@@ -320,7 +329,7 @@ function resetLibraryPaging() {
 }
 
 async function loadLibrary({ append = false } = {}) {
-  if (!state.selectedLibrary) return;
+  if (!state.selectedLibrary) return false;
   if (!append) {
     resetLibraryPaging();
     setStatus("Loading media...");
@@ -342,6 +351,7 @@ async function loadLibrary({ append = false } = {}) {
     state.libraryTotal = data.totalSize || data.size || 0;
     const incoming = data.items || [];
     renderItems(append ? [...state.currentItems, ...incoming] : incoming);
+    return true;
   } catch (error) {
     if (!append) {
       state.currentItems = [];
@@ -349,9 +359,38 @@ async function loadLibrary({ append = false } = {}) {
       el.grid.innerHTML = "";
     }
     setStatus(`Could not load media: ${error.message}`, "error");
+    return false;
   } finally {
     state.libraryLoadingMore = false;
     updateLoadMore();
+  }
+}
+
+async function scanSelectedLibrary() {
+  if (!state.selectedLibrary || state.scanInProgress) return;
+  const library = state.selectedLibrary;
+  state.scanInProgress = true;
+  updateScanButton();
+  setStatus(`Starting scan for ${library.title}...`);
+  try {
+    await api("/api/library-scan", {
+      method: "POST",
+      body: JSON.stringify({ sectionKey: library.key }),
+    });
+    setStatus(`Plex is scanning ${library.title}. Results will refresh shortly.`, "success");
+    await new Promise((resolve) => window.setTimeout(resolve, 3000));
+    if (state.selectedLibrary?.key === library.key) {
+      state.stack = [];
+      const refreshed = await loadLibrary();
+      if (refreshed) {
+        setStatus(`Scan started for ${library.title}. Results refreshed.`, "success");
+      }
+    }
+  } catch (error) {
+    setStatus(`Could not start scan: ${error.message}`, "error");
+  } finally {
+    state.scanInProgress = false;
+    updateScanButton();
   }
 }
 
@@ -1436,6 +1475,8 @@ el.loadMore.addEventListener("click", async () => {
   if (state.libraryLoadingMore) return;
   await loadLibrary({ append: true });
 });
+
+el.scanLibrary.addEventListener("click", scanSelectedLibrary);
 
 el.sort.addEventListener("change", async () => {
   state.sort = el.sort.value;

@@ -314,6 +314,22 @@ select:focus-visible {
   width: 190px;
 }
 
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.scan-button {
+  min-height: 42px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  white-space: nowrap;
+}
+
 .status {
   min-height: 24px;
   color: var(--muted);
@@ -322,6 +338,10 @@ select:focus-visible {
 
 .status[data-kind="error"] {
   color: var(--danger);
+}
+
+.status[data-kind="success"] {
+  color: var(--accent-2);
 }
 
 .media-grid {
@@ -719,8 +739,13 @@ select:focus-visible {
   }
 
   .search,
+  .toolbar-actions,
   .toolbar select {
     width: 100%;
+  }
+
+  .toolbar-actions select {
+    flex: 1;
   }
 
   .segmented {

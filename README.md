@@ -8,6 +8,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 - Password-protected web UI with signed HttpOnly session cookies.
 - Library list, recent/all/unwatched views, sorting, and search.
+- One-tap scanning for the selected Plex library with progress feedback and an automatic result reload.
 - Movie playback in the browser through a Range-aware stream proxy.
 - TV show navigation from show to season to episode.
 - Browser subtitle selection from Plex subtitle streams and sidecar subtitle files.

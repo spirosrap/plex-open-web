@@ -55,12 +55,15 @@
             <button class="view-button active" data-view="all">All</button>
             <button class="view-button" data-view="unwatched">Unwatched</button>
           </div>
-          <select id="sort">
-            <option value="addedAt:desc">Recently added</option>
-            <option value="titleSort">Title</option>
-            <option value="year:desc">Year</option>
-            <option value="lastViewedAt:desc">Recently watched</option>
-          </select>
+          <div class="toolbar-actions">
+            <select id="sort">
+              <option value="addedAt:desc">Recently added</option>
+              <option value="titleSort">Title</option>
+              <option value="year:desc">Year</option>
+              <option value="lastViewedAt:desc">Recently watched</option>
+            </select>
+            <button id="scan-library" class="scan-button" type="button" title="Ask Plex to scan this library">Scan library</button>
+          </div>
         </div>
 
         <div id="status" class="status" aria-live="polite"></div>

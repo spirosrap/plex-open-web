@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.3.0"
 COOKIE_NAME = "plex_open_session"
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
@@ -1775,6 +1775,9 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_json({"authenticated": False}, headers={"Set-Cookie": cookie.output(header="").strip()})
 
     def handle_api(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
+        if path == "/api/library-scan":
+            self.api_library_scan(method)
+            return
         if path == "/api/subtitle-download":
             self.api_subtitle_download(method)
             return
@@ -1838,6 +1841,36 @@ class AppHandler(BaseHTTPRequestHandler):
         root = PLEX.xml("/library/sections")
         sections = [library_from_xml(child) for child in root.findall("Directory")]
         self.send_json({"libraries": sections})
+
+    def api_library_scan(self, method: str) -> None:
+        if method != "POST":
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload = self.read_json()
+        section_key = str(payload.get("sectionKey") or "").strip()
+        if not re.fullmatch(r"\d+", section_key):
+            self.send_json({"error": "invalid_section"}, status=400)
+            return
+        sections = PLEX.xml("/library/sections")
+        section = next(
+            (item for item in sections.findall("Directory") if item.get("key") == section_key),
+            None,
+        )
+        if section is None:
+            self.send_json({"error": "library_not_found"}, status=404)
+            return
+        endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/refresh"
+        with PLEX.open(endpoint) as response:
+            plex_status = response.getcode()
+        self.send_json(
+            {
+                "ok": True,
+                "scanStarted": True,
+                "sectionKey": section_key,
+                "libraryTitle": section.get("title"),
+                "plexStatus": plex_status,
+            }
+        )
 
     def api_library(self, path: str, query: Dict[str, List[str]]) -> None:
         section_key = path[len("/api/library/") :].strip("/").split("/", 1)[0]
