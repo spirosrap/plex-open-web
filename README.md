@@ -18,6 +18,64 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Poster/artwork proxy so the browser only needs this app URL.
 - No runtime dependencies beyond Python 3 standard library.
 
+## Release notes
+
+Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.3.0
+
+**Added**
+
+- Added authenticated one-tap scanning for the selected Plex library.
+- Added scan progress, success, and error feedback.
+
+**Improved**
+
+- The Scan library control is disabled while a scan is running.
+- The selected library automatically reloads after Plex accepts the scan.
+
+**Fixed**
+
+- Invalid or missing library section identifiers are rejected before Plex is asked to scan.
+- Scan failures remain visible instead of looking like a successful refresh.
+
+### 0.2.2
+
+**Maintenance**
+
+- Updated release metadata only; no user-facing behavior changed.
+
+### 0.2.1
+
+**Improved**
+
+- Moved the version label into the signed-in app identity area while keeping it visible on the login screen.
+- Added server-injected versioning to HTML and asset URLs so releases automatically load fresh CSS and JavaScript.
+
+**Fixed**
+
+- Fixed generic or stale version labels when frontend startup or browser caching was out of date.
+
+### 0.2.0
+
+**Added**
+
+- Added original-media ZIP downloads containing the untouched video file and available subtitles.
+- Added playback progress reporting, local resume positions, and Plex watched-state updates.
+- Added browser-device save, play, and delete actions for cached MP4 and VTT files.
+- Added the app version to health and session responses and displayed it in the interface.
+
+**Improved**
+
+- Expanded support for Plex, sidecar, embedded, and OpenSubtitles subtitle sources.
+- Added server-saved browser-compatible playback and clear playback-mode indicators.
+- Increased the browser device cache to approximately 12 GB with automatic 14-day pruning.
+
+**Fixed**
+
+- Playback progress is preserved locally when server reporting temporarily fails.
+- Completed playback clears stale resume positions and marks media as watched.
+
 ## Run locally
 
 ```bash
