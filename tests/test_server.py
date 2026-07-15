@@ -20,6 +20,10 @@ class FakePlex:
 
     def xml(self, path, params=None):
         self.xml_calls.append((path, dict(params or {})))
+        if path == "/library/sections":
+            return ET.fromstring(
+                '<MediaContainer size="1"><Directory key="7" title="Movies" type="movie" /></MediaContainer>'
+            )
         if path.endswith("/collections"):
             return ET.fromstring(
                 '<MediaContainer size="2" totalSize="9">'
@@ -28,6 +32,14 @@ class FakePlex:
                 '<Directory ratingKey="102" key="/library/collections/102/children" type="collection" '
                 'title="B Collection" childCount="7" />'
                 '</MediaContainer>'
+            )
+        if path.endswith("/all"):
+            index = int((params or {}).get("X-Plex-Container-Start", 0))
+            return ET.fromstring(
+                f'<MediaContainer size="1" totalSize="3">'
+                f'<Video ratingKey="{100 + index}" type="movie" title="Pick {index}" duration="600000">'
+                f'<Media videoCodec="h264" audioCodec="aac"><Part key="/library/parts/{100 + index}/file.mp4" /></Media>'
+                f'</Video></MediaContainer>'
             )
         if path.startswith("/library/metadata/"):
             rating_key = path.rsplit("/", 1)[-1]
@@ -102,6 +114,28 @@ class LibraryViewTests(unittest.TestCase):
 
         self.assertEqual("/library/collections/101/composite/1", path)
         self.assertEqual({"width": "400", "height": "600"}, params)
+
+    def test_random_item_uses_a_single_random_library_offset(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(server.secrets, "randbelow", return_value=2):
+            handler.api_random_item({"sectionKey": ["7"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(3, responses[0][1]["totalSize"])
+        self.assertEqual(2, responses[0][1]["offset"])
+        self.assertEqual("102", responses[0][1]["item"]["ratingKey"])
+        self.assertEqual("/api/stream?partKey=%2Flibrary%2Fparts%2F102%2Ffile.mp4", responses[0][1]["item"]["streamUrl"])
+        self.assertEqual("/library/sections", plex.xml_calls[0][0])
+        self.assertEqual(0, plex.xml_calls[1][1]["X-Plex-Container-Start"])
+        self.assertEqual(2, plex.xml_calls[2][1]["X-Plex-Container-Start"])
+
+    def test_random_item_rejects_an_invalid_library_key(self):
+        handler, responses = handler_with_payload({})
+        handler.api_random_item({"sectionKey": ["../7"]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_section", responses[0][1]["error"])
 
 
 class WatchStateTests(unittest.TestCase):

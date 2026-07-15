@@ -9,6 +9,8 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Password-protected web UI with signed HttpOnly session cookies.
 - Library list, continue/recent/all/unwatched views, sorting, and search.
 - Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
+- Surprise Me selection for opening a random item from the current Plex library.
+- Persistent library, view, and sort context across reloads and sign-in sessions.
 - Resume-progress indicators and manual watched/unwatched controls synchronized with Plex.
 - Persistent System, Light, and Dark color themes available before and after login.
 - One-tap scanning for the selected Plex library with progress feedback and an automatic result reload.
@@ -24,6 +26,25 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.7.0
+
+**Added**
+
+- Added a Surprise Me action that chooses a random item from the selected library and opens its details.
+- Added per-browser persistence for the last library, view, and sort selection.
+- Added a validated random-item API shared by the web and Android clients.
+
+**Improved**
+
+- Random selection reads only the library count and one chosen item, remaining fast for large libraries.
+- Mobile toolbar actions now wrap into a stable sort row and two equal command buttons.
+- Restored Continue and Collections views automatically keep sorting disabled as expected.
+
+**Fixed**
+
+- Reloading no longer always resets browsing to the first library, All view, and Recently added sort.
+- Missing libraries and invalid or obsolete saved view values fall back safely to supported defaults.
 
 ### 0.6.0
 

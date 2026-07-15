@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 COOKIE_NAME = "plex_open_session"
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
@@ -1822,6 +1822,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.api_server()
         elif path == "/api/libraries":
             self.api_libraries()
+        elif path == "/api/random-item":
+            self.api_random_item(query)
         elif path.startswith("/api/library/"):
             self.api_library(path, query)
         elif path.startswith("/api/metadata/"):
@@ -1869,6 +1871,48 @@ class AppHandler(BaseHTTPRequestHandler):
         root = PLEX.xml("/library/sections")
         sections = [library_from_xml(child) for child in root.findall("Directory")]
         self.send_json({"libraries": sections})
+
+    def api_random_item(self, query: Dict[str, List[str]]) -> None:
+        section_key = one(query, "sectionKey", "").strip()
+        if not re.fullmatch(r"\d+", section_key):
+            self.send_json({"error": "invalid_section"}, status=400)
+            return
+        sections = PLEX.xml("/library/sections")
+        section = next(
+            (item for item in sections.findall("Directory") if item.get("key") == section_key),
+            None,
+        )
+        if section is None:
+            self.send_json({"error": "library_not_found"}, status=404)
+            return
+
+        endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/all"
+        params: Dict[str, Any] = {
+            "includeGuids": "1",
+            "includeCollections": "1",
+            "X-Plex-Container-Start": 0,
+            "X-Plex-Container-Size": 1,
+        }
+        first = PLEX.xml(endpoint, params=params)
+        total = to_int(first.get("totalSize")) or to_int(first.get("size")) or 0
+        if total <= 0:
+            self.send_json({"library": section_key, "totalSize": 0, "item": None})
+            return
+
+        offset = secrets.randbelow(total)
+        root = first
+        if offset:
+            params["X-Plex-Container-Start"] = offset
+            root = PLEX.xml(endpoint, params=params)
+        items = items_from_container(root)
+        self.send_json(
+            {
+                "library": section_key,
+                "totalSize": total,
+                "offset": offset,
+                "item": items[0] if items else None,
+            }
+        )
 
     def api_library_scan(self, method: str) -> None:
         if method != "POST":

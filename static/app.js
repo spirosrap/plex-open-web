@@ -1,6 +1,7 @@
 const state = {
   libraries: [],
   selectedLibrary: null,
+  preferredLibraryKey: "",
   selectedView: "all",
   sort: "addedAt:desc",
   stack: [],
@@ -10,6 +11,7 @@ const state = {
   libraryTotal: 0,
   libraryLoadingMore: false,
   scanInProgress: false,
+  surpriseInProgress: false,
   watchStateRatingKey: null,
   playerItem: null,
   subtitleTrackElements: [],
@@ -29,8 +31,16 @@ const DEVICE_CACHE_MAX_BYTES = 12 * 1024 * 1024 * 1024;
 const DEVICE_CACHE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const LOCAL_PROGRESS_KEY = "plex-open-web-progress-v1";
 const THEME_KEY = "plex-open-web-theme-v1";
+const BROWSE_KEY = "plex-open-web-browse-v1";
 const THEME_VALUES = new Set(["system", "light", "dark"]);
+const VIEW_VALUES = new Set(["continue", "recent", "all", "unwatched", "collections"]);
+const SORT_VALUES = new Set(["addedAt:desc", "titleSort", "year:desc", "lastViewedAt:desc"]);
 const PROGRESS_REPORT_INTERVAL_MS = 15000;
+
+const savedBrowse = readBrowsePreferences();
+state.preferredLibraryKey = typeof savedBrowse.libraryKey === "string" ? savedBrowse.libraryKey : "";
+state.selectedView = VIEW_VALUES.has(savedBrowse.view) ? savedBrowse.view : "all";
+state.sort = SORT_VALUES.has(savedBrowse.sort) ? savedBrowse.sort : "addedAt:desc";
 
 const el = {
   login: document.querySelector("#login"),
@@ -53,6 +63,7 @@ const el = {
   grid: document.querySelector("#grid"),
   loadMore: document.querySelector("#load-more"),
   sort: document.querySelector("#sort"),
+  surpriseMe: document.querySelector("#surprise-me"),
   scanLibrary: document.querySelector("#scan-library"),
   viewButtons: [...document.querySelectorAll(".view-button")],
   detailsDialog: document.querySelector("#details-dialog"),
@@ -144,6 +155,33 @@ function applyTheme(value, { persist = true } = {}) {
   }
 }
 
+function readBrowsePreferences() {
+  try {
+    const value = JSON.parse(localStorage.getItem(BROWSE_KEY) || "{}");
+    return value && typeof value === "object" ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function persistBrowsePreferences() {
+  try {
+    localStorage.setItem(BROWSE_KEY, JSON.stringify({
+      libraryKey: state.selectedLibrary?.key || state.preferredLibraryKey || "",
+      view: state.selectedView,
+      sort: state.sort,
+    }));
+  } catch {
+    // Browsing remains fully usable when storage is unavailable.
+  }
+}
+
+function syncBrowseControls() {
+  el.viewButtons.forEach((button) => button.classList.toggle("active", button.dataset.view === state.selectedView));
+  el.sort.value = state.sort;
+  el.sort.disabled = ["continue", "collections"].includes(state.selectedView);
+}
+
 applyTheme(document.documentElement.dataset.theme, { persist: false });
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   if (document.documentElement.dataset.theme === "system") {
@@ -227,12 +265,19 @@ function renderLibraries() {
     el.libraries.append(button);
   }
   updateScanButton();
+  updateSurpriseButton();
 }
 
 function updateScanButton() {
   if (!el.scanLibrary) return;
   el.scanLibrary.disabled = !state.selectedLibrary || state.scanInProgress;
   el.scanLibrary.textContent = state.scanInProgress ? "Scanning..." : "Scan library";
+}
+
+function updateSurpriseButton() {
+  if (!el.surpriseMe) return;
+  el.surpriseMe.disabled = !state.selectedLibrary || state.surpriseInProgress;
+  el.surpriseMe.textContent = state.surpriseInProgress ? "Choosing..." : "Surprise me";
 }
 
 function renderBreadcrumbs() {
@@ -359,8 +404,13 @@ async function loadLibraries() {
   setStatus("Loading libraries...");
   const data = await api("/api/libraries");
   state.libraries = data.libraries || [];
-  state.selectedLibrary = state.libraries[0] || null;
+  state.selectedLibrary = state.libraries.find((library) => library.key === state.preferredLibraryKey)
+    || state.libraries[0]
+    || null;
+  state.preferredLibraryKey = state.selectedLibrary?.key || "";
   resetLibraryPaging();
+  syncBrowseControls();
+  persistBrowsePreferences();
   renderLibraries();
   if (state.selectedLibrary) {
     await loadLibrary();
@@ -371,8 +421,11 @@ async function loadLibraries() {
 
 async function selectLibrary(key) {
   state.selectedLibrary = state.libraries.find((library) => library.key === key);
+  if (!state.selectedLibrary) return;
+  state.preferredLibraryKey = state.selectedLibrary.key;
   state.stack = [];
   resetLibraryPaging();
+  persistBrowsePreferences();
   renderLibraries();
   await loadLibrary();
 }
@@ -447,6 +500,28 @@ async function scanSelectedLibrary() {
   } finally {
     state.scanInProgress = false;
     updateScanButton();
+  }
+}
+
+async function surpriseMe() {
+  if (!state.selectedLibrary || state.surpriseInProgress) return;
+  state.surpriseInProgress = true;
+  updateSurpriseButton();
+  setStatus(`Choosing from ${state.selectedLibrary.title}...`);
+  try {
+    const params = new URLSearchParams({ sectionKey: state.selectedLibrary.key });
+    const data = await api(`/api/random-item?${params}`);
+    if (!data.item) {
+      setStatus("This library has no items to choose from.", "muted");
+      return;
+    }
+    openDetails(data.item);
+    setStatus(`Surprise pick: ${displayTitle(data.item)}.`, "success");
+  } catch (error) {
+    setStatus(`Could not choose an item: ${error.message}`, "error");
+  } finally {
+    state.surpriseInProgress = false;
+    updateSurpriseButton();
   }
 }
 
@@ -1588,10 +1663,12 @@ el.loadMore.addEventListener("click", async () => {
   await loadLibrary({ append: true });
 });
 
+el.surpriseMe.addEventListener("click", surpriseMe);
 el.scanLibrary.addEventListener("click", scanSelectedLibrary);
 
 el.sort.addEventListener("change", async () => {
   state.sort = el.sort.value;
+  persistBrowsePreferences();
   state.stack = [];
   resetLibraryPaging();
   await loadLibrary();
@@ -1600,8 +1677,8 @@ el.sort.addEventListener("change", async () => {
 for (const button of el.viewButtons) {
   button.addEventListener("click", async () => {
     state.selectedView = button.dataset.view;
-    el.viewButtons.forEach((candidate) => candidate.classList.toggle("active", candidate === button));
-    el.sort.disabled = ["continue", "collections"].includes(state.selectedView);
+    syncBrowseControls();
+    persistBrowsePreferences();
     state.stack = [];
     resetLibraryPaging();
     await loadLibrary();
