@@ -87,7 +87,10 @@
             <button class="view-button" data-view="collections">Collections</button>
           </div>
           <div class="toolbar-actions">
-            <select id="sort">
+            <select id="genre-filter" aria-label="Genre">
+              <option value="">All genres</option>
+            </select>
+            <select id="sort" aria-label="Sort">
               <option value="addedAt:desc">Recently added</option>
               <option value="titleSort">Title</option>
               <option value="year:desc">Year</option>

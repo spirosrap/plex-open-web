@@ -2,6 +2,9 @@ const state = {
   libraries: [],
   selectedLibrary: null,
   preferredLibraryKey: "",
+  genres: [],
+  genreKeysByLibrary: {},
+  genresLoading: false,
   selectedView: "all",
   sort: "addedAt:desc",
   stack: [],
@@ -39,6 +42,7 @@ const PROGRESS_REPORT_INTERVAL_MS = 15000;
 
 const savedBrowse = readBrowsePreferences();
 state.preferredLibraryKey = typeof savedBrowse.libraryKey === "string" ? savedBrowse.libraryKey : "";
+state.genreKeysByLibrary = normalizeGenrePreferences(savedBrowse.genreKeys);
 state.selectedView = VIEW_VALUES.has(savedBrowse.view) ? savedBrowse.view : "all";
 state.sort = SORT_VALUES.has(savedBrowse.sort) ? savedBrowse.sort : "addedAt:desc";
 
@@ -62,6 +66,7 @@ const el = {
   status: document.querySelector("#status"),
   grid: document.querySelector("#grid"),
   loadMore: document.querySelector("#load-more"),
+  genreFilter: document.querySelector("#genre-filter"),
   sort: document.querySelector("#sort"),
   surpriseMe: document.querySelector("#surprise-me"),
   scanLibrary: document.querySelector("#scan-library"),
@@ -168,6 +173,7 @@ function persistBrowsePreferences() {
   try {
     localStorage.setItem(BROWSE_KEY, JSON.stringify({
       libraryKey: state.selectedLibrary?.key || state.preferredLibraryKey || "",
+      genreKeys: state.genreKeysByLibrary,
       view: state.selectedView,
       sort: state.sort,
     }));
@@ -176,10 +182,43 @@ function persistBrowsePreferences() {
   }
 }
 
+function normalizeGenrePreferences(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([libraryKey, genreKey]) => (
+    /^\d+$/.test(libraryKey) && typeof genreKey === "string" && /^\d+$/.test(genreKey)
+  )));
+}
+
+function selectedGenreKey() {
+  const libraryKey = state.selectedLibrary?.key;
+  return libraryKey ? state.genreKeysByLibrary[libraryKey] || "" : "";
+}
+
+function activeGenreKey() {
+  const selected = selectedGenreKey();
+  return state.selectedView === "collections" || !state.genres.some((genre) => genre.key === selected)
+    ? ""
+    : selected;
+}
+
+function renderGenreFilter() {
+  el.genreFilter.replaceChildren();
+  el.genreFilter.add(new Option(state.genresLoading ? "Loading genres..." : "All genres", ""));
+  for (const genre of state.genres) {
+    el.genreFilter.add(new Option(genre.title, genre.key));
+  }
+  el.genreFilter.value = selectedGenreKey();
+  el.genreFilter.disabled = !state.selectedLibrary
+    || state.genresLoading
+    || !state.genres.length
+    || state.selectedView === "collections";
+}
+
 function syncBrowseControls() {
   el.viewButtons.forEach((button) => button.classList.toggle("active", button.dataset.view === state.selectedView));
   el.sort.value = state.sort;
   el.sort.disabled = ["continue", "collections"].includes(state.selectedView);
+  renderGenreFilter();
 }
 
 applyTheme(document.documentElement.dataset.theme, { persist: false });
@@ -413,6 +452,7 @@ async function loadLibraries() {
   persistBrowsePreferences();
   renderLibraries();
   if (state.selectedLibrary) {
+    await loadGenres();
     await loadLibrary();
   } else {
     renderItems([]);
@@ -427,7 +467,35 @@ async function selectLibrary(key) {
   resetLibraryPaging();
   persistBrowsePreferences();
   renderLibraries();
+  await loadGenres();
   await loadLibrary();
+}
+
+async function loadGenres() {
+  if (!state.selectedLibrary) return;
+  const libraryKey = state.selectedLibrary.key;
+  state.genres = [];
+  state.genresLoading = true;
+  renderGenreFilter();
+  try {
+    const data = await api(`/api/library/${encodeURIComponent(libraryKey)}/genres`);
+    if (state.selectedLibrary?.key !== libraryKey) return;
+    state.genres = data.genres || [];
+    const savedGenre = state.genreKeysByLibrary[libraryKey];
+    if (savedGenre && !state.genres.some((genre) => genre.key === savedGenre)) {
+      delete state.genreKeysByLibrary[libraryKey];
+    }
+  } catch {
+    if (state.selectedLibrary?.key === libraryKey) {
+      state.genres = [];
+    }
+  } finally {
+    if (state.selectedLibrary?.key === libraryKey) {
+      state.genresLoading = false;
+      renderGenreFilter();
+      persistBrowsePreferences();
+    }
+  }
 }
 
 function resetLibraryPaging() {
@@ -451,6 +519,7 @@ async function loadLibrary({ append = false } = {}) {
   const params = new URLSearchParams({
     view: state.selectedView,
     sort: state.sort,
+    genre: activeGenreKey(),
     start: String(start),
     limit: String(state.pageSize),
   });
@@ -510,6 +579,9 @@ async function surpriseMe() {
   setStatus(`Choosing from ${state.selectedLibrary.title}...`);
   try {
     const params = new URLSearchParams({ sectionKey: state.selectedLibrary.key });
+    const genre = activeGenreKey();
+    if (genre) params.set("genre", genre);
+    if (state.selectedView === "unwatched") params.set("unwatched", "1");
     const data = await api(`/api/random-item?${params}`);
     if (!data.item) {
       setStatus("This library has no items to choose from.", "muted");
@@ -1665,6 +1737,20 @@ el.loadMore.addEventListener("click", async () => {
 
 el.surpriseMe.addEventListener("click", surpriseMe);
 el.scanLibrary.addEventListener("click", scanSelectedLibrary);
+
+el.genreFilter.addEventListener("change", async () => {
+  if (!state.selectedLibrary) return;
+  const libraryKey = state.selectedLibrary.key;
+  if (el.genreFilter.value) {
+    state.genreKeysByLibrary[libraryKey] = el.genreFilter.value;
+  } else {
+    delete state.genreKeysByLibrary[libraryKey];
+  }
+  persistBrowsePreferences();
+  state.stack = [];
+  resetLibraryPaging();
+  await loadLibrary();
+});
 
 el.sort.addEventListener("change", async () => {
   state.sort = el.sort.value;

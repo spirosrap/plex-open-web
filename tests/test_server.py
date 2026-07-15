@@ -24,6 +24,13 @@ class FakePlex:
             return ET.fromstring(
                 '<MediaContainer size="1"><Directory key="7" title="Movies" type="movie" /></MediaContainer>'
             )
+        if path.endswith("/genre"):
+            return ET.fromstring(
+                '<MediaContainer size="2">'
+                '<Directory key="22" title="Drama" />'
+                '<Directory key="11" title="Action" />'
+                '</MediaContainer>'
+            )
         if path.endswith("/collections"):
             return ET.fromstring(
                 '<MediaContainer size="2" totalSize="9">'
@@ -69,6 +76,42 @@ def handler_with_payload(payload):
 
 
 class LibraryViewTests(unittest.TestCase):
+    def test_library_genres_are_returned_in_title_order(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library_genres("/api/library/7/genres")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(
+            [{"key": "11", "title": "Action"}, {"key": "22", "title": "Drama"}],
+            responses[0][1]["genres"],
+        )
+        self.assertEqual("/library/sections/7/genre", plex.xml_calls[0][0])
+
+    def test_library_view_forwards_a_valid_genre_filter(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library(
+                "/api/library/7",
+                {"view": ["all"], "sort": ["titleSort"], "genre": ["11"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("11", responses[0][1]["genre"])
+        path, params = plex.xml_calls[0]
+        self.assertEqual("/library/sections/7/all", path)
+        self.assertEqual("11", params["genre"])
+        self.assertEqual("titleSort", params["sort"])
+
+    def test_library_view_rejects_an_invalid_genre_filter(self):
+        handler, responses = handler_with_payload({})
+        handler.api_library("/api/library/7", {"genre": ["../11"]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_genre", responses[0][1]["error"])
+
     def test_continue_view_uses_on_deck_and_excludes_watched_items(self):
         plex = FakePlex()
         handler, responses = handler_with_payload({})
@@ -94,7 +137,13 @@ class LibraryViewTests(unittest.TestCase):
         with mock.patch.object(server, "PLEX", plex):
             handler.api_library(
                 "/api/library/7",
-                {"view": ["collections"], "sort": ["year:desc"], "start": ["0"], "limit": ["2"]},
+                {
+                    "view": ["collections"],
+                    "sort": ["year:desc"],
+                    "genre": ["11"],
+                    "start": ["0"],
+                    "limit": ["2"],
+                },
             )
 
         self.assertEqual(200, responses[0][0])
@@ -106,6 +155,8 @@ class LibraryViewTests(unittest.TestCase):
         self.assertEqual("/library/sections/7/collections", path)
         self.assertEqual("titleSort", params["sort"])
         self.assertEqual(2, params["X-Plex-Container-Size"])
+        self.assertNotIn("genre", params)
+        self.assertIsNone(responses[0][1]["genre"])
 
     def test_collection_composite_image_query_is_forwarded_safely(self):
         path, params = server.plex_image_request(
@@ -136,6 +187,19 @@ class LibraryViewTests(unittest.TestCase):
 
         self.assertEqual(400, responses[0][0])
         self.assertEqual("invalid_section", responses[0][1]["error"])
+
+    def test_random_item_honors_genre_and_unwatched_filters(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(server.secrets, "randbelow", return_value=1):
+            handler.api_random_item({"sectionKey": ["7"], "genre": ["11"], "unwatched": ["true"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("11", responses[0][1]["genre"])
+        self.assertTrue(responses[0][1]["unwatched"])
+        for _, params in plex.xml_calls[1:]:
+            self.assertEqual("11", params["genre"])
+            self.assertEqual("1", params["unwatched"])
 
 
 class WatchStateTests(unittest.TestCase):

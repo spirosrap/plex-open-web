@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 COOKIE_NAME = "plex_open_session"
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
@@ -1824,6 +1824,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.api_libraries()
         elif path == "/api/random-item":
             self.api_random_item(query)
+        elif path.startswith("/api/library/") and path.endswith("/genres"):
+            self.api_library_genres(path)
         elif path.startswith("/api/library/"):
             self.api_library(path, query)
         elif path.startswith("/api/metadata/"):
@@ -1872,11 +1874,34 @@ class AppHandler(BaseHTTPRequestHandler):
         sections = [library_from_xml(child) for child in root.findall("Directory")]
         self.send_json({"libraries": sections})
 
+    def api_library_genres(self, path: str) -> None:
+        section_key = path[len("/api/library/") : -len("/genres")].strip("/")
+        if not re.fullmatch(r"\d+", section_key):
+            self.send_json({"error": "invalid_section"}, status=400)
+            return
+        root = PLEX.xml(f"/library/sections/{urllib.parse.quote(section_key)}/genre")
+        genres = [
+            {"key": item.get("key"), "title": item.get("title")}
+            for item in root.findall("Directory")
+            if item.get("key") and item.get("title")
+        ]
+        genres.sort(key=lambda item: item["title"].casefold())
+        self.send_json({"library": section_key, "genres": genres})
+
     def api_random_item(self, query: Dict[str, List[str]]) -> None:
         section_key = one(query, "sectionKey", "").strip()
         if not re.fullmatch(r"\d+", section_key):
             self.send_json({"error": "invalid_section"}, status=400)
             return
+        genre = one(query, "genre", "").strip()
+        if genre and not re.fullmatch(r"\d+", genre):
+            self.send_json({"error": "invalid_genre"}, status=400)
+            return
+        unwatched_value = one(query, "unwatched", "").strip().lower()
+        if unwatched_value not in {"", "0", "1", "false", "true"}:
+            self.send_json({"error": "invalid_unwatched"}, status=400)
+            return
+        unwatched = unwatched_value in {"1", "true"}
         sections = PLEX.xml("/library/sections")
         section = next(
             (item for item in sections.findall("Directory") if item.get("key") == section_key),
@@ -1893,10 +1918,22 @@ class AppHandler(BaseHTTPRequestHandler):
             "X-Plex-Container-Start": 0,
             "X-Plex-Container-Size": 1,
         }
+        if genre:
+            params["genre"] = genre
+        if unwatched:
+            params["unwatched"] = "1"
         first = PLEX.xml(endpoint, params=params)
         total = to_int(first.get("totalSize")) or to_int(first.get("size")) or 0
         if total <= 0:
-            self.send_json({"library": section_key, "totalSize": 0, "item": None})
+            self.send_json(
+                {
+                    "library": section_key,
+                    "totalSize": 0,
+                    "genre": genre or None,
+                    "unwatched": unwatched,
+                    "item": None,
+                }
+            )
             return
 
         offset = secrets.randbelow(total)
@@ -1910,6 +1947,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 "library": section_key,
                 "totalSize": total,
                 "offset": offset,
+                "genre": genre or None,
+                "unwatched": unwatched,
                 "item": items[0] if items else None,
             }
         )
@@ -1985,6 +2024,10 @@ class AppHandler(BaseHTTPRequestHandler):
         start = max(0, to_int(one(query, "start", "0")) or 0)
         limit = min(300, max(1, to_int(one(query, "limit", "48")) or 48))
         sort = one(query, "sort", "")
+        genre = one(query, "genre", "").strip()
+        if genre and not re.fullmatch(r"\d+", genre):
+            self.send_json({"error": "invalid_genre"}, status=400)
+            return
         params: Dict[str, Any] = {
             "includeGuids": "1",
             "includeCollections": "1",
@@ -2005,6 +2048,9 @@ class AppHandler(BaseHTTPRequestHandler):
         elif view == "collections":
             endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/collections"
             params["sort"] = "titleSort"
+        active_genre = genre if view != "collections" else ""
+        if active_genre:
+            params["genre"] = active_genre
         if sort and view not in {"continue", "collections"}:
             params["sort"] = sort
         root = PLEX.xml(endpoint, params=params)
@@ -2015,6 +2061,7 @@ class AppHandler(BaseHTTPRequestHandler):
             {
                 "library": section_key,
                 "view": view,
+                "genre": active_genre or None,
                 "start": start,
                 "limit": limit,
                 "size": len(items) if view == "continue" else to_int(root.get("size")),

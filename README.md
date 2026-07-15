@@ -7,10 +7,10 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Features
 
 - Password-protected web UI with signed HttpOnly session cookies.
-- Library list, continue/recent/all/unwatched views, sorting, and search.
+- Library list, continue/recent/all/unwatched views, persistent genre filtering, sorting, and search.
 - Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
-- Surprise Me selection for opening a random item from the current Plex library.
-- Persistent library, view, and sort context across reloads and sign-in sessions.
+- Surprise Me selection for opening a random item from the active genre and Unwatched filters.
+- Persistent library, view, genre, and sort context across reloads and sign-in sessions.
 - Resume-progress indicators and manual watched/unwatched controls synchronized with Plex.
 - Persistent System, Light, and Dark color themes available before and after login.
 - One-tap scanning for the selected Plex library with progress feedback and an automatic result reload.
@@ -26,6 +26,26 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.8.0
+
+**Added**
+
+- Added a server-backed genre selector populated from the active Plex library.
+- Added authenticated genre discovery and filtered-library API support shared with Android.
+- Added independent saved genre choices for each library.
+
+**Improved**
+
+- Genre filters work with paging, sorting, Continue, Recent, All, and Unwatched views.
+- Surprise Me now respects the selected genre and limits picks to unwatched media from the Unwatched view.
+- Desktop and mobile toolbars accommodate both genre and sort controls without horizontal overflow.
+
+**Fixed**
+
+- Switching libraries no longer carries an unrelated genre identifier into the new library.
+- Removed or invalid saved genres fall back to All genres instead of producing an empty library.
+- Collections temporarily disables the unrelated genre filter while preserving it for other views.
 
 ### 0.7.0
 
