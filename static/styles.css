@@ -589,6 +589,7 @@ select:focus-visible {
 
 .details-dialog,
 .collection-dialog,
+.collection-name-dialog,
 .player-dialog,
 .subtitle-dialog {
   width: min(900px, calc(100vw - 28px));
@@ -601,6 +602,7 @@ select:focus-visible {
 
 .details-dialog::backdrop,
 .collection-dialog::backdrop,
+.collection-name-dialog::backdrop,
 .player-dialog::backdrop,
 .subtitle-dialog::backdrop {
   background: var(--backdrop);
@@ -641,15 +643,27 @@ select:focus-visible {
   overflow-wrap: anywhere;
 }
 
-#collection-filter {
+.collection-create-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 18px;
+}
+
+#collection-filter,
+#collection-create-title,
+#collection-name-input {
   width: 100%;
   min-height: 42px;
-  margin-top: 18px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--field);
   color: var(--text);
   padding: 0 12px;
+}
+
+#collection-filter {
+  margin-top: 10px;
 }
 
 .collection-status {
@@ -677,7 +691,7 @@ select:focus-visible {
 
 .collection-row {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 12px;
   min-height: 52px;
@@ -715,6 +729,55 @@ select:focus-visible {
 
 .collection-row.is-readonly {
   opacity: 0.68;
+}
+
+.collection-actions {
+  display: flex;
+  gap: 5px;
+}
+
+.collection-action {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--field);
+  color: var(--text);
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.collection-action.danger {
+  color: var(--danger);
+}
+
+.collection-action:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.collection-name-dialog {
+  width: min(430px, calc(100vw - 28px));
+}
+
+.collection-name-dialog h2 {
+  margin: 0 0 16px;
+  font-size: 22px;
+}
+
+.collection-name-dialog label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.collection-name-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .details-layout {
@@ -1058,6 +1121,19 @@ select:focus-visible {
   .subtitle-form,
   .subtitle-result {
     grid-template-columns: 1fr;
+  }
+
+  .collection-create-form {
+    grid-template-columns: 1fr;
+  }
+
+  .collection-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .collection-actions {
+    grid-column: 2 / -1;
+    justify-content: flex-end;
   }
 
   .player-dialog header {

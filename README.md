@@ -10,6 +10,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Library list, continue/recent/all/unwatched views, persistent genre filtering, sorting, and search.
 - Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
 - Movie collection membership management with searchable, immediate add/remove controls.
+- Manual collection creation, rename, and confirmed deletion without removing library movies.
 - Server-backed My List shared with the Android app, with per-library browsing and poster badges.
 - Surprise Me selection for opening a random item from the active genre and Unwatched filters.
 - Persistent library, view, genre, and sort context across reloads and sign-in sessions.
@@ -29,6 +30,28 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.12.0
+
+**Added**
+
+- Added New collection creation directly from a movie's collection manager; the movie is included immediately.
+- Added Rename and Delete actions for every manual Plex collection.
+- Added a focused rename dialog and an explicit deletion confirmation explaining that movies remain in the library.
+
+**Improved**
+
+- Collection creation, rename, and deletion use Plex's native library operations and refresh authoritative names, counts, and memberships afterward.
+- Manual collection rows now combine membership, movie count, and lifecycle actions while remaining responsive on phone-sized screens.
+- Duplicate-name and validation errors are translated into clear collection-specific feedback.
+- Renaming the currently open collection updates its breadcrumb immediately.
+
+**Fixed**
+
+- Deleting the currently open collection now closes stale detail dialogs and returns to the refreshed collection library.
+- Existing collection names are compared case-insensitively before create or rename operations.
+- Empty, control-character, oversized, cross-library, missing, and smart-collection mutation requests are rejected before Plex is changed.
+- Deleting a collection removes only the collection container; its movies remain untouched in the Plex library.
 
 ### 0.11.0
 

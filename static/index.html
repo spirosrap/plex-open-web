@@ -143,9 +143,26 @@
         </div>
         <button id="collection-close" class="icon-button" aria-label="Close">x</button>
       </header>
+      <form id="collection-create-form" class="collection-create-form">
+        <input id="collection-create-title" type="text" maxlength="120" placeholder="New collection name" autocomplete="off" />
+        <button id="collection-create" type="submit" class="primary-button">Create</button>
+      </form>
       <input id="collection-filter" type="search" placeholder="Filter collections" autocomplete="off" />
       <div id="collection-status" class="collection-status" aria-live="polite"></div>
       <section id="collection-list" class="collection-list" aria-live="polite"></section>
+    </dialog>
+
+    <dialog id="collection-name-dialog" class="collection-name-dialog">
+      <form id="collection-name-form">
+        <h2>Rename collection</h2>
+        <label for="collection-name-input">Collection name</label>
+        <input id="collection-name-input" type="text" maxlength="120" autocomplete="off" required />
+        <div id="collection-name-status" class="collection-status" aria-live="polite"></div>
+        <div class="collection-name-actions">
+          <button id="collection-name-cancel" type="button" class="secondary-button">Cancel</button>
+          <button id="collection-name-save" type="submit" class="primary-button">Save</button>
+        </div>
+      </form>
     </dialog>
 
     <dialog id="player-dialog" class="player-dialog">

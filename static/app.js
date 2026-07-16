@@ -22,6 +22,8 @@ const state = {
   collectionItem: null,
   collectionMembership: null,
   collectionUpdating: new Set(),
+  collectionCreating: false,
+  collectionRenameTarget: null,
   playerItem: null,
   playerNeighbors: null,
   autoplayNext: true,
@@ -105,9 +107,18 @@ const el = {
   collectionDialog: document.querySelector("#collection-dialog"),
   collectionTitle: document.querySelector("#collection-title"),
   collectionFilter: document.querySelector("#collection-filter"),
+  collectionCreateForm: document.querySelector("#collection-create-form"),
+  collectionCreateTitle: document.querySelector("#collection-create-title"),
+  collectionCreate: document.querySelector("#collection-create"),
   collectionStatus: document.querySelector("#collection-status"),
   collectionList: document.querySelector("#collection-list"),
   collectionClose: document.querySelector("#collection-close"),
+  collectionNameDialog: document.querySelector("#collection-name-dialog"),
+  collectionNameForm: document.querySelector("#collection-name-form"),
+  collectionNameInput: document.querySelector("#collection-name-input"),
+  collectionNameStatus: document.querySelector("#collection-name-status"),
+  collectionNameCancel: document.querySelector("#collection-name-cancel"),
+  collectionNameSave: document.querySelector("#collection-name-save"),
   playerDialog: document.querySelector("#player-dialog"),
   playerTitle: document.querySelector("#player-title"),
   playbackMode: document.querySelector("#playback-mode"),
@@ -799,6 +810,9 @@ function renderCollectionMembership() {
     !query || collection.title.toLowerCase().includes(query)
   );
   el.collectionList.innerHTML = "";
+  el.collectionCreate.disabled = state.collectionCreating;
+  el.collectionCreateTitle.disabled = state.collectionCreating;
+  el.collectionCreate.textContent = state.collectionCreating ? "Creating..." : "Create";
   if (!data) {
     setCollectionStatus("Loading collections...");
     return;
@@ -810,10 +824,11 @@ function renderCollectionMembership() {
 
   const fragment = document.createDocumentFragment();
   for (const collection of collections) {
-    const row = document.createElement("label");
+    const row = document.createElement("div");
     row.className = `collection-row${collection.editable ? "" : " is-readonly"}`;
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
+    checkbox.id = `collection-membership-${collection.ratingKey}`;
     checkbox.checked = Boolean(collection.member);
     checkbox.disabled = !collection.editable || state.collectionUpdating.has(collection.ratingKey);
     checkbox.setAttribute("aria-label", `${collection.member ? "Remove from" : "Add to"} ${collection.title}`);
@@ -821,7 +836,8 @@ function renderCollectionMembership() {
       setCollectionMembership(collection, checkbox.checked);
     });
 
-    const label = document.createElement("span");
+    const label = document.createElement("label");
+    label.htmlFor = checkbox.id;
     const title = document.createElement("strong");
     title.textContent = collection.title;
     label.append(title);
@@ -833,7 +849,24 @@ function renderCollectionMembership() {
     const count = document.createElement("span");
     count.className = "collection-count";
     count.textContent = `${collection.childCount} ${collection.childCount === 1 ? "movie" : "movies"}`;
-    row.append(checkbox, label, count);
+    const actions = document.createElement("span");
+    actions.className = "collection-actions";
+    if (collection.editable) {
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "collection-action";
+      rename.textContent = "Rename";
+      rename.disabled = state.collectionUpdating.has(collection.ratingKey);
+      rename.addEventListener("click", () => openCollectionRename(collection));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "collection-action danger";
+      remove.textContent = "Delete";
+      remove.disabled = state.collectionUpdating.has(collection.ratingKey);
+      remove.addEventListener("click", () => deleteCollection(collection));
+      actions.append(rename, remove);
+    }
+    row.append(checkbox, label, count, actions);
     fragment.append(row);
   }
   el.collectionList.append(fragment);
@@ -848,6 +881,7 @@ async function openCollectionMembership(item) {
   state.collectionUpdating.clear();
   el.collectionTitle.textContent = `Collections for ${displayTitle(item)}`;
   el.collectionFilter.value = "";
+  el.collectionCreateTitle.value = "";
   renderCollectionMembership();
   if (!el.collectionDialog.open) {
     el.collectionDialog.showModal();
@@ -863,6 +897,142 @@ async function openCollectionMembership(item) {
     }
   } catch (error) {
     setCollectionStatus(`Could not load collections: ${error.message}`, "error");
+  }
+}
+
+function collectionErrorMessage(message) {
+  const messages = {
+    collection_title_already_exists: "A collection with this name already exists.",
+    invalid_collection_title: "Enter a collection name between 1 and 120 characters.",
+    smart_collection_read_only: "Smart collections are managed automatically by Plex.",
+    collection_not_found: "This collection no longer exists in Plex.",
+  };
+  return messages[message] || message;
+}
+
+function applyCollectionManagementResponse(data) {
+  const item = state.collectionItem;
+  state.collectionMembership = data;
+  if (item) {
+    Object.assign(item, data.item || {});
+    if (el.detailsDialog.open) openDetails(item);
+  }
+}
+
+async function createCollection(title) {
+  const item = state.collectionItem;
+  if (!item?.ratingKey || state.collectionCreating) return;
+  state.collectionCreating = true;
+  renderCollectionMembership();
+  setCollectionStatus(`Creating ${title}...`);
+  let resultStatus;
+  try {
+    const data = await api("/api/collection-management", {
+      method: "POST",
+      body: JSON.stringify({ action: "create", ratingKey: item.ratingKey, title }),
+    });
+    applyCollectionManagementResponse(data);
+    el.collectionCreateTitle.value = "";
+    el.collectionFilter.value = "";
+    resultStatus = [`Created ${title} and added ${displayTitle(item)}.`, "success"];
+  } catch (error) {
+    resultStatus = [`Could not create collection: ${collectionErrorMessage(error.message)}`, "error"];
+  } finally {
+    state.collectionCreating = false;
+    renderCollectionMembership();
+    setCollectionStatus(...resultStatus);
+  }
+}
+
+function openCollectionRename(collection) {
+  state.collectionRenameTarget = collection;
+  el.collectionNameInput.value = collection.title;
+  el.collectionNameStatus.textContent = "";
+  el.collectionNameStatus.dataset.kind = "muted";
+  el.collectionNameSave.disabled = false;
+  el.collectionNameDialog.showModal();
+  el.collectionNameInput.select();
+}
+
+async function renameCollection(collection, title) {
+  const item = state.collectionItem;
+  if (!item?.ratingKey || !collection?.ratingKey || state.collectionUpdating.has(collection.ratingKey)) return;
+  state.collectionUpdating.add(collection.ratingKey);
+  el.collectionNameSave.disabled = true;
+  el.collectionNameStatus.textContent = "Renaming...";
+  let successMessage = null;
+  try {
+    const data = await api("/api/collection-management", {
+      method: "POST",
+      body: JSON.stringify({
+        action: "rename",
+        ratingKey: item.ratingKey,
+        collectionRatingKey: collection.ratingKey,
+        title,
+      }),
+    });
+    applyCollectionManagementResponse(data);
+    const current = state.stack.at(-1);
+    if (current?.item?.ratingKey === collection.ratingKey) {
+      current.title = title;
+      current.item.title = title;
+      el.viewTitle.textContent = title;
+      renderBreadcrumbs();
+    }
+    el.collectionNameDialog.close();
+    successMessage = `Renamed ${collection.title} to ${title}.`;
+  } catch (error) {
+    el.collectionNameStatus.textContent = collectionErrorMessage(error.message);
+    el.collectionNameStatus.dataset.kind = "error";
+  } finally {
+    state.collectionUpdating.delete(collection.ratingKey);
+    el.collectionNameSave.disabled = false;
+    if (successMessage && el.collectionDialog.open) {
+      renderCollectionMembership();
+      setCollectionStatus(successMessage, "success");
+    }
+  }
+}
+
+async function deleteCollection(collection) {
+  const item = state.collectionItem;
+  if (!item?.ratingKey || !collection?.ratingKey || state.collectionUpdating.has(collection.ratingKey)) return;
+  const confirmed = window.confirm(
+    `Delete ${collection.title}? The movies will remain in your Plex library.`
+  );
+  if (!confirmed) return;
+  state.collectionUpdating.add(collection.ratingKey);
+  renderCollectionMembership();
+  setCollectionStatus(`Deleting ${collection.title}...`);
+  let resultStatus;
+  try {
+    const data = await api("/api/collection-management", {
+      method: "POST",
+      body: JSON.stringify({
+        action: "delete",
+        ratingKey: item.ratingKey,
+        collectionRatingKey: collection.ratingKey,
+      }),
+    });
+    applyCollectionManagementResponse(data);
+    const deletingOpenCollection = state.stack.at(-1)?.item?.ratingKey === collection.ratingKey;
+    if (deletingOpenCollection) {
+      el.collectionDialog.close();
+      el.detailsDialog.close();
+      state.stack = [];
+      await loadLibrary();
+      setStatus(`Deleted ${collection.title}. Movies remain in the library.`, "success");
+      return;
+    }
+    resultStatus = [`Deleted ${collection.title}. Movies remain in the library.`, "success"];
+  } catch (error) {
+    resultStatus = [`Could not delete collection: ${collectionErrorMessage(error.message)}`, "error"];
+  } finally {
+    state.collectionUpdating.delete(collection.ratingKey);
+    if (el.collectionDialog.open) {
+      renderCollectionMembership();
+      if (resultStatus) setCollectionStatus(...resultStatus);
+    }
   }
 }
 
@@ -2158,11 +2328,37 @@ el.detailsDialog.addEventListener("close", () => {
   state.detailsItem = null;
 });
 el.collectionFilter.addEventListener("input", renderCollectionMembership);
+el.collectionCreateForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const title = el.collectionCreateTitle.value.trim();
+  if (!title) {
+    setCollectionStatus("Enter a name for the new collection.", "error");
+    el.collectionCreateTitle.focus();
+    return;
+  }
+  createCollection(title);
+});
 el.collectionClose.addEventListener("click", () => el.collectionDialog.close());
 el.collectionDialog.addEventListener("close", () => {
   state.collectionItem = null;
   state.collectionMembership = null;
   state.collectionUpdating.clear();
+  state.collectionCreating = false;
+});
+el.collectionNameCancel.addEventListener("click", () => el.collectionNameDialog.close());
+el.collectionNameForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const title = el.collectionNameInput.value.trim();
+  if (!title) {
+    el.collectionNameStatus.textContent = "Enter a collection name.";
+    el.collectionNameStatus.dataset.kind = "error";
+    return;
+  }
+  renameCollection(state.collectionRenameTarget, title);
+});
+el.collectionNameDialog.addEventListener("close", () => {
+  state.collectionRenameTarget = null;
+  el.collectionNameStatus.textContent = "";
 });
 el.autoplayNext.addEventListener("change", () => {
   state.autoplayNext = el.autoplayNext.checked;

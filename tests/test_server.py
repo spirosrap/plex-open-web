@@ -108,18 +108,26 @@ class FakeEpisodePlex(FakePlex):
 class FakeCollectionPlex(FakePlex):
     def __init__(self, member=False):
         super().__init__()
-        self.member = member
+        self.member_keys = {"101"} if member else set()
+        self.collections = [
+            {"ratingKey": "101", "title": "Manual Picks", "childCount": 4, "smart": False},
+            {"ratingKey": "102", "title": "Automatic Picks", "childCount": 8, "smart": True},
+        ]
 
     def xml(self, path, params=None):
         self.xml_calls.append((path, dict(params or {})))
         if path == "/":
             return ET.fromstring('<MediaContainer machineIdentifier="machine-123" />')
         if path == "/library/metadata/501":
-            tag = '<Collection id="9001" tag="Manual Picks" />' if self.member else ""
+            tags = "".join(
+                f'<Collection id="tag-{item["ratingKey"]}" tag="{item["title"]}" />'
+                for item in self.collections
+                if item["ratingKey"] in self.member_keys
+            )
             return ET.fromstring(
                 '<MediaContainer size="1">'
                 '<Video ratingKey="501" librarySectionID="7" type="movie" title="Collection Test">'
-                f'{tag}</Video></MediaContainer>'
+                f'{tags}</Video></MediaContainer>'
             )
         if path == "/library/metadata/601":
             return ET.fromstring(
@@ -128,13 +136,18 @@ class FakeCollectionPlex(FakePlex):
                 '</MediaContainer>'
             )
         if path == "/library/sections/7/collections":
+            directories = "".join(
+                '<Directory ratingKey="{ratingKey}" key="/library/collections/{ratingKey}/children" '
+                'type="collection" subtype="movie" title="{title}" childCount="{childCount}"{smart_attr} />'.format(
+                    ratingKey=item["ratingKey"],
+                    title=item["title"],
+                    childCount=item["childCount"],
+                    smart_attr=' smart="1"' if item["smart"] else "",
+                )
+                for item in self.collections
+            )
             return ET.fromstring(
-                '<MediaContainer size="2">'
-                '<Directory ratingKey="101" key="/library/collections/101/children" type="collection" '
-                'subtype="movie" title="Manual Picks" childCount="4" />'
-                '<Directory ratingKey="102" key="/library/collections/102/children" type="collection" '
-                'subtype="movie" title="Automatic Picks" childCount="8" smart="1" />'
-                '</MediaContainer>'
+                f'<MediaContainer size="{len(self.collections)}">{directories}</MediaContainer>'
             )
         return ET.fromstring('<MediaContainer size="0" />')
 
@@ -142,9 +155,26 @@ class FakeCollectionPlex(FakePlex):
         response = super().open(path, params=params, **kwargs)
         method = kwargs.get("method")
         if path == "/library/collections/101/items" and method == "PUT":
-            self.member = True
+            self.member_keys.add("101")
         elif path == "/library/collections/101/items/501" and method == "DELETE":
-            self.member = False
+            self.member_keys.discard("101")
+        elif path == "/library/collections" and method == "POST":
+            self.collections.append(
+                {
+                    "ratingKey": "103",
+                    "title": params["title"],
+                    "childCount": 1,
+                    "smart": False,
+                }
+            )
+            self.member_keys.add("103")
+        elif path == "/library/sections/7/all" and method == "PUT":
+            target = next(item for item in self.collections if item["ratingKey"] == params["id"])
+            target["title"] = params["title.value"]
+        elif path.startswith("/library/collections/") and method == "DELETE":
+            rating_key = path.rsplit("/", 1)[-1]
+            self.collections = [item for item in self.collections if item["ratingKey"] != rating_key]
+            self.member_keys.discard(rating_key)
         return response
 
 
@@ -329,7 +359,7 @@ class CollectionMembershipTests(unittest.TestCase):
         self.assertFalse(automatic["editable"])
         self.assertEqual("Manual Picks", manual["title"])
         self.assertTrue(manual["member"])
-        self.assertEqual([{"id": "9001", "tag": "Manual Picks"}], responses[0][1]["item"]["collections"])
+        self.assertEqual([{"id": "tag-101", "tag": "Manual Picks"}], responses[0][1]["item"]["collections"])
 
     def test_adds_movie_by_native_collection_id_and_refreshes_membership(self):
         plex = FakeCollectionPlex()
@@ -386,6 +416,99 @@ class CollectionMembershipTests(unittest.TestCase):
             )
             handler.api_collection_membership("POST", {})
             self.assertEqual("invalid_member_state", responses[0][1]["error"])
+
+
+class CollectionManagementTests(unittest.TestCase):
+    def test_creates_collection_with_movie_and_refreshes_membership(self):
+        plex = FakeCollectionPlex()
+        handler, responses = handler_with_payload(
+            {"action": "create", "ratingKey": "501", "title": "New Collection"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("create", responses[0][1]["action"])
+        self.assertEqual(3, len(responses[0][1]["collections"]))
+        created = next(item for item in responses[0][1]["collections"] if item["ratingKey"] == "103")
+        self.assertTrue(created["member"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/collections", path)
+        self.assertEqual("POST", kwargs["method"])
+        self.assertEqual("New Collection", params["title"])
+        self.assertEqual("7", params["sectionId"])
+        self.assertEqual(1, params["type"])
+
+    def test_renames_manual_collection_and_preserves_membership(self):
+        plex = FakeCollectionPlex(member=True)
+        handler, responses = handler_with_payload(
+            {
+                "action": "rename",
+                "ratingKey": "501",
+                "collectionRatingKey": "101",
+                "title": "Renamed Picks",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(200, responses[0][0])
+        renamed = next(item for item in responses[0][1]["collections"] if item["ratingKey"] == "101")
+        self.assertEqual("Renamed Picks", renamed["title"])
+        self.assertTrue(renamed["member"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/sections/7/all", path)
+        self.assertEqual("PUT", kwargs["method"])
+        self.assertEqual(18, params["type"])
+
+    def test_deletes_manual_collection_without_deleting_movie(self):
+        plex = FakeCollectionPlex(member=True)
+        handler, responses = handler_with_payload(
+            {"action": "delete", "ratingKey": "501", "collectionRatingKey": "101"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertNotIn("101", [item["ratingKey"] for item in responses[0][1]["collections"]])
+        self.assertEqual("/library/collections/101", plex.open_calls[0][0])
+        self.assertEqual("DELETE", plex.open_calls[0][2]["method"])
+        self.assertEqual("501", responses[0][1]["item"]["ratingKey"])
+
+    def test_rejects_duplicate_and_invalid_titles(self):
+        plex = FakeCollectionPlex()
+        with mock.patch.object(server, "PLEX", plex):
+            handler, responses = handler_with_payload(
+                {"action": "create", "ratingKey": "501", "title": " manual picks "}
+            )
+            handler.api_collection_management("POST")
+            self.assertEqual(409, responses[0][0])
+            self.assertEqual("collection_title_already_exists", responses[0][1]["error"])
+
+            handler, responses = handler_with_payload(
+                {"action": "create", "ratingKey": "501", "title": "\n"}
+            )
+            handler.api_collection_management("POST")
+            self.assertEqual(400, responses[0][0])
+            self.assertEqual("invalid_collection_title", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_rejects_smart_collection_rename_and_delete(self):
+        plex = FakeCollectionPlex()
+        with mock.patch.object(server, "PLEX", plex):
+            for action in ("rename", "delete"):
+                payload = {
+                    "action": action,
+                    "ratingKey": "501",
+                    "collectionRatingKey": "102",
+                }
+                if action == "rename":
+                    payload["title"] = "Not Allowed"
+                handler, responses = handler_with_payload(payload)
+                handler.api_collection_management("POST")
+                self.assertEqual(409, responses[0][0])
+                self.assertEqual("smart_collection_read_only", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
 
 
 class EpisodeNeighborTests(unittest.TestCase):

@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.11.0"
+APP_VERSION = "0.12.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -1914,6 +1914,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/collection-membership":
             self.api_collection_membership(method, query)
             return
+        if path == "/api/collection-management":
+            self.api_collection_management(method)
+            return
         if path == "/api/library-scan":
             self.api_library_scan(method)
             return
@@ -2306,6 +2309,111 @@ class AppHandler(BaseHTTPRequestHandler):
             membership = self.collection_membership(rating_key)
 
         self.send_json({"ok": True, **membership})
+
+    def api_collection_management(self, method: str) -> None:
+        if method != "POST":
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload = self.read_json()
+        action = str(payload.get("action", "")).strip().lower()
+        if action not in {"create", "rename", "delete"}:
+            self.send_json({"error": "invalid_collection_action"}, status=400)
+            return
+        rating_key = str(payload.get("ratingKey", "")).strip()
+        if not re.fullmatch(r"\d+", rating_key):
+            self.send_json({"error": "invalid_rating_key"}, status=400)
+            return
+        try:
+            membership = self.collection_membership(rating_key)
+        except LookupError as exc:
+            self.send_json({"error": str(exc)}, status=404)
+            return
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+
+        title = payload.get("title")
+        if action in {"create", "rename"}:
+            if not isinstance(title, str):
+                self.send_json({"error": "invalid_collection_title"}, status=400)
+                return
+            title = title.strip()
+            if not title or len(title) > 120 or any(ord(char) < 32 for char in title):
+                self.send_json({"error": "invalid_collection_title"}, status=400)
+                return
+
+        collection = None
+        collection_key = str(payload.get("collectionRatingKey", "")).strip()
+        if action in {"rename", "delete"}:
+            if not re.fullmatch(r"\d+", collection_key):
+                self.send_json({"error": "invalid_collection_rating_key"}, status=400)
+                return
+            collection = next(
+                (item for item in membership["collections"] if item["ratingKey"] == collection_key),
+                None,
+            )
+            if collection is None:
+                self.send_json({"error": "collection_not_found"}, status=404)
+                return
+            if not collection["editable"]:
+                self.send_json({"error": "smart_collection_read_only"}, status=409)
+                return
+
+        if action in {"create", "rename"}:
+            duplicate = next(
+                (
+                    item
+                    for item in membership["collections"]
+                    if item["title"].casefold() == title.casefold()
+                    and item["ratingKey"] != collection_key
+                ),
+                None,
+            )
+            if duplicate is not None:
+                self.send_json({"error": "collection_title_already_exists"}, status=409)
+                return
+
+        section_key = membership["librarySectionID"]
+        if action == "create":
+            server_root = PLEX.xml("/")
+            machine_id = server_root.get("machineIdentifier") or ""
+            if not machine_id:
+                self.send_json({"error": "plex_machine_identifier_unavailable"}, status=502)
+                return
+            uri = (
+                f"server://{machine_id}/com.plexapp.plugins.library"
+                f"/library/metadata/{rating_key}"
+            )
+            response = PLEX.open(
+                "/library/collections",
+                params={
+                    "uri": uri,
+                    "type": 1,
+                    "title": title,
+                    "smart": 0,
+                    "sectionId": section_key,
+                },
+                method="POST",
+            )
+            response.close()
+        elif action == "rename" and title != collection["title"]:
+            response = PLEX.open(
+                f"/library/sections/{section_key}/all",
+                params={
+                    "id": collection_key,
+                    "type": 18,
+                    "title.value": title,
+                    "title.locked": 1,
+                },
+                method="PUT",
+            )
+            response.close()
+        elif action == "delete":
+            response = PLEX.open(f"/library/collections/{collection_key}", method="DELETE")
+            response.close()
+
+        refreshed = self.collection_membership(rating_key)
+        self.send_json({"ok": True, "action": action, **refreshed})
 
     def api_library(self, path: str, query: Dict[str, List[str]]) -> None:
         section_key = path[len("/api/library/") :].strip("/").split("/", 1)[0]
