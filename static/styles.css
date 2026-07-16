@@ -90,6 +90,11 @@ button {
   border: 0;
   color: inherit;
   cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease, transform 120ms ease;
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.98);
 }
 
 button:disabled {
@@ -319,7 +324,7 @@ select:focus-visible {
 
 .topbar h1 {
   margin: 5px 0 0;
-  font-size: clamp(28px, 3vw, 42px);
+  font-size: 36px;
   line-height: 1.05;
   letter-spacing: 0;
 }
@@ -422,6 +427,12 @@ select:focus-visible {
   grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
   gap: 18px;
   align-items: start;
+  transition: opacity 120ms ease;
+}
+
+.media-grid.is-refreshing {
+  opacity: 0.64;
+  pointer-events: none;
 }
 
 .load-more-button {
@@ -442,6 +453,8 @@ select:focus-visible {
 
 .media-card {
   min-width: 0;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 340px;
 }
 
 .poster-button {
@@ -453,6 +466,7 @@ select:focus-visible {
   border-radius: 8px;
   background: var(--panel-2);
   box-shadow: var(--poster-shadow);
+  transition: box-shadow 150ms ease, transform 150ms ease;
 }
 
 .poster-button img,
@@ -462,6 +476,54 @@ select:focus-visible {
   display: grid;
   place-items: center;
   object-fit: cover;
+}
+
+.skeleton-card {
+  content-visibility: visible;
+  animation: skeleton-pulse 1.15s ease-in-out infinite alternate;
+}
+
+.skeleton-block,
+.skeleton-line {
+  background: var(--panel-2);
+}
+
+.skeleton-line {
+  height: 12px;
+  border-radius: 4px;
+}
+
+.skeleton-title {
+  width: 78%;
+  margin-top: 4px;
+}
+
+.skeleton-meta {
+  width: 48%;
+  margin-top: 10px;
+}
+
+@keyframes skeleton-pulse {
+  from { opacity: 0.48; }
+  to { opacity: 0.9; }
+}
+
+@media (hover: hover) {
+  .media-card:hover .poster-button {
+    transform: translateY(-2px);
+    box-shadow: 0 16px 34px rgba(0, 0, 0, 0.34);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }
 
 .poster-fallback {
@@ -1069,6 +1131,10 @@ select:focus-visible {
   .toolbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .topbar h1 {
+    font-size: 30px;
   }
 
   .search,

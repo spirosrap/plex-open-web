@@ -10,6 +10,7 @@ media library you control.
 from __future__ import annotations
 
 import base64
+import collections
 import gzip
 import hashlib
 import hmac
@@ -32,17 +33,22 @@ import xml.etree.ElementTree as ET
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.12.0"
+APP_VERSION = "0.13.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
+JSON_COMPRESSION_MIN_BYTES = 1024
+POSTER_WIDTH = 480
+POSTER_HEIGHT = 720
+ART_WIDTH = 1280
+ART_HEIGHT = 720
 DEFAULT_PREFS = (
     "/var/lib/plexmediaserver/Library/Application Support/"
     "Plex Media Server/Preferences.xml"
@@ -108,6 +114,70 @@ class Settings:
     opensubtitles_user_agent = os.environ.get(
         "OPENSUBTITLES_USER_AGENT", f"PlexOpenWeb v{APP_VERSION}"
     )
+
+
+class TimedResultCache:
+    """Small bounded cache that also coalesces concurrent identical work."""
+
+    def __init__(self, max_entries: int = 128) -> None:
+        self.max_entries = max_entries
+        self.lock = threading.Lock()
+        self.values: "collections.OrderedDict[str, Tuple[float, Any]]" = collections.OrderedDict()
+        self.inflight: Dict[str, Dict[str, Any]] = {}
+        self.generation = 0
+
+    def get_or_load(self, key: str, ttl: float, loader: Callable[[], Any]) -> Any:
+        with self.lock:
+            now = time.monotonic()
+            cached = self.values.get(key)
+            if cached and cached[0] > now:
+                self.values.move_to_end(key)
+                return cached[1]
+            if cached:
+                self.values.pop(key, None)
+            pending = self.inflight.get(key)
+            owner = pending is None
+            if owner:
+                pending = {"event": threading.Event(), "generation": self.generation}
+                self.inflight[key] = pending
+
+        if not owner:
+            pending["event"].wait(Settings.request_timeout + 5)
+            if "error" in pending:
+                raise pending["error"]
+            if "result" in pending:
+                return pending["result"]
+            return self.get_or_load(key, ttl, loader)
+
+        try:
+            result = loader()
+        except BaseException as exc:
+            with self.lock:
+                pending["error"] = exc
+                self.inflight.pop(key, None)
+                pending["event"].set()
+            raise
+
+        with self.lock:
+            pending["result"] = result
+            if pending["generation"] == self.generation:
+                self.values[key] = (time.monotonic() + ttl, result)
+                self.values.move_to_end(key)
+                while len(self.values) > self.max_entries:
+                    self.values.popitem(last=False)
+            self.inflight.pop(key, None)
+            pending["event"].set()
+        return result
+
+    def clear(self) -> None:
+        with self.lock:
+            self.generation += 1
+            self.values.clear()
+
+
+API_CACHE = TimedResultCache()
+STATIC_CACHE_LOCK = threading.Lock()
+STATIC_CACHE: Dict[Path, Tuple[int, bytes]] = {}
 
 
 MY_LIST_FILE = Settings.data_dir / "my-list.json"
@@ -204,7 +274,22 @@ def plex_image_request(path: str) -> Tuple[Optional[str], Dict[str, str]]:
         for key, values in query.items()
         if key in PLEX_IMAGE_QUERY_KEYS and values
     }
+    if plex_path == "/photo/:/transcode":
+        source = query.get("url", [""])[-1]
+        source_path = safe_plex_path(urllib.parse.urlsplit(source).path)
+        if not source_path:
+            return None, {}
+        plex_path = source_path
     return plex_path, params
+
+
+def plex_image_upstream_request(path: str) -> Tuple[Optional[str], Dict[str, str]]:
+    source_path, params = plex_image_request(path)
+    if not source_path:
+        return None, {}
+    if not params:
+        return source_path, {}
+    return "/photo/:/transcode", {"url": source_path, **params}
 
 
 def to_int(value: Optional[str]) -> Optional[int]:
@@ -327,10 +412,48 @@ def library_from_xml(elem: ET.Element) -> Dict[str, Any]:
     }
 
 
-def image_url(path: Optional[str]) -> Optional[str]:
+def cached_server_info() -> Dict[str, Any]:
+    def load() -> Dict[str, Any]:
+        root = PLEX.xml("/")
+        return {
+            "friendlyName": root.get("friendlyName"),
+            "machineIdentifier": root.get("machineIdentifier"),
+            "platform": root.get("platform"),
+            "version": root.get("version"),
+            "updatedAt": root.get("updatedAt"),
+        }
+
+    return API_CACHE.get_or_load(f"server:{id(PLEX)}", 30.0, load)
+
+
+def cached_libraries() -> List[Dict[str, Any]]:
+    def load() -> List[Dict[str, Any]]:
+        root = PLEX.xml("/library/sections")
+        return [library_from_xml(child) for child in root.findall("Directory")]
+
+    return API_CACHE.get_or_load(f"libraries:{id(PLEX)}", 15.0, load)
+
+
+def image_url(
+    path: Optional[str],
+    width: int = POSTER_WIDTH,
+    height: int = POSTER_HEIGHT,
+    quality: int = 88,
+) -> Optional[str]:
     if not path:
         return None
-    return "/api/image?" + urllib.parse.urlencode({"path": path})
+    plex_path, params = plex_image_request(path)
+    if not plex_path:
+        return None
+    params.setdefault("width", str(width))
+    params.setdefault("height", str(height))
+    params.setdefault("minSize", "1")
+    params.setdefault("upscale", "0")
+    params.setdefault("quality", str(quality))
+    resized_path = plex_path
+    if params:
+        resized_path += "?" + urllib.parse.urlencode(params)
+    return "/api/image?" + urllib.parse.urlencode({"path": resized_path})
 
 
 LANGUAGE_CODES = {
@@ -762,13 +885,14 @@ def saved_playback_status(
     with SAVE_JOBS_LOCK:
         job = dict(SAVE_JOBS.get(playback_id) or {})
     if final_path.is_file():
+        stat = final_path.stat()
         return {
             "id": playback_id,
             "state": "ready",
             "ready": True,
             "streamUrl": saved_playback_stream_url(playback_id),
-            "bytes": final_path.stat().st_size,
-            "updatedAt": int(final_path.stat().st_mtime),
+            "bytes": stat.st_size,
+            "updatedAt": int(stat.st_mtime),
             "media": media or {},
         }
     if job:
@@ -993,11 +1117,16 @@ def external_ids_from_xml(elem: ET.Element) -> Tuple[List[Dict[str, str]], Dict[
     return guids, ids
 
 
-def item_from_xml(elem: ET.Element) -> Dict[str, Any]:
+def item_from_xml(
+    elem: ET.Element,
+    *,
+    include_saved_playback: bool = True,
+    include_guids: bool = True,
+) -> Dict[str, Any]:
     part_key, media, subtitles = first_part(elem)
     title = elem.get("title") or elem.get("parentTitle") or elem.get("grandparentTitle") or "Untitled"
     item_type = elem.get("type") or elem.tag.lower()
-    guids, external_ids = external_ids_from_xml(elem)
+    guids, external_ids = external_ids_from_xml(elem) if include_guids else ([], {})
     item = {
         "ratingKey": elem.get("ratingKey"),
         "key": elem.get("key"),
@@ -1041,13 +1170,15 @@ def item_from_xml(elem: ET.Element) -> Dict[str, Any]:
         "thumb": elem.get("thumb"),
         "art": elem.get("art"),
         "posterUrl": image_url(elem.get("thumb")),
-        "artUrl": image_url(elem.get("art")),
+        "artUrl": image_url(elem.get("art"), ART_WIDTH, ART_HEIGHT, 86),
         "partKey": part_key,
         "streamUrl": part_stream_url(part_key),
         "compatibleStreamUrl": compatible_stream_url(part_key),
         "downloadOriginalUrl": original_download_url(elem.get("ratingKey")) if part_key else None,
         "playback": playback_info(part_key, media),
-        "savedPlayback": saved_playback_status(elem.get("ratingKey"), part_key, media),
+        "savedPlayback": saved_playback_status(elem.get("ratingKey"), part_key, media)
+        if include_saved_playback
+        else {"state": "unknown", "ready": False},
         "subtitles": subtitles,
         "media": media,
         "guids": guids,
@@ -1626,7 +1757,11 @@ def extract_embedded_subtitle(media_path: Path, stream_index: int) -> bytes:
     return process.stdout
 
 
-def items_from_container(root: ET.Element, recursive: bool = False) -> List[Dict[str, Any]]:
+def items_from_container(
+    root: ET.Element,
+    recursive: bool = False,
+    detailed: bool = False,
+) -> List[Dict[str, Any]]:
     nodes: Iterable[ET.Element]
     if recursive:
         nodes = root.iter()
@@ -1641,7 +1776,13 @@ def items_from_container(root: ET.Element, recursive: bool = False) -> List[Dict
         if not rating_key or rating_key in seen:
             continue
         seen.add(rating_key)
-        items.append(item_from_xml(elem))
+        items.append(
+            item_from_xml(
+                elem,
+                include_saved_playback=detailed,
+                include_guids=detailed,
+            )
+        )
     return items
 
 
@@ -1806,9 +1947,18 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def send_json(self, payload: Any, status: int = 200, headers: Optional[Dict[str, str]] = None) -> None:
         body = json_bytes(payload)
+        compressed = False
+        accept_encoding = self.headers.get("Accept-Encoding", "") if hasattr(self, "headers") else ""
+        if len(body) >= JSON_COMPRESSION_MIN_BYTES and "gzip" in accept_encoding.lower():
+            body = gzip.compress(body, compresslevel=4)
+            compressed = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
         self.send_header("Content-Length", str(len(body)))
         for key, value in (headers or {}).items():
             self.send_header(key, value)
@@ -1830,16 +1980,29 @@ class AppHandler(BaseHTTPRequestHandler):
         target = safe_static_path(path)
         if target is None:
             target = STATIC_DIR / "index.html"
-        body = target.read_bytes()
+        stamp = target.stat().st_mtime_ns
+        with STATIC_CACHE_LOCK:
+            cached = STATIC_CACHE.get(target)
+            if cached and cached[0] == stamp:
+                body = cached[1]
+            else:
+                body = target.read_bytes()
+                STATIC_CACHE[target] = (stamp, body)
         if target.name == "index.html":
             body = body.replace(b"__APP_VERSION__", APP_VERSION.encode("utf-8"))
         mime, _ = mimetypes.guess_type(str(target))
         self.send_response(200)
         self.send_header("Content-Type", mime or "application/octet-stream")
         cache_control = "public, max-age=3600"
-        if target.name == "index.html" or target.suffix in {".css", ".js"}:
+        version = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("v", [""])[0]
+        if target.name == "index.html":
             cache_control = "no-cache"
+        elif target.suffix in {".css", ".js"}:
+            cache_control = (
+                "public, max-age=31536000, immutable" if version == APP_VERSION else "no-cache"
+            )
         self.send_header("Cache-Control", cache_control)
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if method != "HEAD":
@@ -1908,6 +2071,8 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_json({"authenticated": False}, headers={"Set-Cookie": cookie.output(header="").strip()})
 
     def handle_api(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
+        if method == "POST":
+            API_CACHE.clear()
         if path == "/api/my-list":
             self.api_my_list(method, query)
             return
@@ -1937,6 +2102,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/server":
             self.api_server()
+        elif path == "/api/bootstrap":
+            self.api_bootstrap()
         elif path == "/api/libraries":
             self.api_libraries()
         elif path == "/api/random-item":
@@ -1977,34 +2144,37 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "not_found"}, status=404)
 
     def api_server(self) -> None:
-        root = PLEX.xml("/")
+        self.send_json(cached_server_info())
+
+    def api_bootstrap(self) -> None:
         self.send_json(
             {
-                "friendlyName": root.get("friendlyName"),
-                "machineIdentifier": root.get("machineIdentifier"),
-                "platform": root.get("platform"),
-                "version": root.get("version"),
-                "updatedAt": root.get("updatedAt"),
+                "server": cached_server_info(),
+                "libraries": cached_libraries(),
+                "ratingKeys": my_list_keys(),
+                "version": APP_VERSION,
             }
         )
 
     def api_libraries(self) -> None:
-        root = PLEX.xml("/library/sections")
-        sections = [library_from_xml(child) for child in root.findall("Directory")]
-        self.send_json({"libraries": sections})
+        self.send_json({"libraries": cached_libraries()})
 
     def api_library_genres(self, path: str) -> None:
         section_key = path[len("/api/library/") : -len("/genres")].strip("/")
         if not re.fullmatch(r"\d+", section_key):
             self.send_json({"error": "invalid_section"}, status=400)
             return
-        root = PLEX.xml(f"/library/sections/{urllib.parse.quote(section_key)}/genre")
-        genres = [
-            {"key": item.get("key"), "title": item.get("title")}
-            for item in root.findall("Directory")
-            if item.get("key") and item.get("title")
-        ]
-        genres.sort(key=lambda item: item["title"].casefold())
+        def load() -> List[Dict[str, Any]]:
+            root = PLEX.xml(f"/library/sections/{urllib.parse.quote(section_key)}/genre")
+            genres = [
+                {"key": item.get("key"), "title": item.get("title")}
+                for item in root.findall("Directory")
+                if item.get("key") and item.get("title")
+            ]
+            genres.sort(key=lambda item: item["title"].casefold())
+            return genres
+
+        genres = API_CACHE.get_or_load(f"genres:{id(PLEX)}:{section_key}", 300.0, load)
         self.send_json({"library": section_key, "genres": genres})
 
     def api_random_item(self, query: Dict[str, List[str]]) -> None:
@@ -2032,7 +2202,6 @@ class AppHandler(BaseHTTPRequestHandler):
 
         endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/all"
         params: Dict[str, Any] = {
-            "includeGuids": "1",
             "includeCollections": "1",
             "X-Plex-Container-Start": 0,
             "X-Plex-Container-Size": 1,
@@ -2474,12 +2643,16 @@ class AppHandler(BaseHTTPRequestHandler):
             params["genre"] = active_genre
         if sort and view not in {"continue", "collections"}:
             params["sort"] = sort
-        root = PLEX.xml(endpoint, params=params)
-        items = items_from_container(root)
-        if view == "continue":
-            items = [item for item in items if not item.get("viewCount")]
-        self.send_json(
-            {
+        cache_key = ":".join(
+            ["library", str(id(PLEX)), section_key, view, sort, active_genre, str(start), str(limit)]
+        )
+
+        def load() -> Dict[str, Any]:
+            root = PLEX.xml(endpoint, params=params)
+            items = items_from_container(root)
+            if view == "continue":
+                items = [item for item in items if not item.get("viewCount")]
+            return {
                 "library": section_key,
                 "view": view,
                 "genre": active_genre or None,
@@ -2489,24 +2662,28 @@ class AppHandler(BaseHTTPRequestHandler):
                 "totalSize": len(items) if view == "continue" else to_int(root.get("totalSize")),
                 "items": items,
             }
-        )
+
+        self.send_json(API_CACHE.get_or_load(cache_key, 1.0, load))
 
     def api_metadata(self, rating_key: str) -> None:
         root = PLEX.xml(
             f"/library/metadata/{urllib.parse.quote(rating_key)}",
             params={"includeGuids": "1", "includeCollections": "1"},
         )
-        items = items_from_container(root)
+        items = items_from_container(root, detailed=True)
         self.send_json({"item": items[0] if items else None})
 
     def api_children(self, rating_key: str) -> None:
-        root = PLEX.xml(f"/library/metadata/{urllib.parse.quote(rating_key)}/children")
-        self.send_json(
-            {
+        def load() -> Dict[str, Any]:
+            root = PLEX.xml(f"/library/metadata/{urllib.parse.quote(rating_key)}/children")
+            return {
                 "parentTitle": root.get("parentTitle") or root.get("grandparentTitle"),
                 "parentRatingKey": root.get("parentRatingKey"),
                 "items": items_from_container(root),
             }
+
+        self.send_json(
+            API_CACHE.get_or_load(f"children:{id(PLEX)}:{rating_key}", 2.0, load)
         )
 
     def api_episode_neighbors(self, query: Dict[str, List[str]]) -> None:
@@ -2537,9 +2714,13 @@ class AppHandler(BaseHTTPRequestHandler):
         if len(search_query) < 2:
             self.send_json({"items": []})
             return
-        root = PLEX.xml("/search", params={"query": search_query, "includeCollections": "1"})
-        items = items_from_container(root, recursive=True)
-        self.send_json({"query": search_query, "items": items[:150]})
+        def load() -> Dict[str, Any]:
+            root = PLEX.xml("/search", params={"query": search_query, "includeCollections": "1"})
+            items = items_from_container(root, recursive=True)
+            return {"query": search_query, "items": items[:150]}
+
+        key = f"search:{id(PLEX)}:{search_query.casefold()}"
+        self.send_json(API_CACHE.get_or_load(key, 1.0, load))
 
     def handle_image(self, method: str, query: Dict[str, List[str]]) -> None:
         if method not in {"GET", "HEAD"}:
@@ -2547,20 +2728,30 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         self.require_auth()
         raw_path = one(query, "path", "")
-        plex_path, image_params = plex_image_request(raw_path)
+        plex_path, image_params = plex_image_upstream_request(raw_path)
         if not plex_path:
             self.send_json({"error": "bad_image_path"}, status=400)
             return
-        with PLEX.open(plex_path, params=image_params, timeout=Settings.request_timeout) as response:
-            data = b"" if method == "HEAD" else response.read()
+        with PLEX.open(
+            plex_path,
+            params=image_params,
+            timeout=Settings.request_timeout,
+            method=method,
+        ) as response:
             self.send_response(response.status)
             self.send_header("Content-Type", response.headers.get("Content-Type", "image/jpeg"))
-            self.send_header("Cache-Control", "private, max-age=3600")
-            self.send_header("Content-Length", response.headers.get("Content-Length", str(len(data))))
+            self.send_header("Cache-Control", "private, max-age=2592000, immutable")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                self.send_header("Content-Length", content_length)
+            else:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             if method != "HEAD":
                 try:
-                    self.wfile.write(data)
+                    copy_stream(response, self.wfile, 128 * 1024)
                 except (BrokenPipeError, ConnectionResetError):
                     return
 
@@ -3069,6 +3260,13 @@ class AuthError(Exception):
     pass
 
 
+class ResponsiveThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 128
+    allow_reuse_address = True
+
+
 def one(query: Dict[str, List[str]], key: str, default: str = "") -> str:
     values = query.get(key)
     if not values:
@@ -3083,7 +3281,7 @@ def main() -> None:
         print("Warning: APP_PASSWORD is not set. Login will fail until configured.", file=sys.stderr)
     if not Settings.plex_token:
         print("Warning: PLEX_TOKEN is not set and Preferences.xml was not readable.", file=sys.stderr)
-    httpd = ThreadingHTTPServer((Settings.host, Settings.port), AppHandler)
+    httpd = ResponsiveThreadingHTTPServer((Settings.host, Settings.port), AppHandler)
     print(f"Plex Open Web listening on http://{Settings.host}:{Settings.port}", flush=True)
     httpd.serve_forever()
 

@@ -25,11 +25,42 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Original media download as a ZIP containing the untouched video file and available subtitles.
 - FFmpeg fallback that copies browser-compatible video and converts unsupported audio, such as AC3, to AAC.
 - Poster/artwork proxy so the browser only needs this app URL.
+- Compressed API responses, right-sized artwork, and coalesced Plex reads for fast browsing over a tailnet.
+- Cancellable library/search requests, stable loading placeholders, and incremental card rendering for responsive interaction.
 - No runtime dependencies beyond Python 3 standard library.
 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.13.0
+
+**Added**
+
+- Added a single authenticated bootstrap request that returns server identity, libraries, My List keys, and app version together.
+- Added layout-stable library placeholders and an immediate Preparing state when playback is selected.
+- Added bounded, mutation-aware request coalescing for repeated library, genre, search, children, server, and library-list reads.
+- Added regression coverage for concurrent request coalescing, compressed JSON, right-sized Plex artwork, lightweight browse records, and bootstrap output.
+
+**Improved**
+
+- Large API responses now use gzip when supported. In the release benchmark, a 60-item library page fell from 199,134 bytes to 29,528 bytes over the wire.
+- Posters now use Plex's photo transcoder at 480 by 720 pixels with long-lived immutable client caching. The measured first poster fell from 1,838,960 bytes to 131,204 bytes.
+- Warm 60-item library responses fell from a 79.6 ms median to 3.1 ms, while an eight-client burst fell from 1,112 ms to 260 ms.
+- Browse records skip saved-file filesystem checks and external-ID parsing until full metadata is requested.
+- Versioned JavaScript and CSS use immutable caching, while server-side static bytes are retained in memory.
+- Library paging appends only new cards, uses one delegated grid listener, defers off-screen rendering, and prioritizes first-viewport poster decoding.
+- Playback metadata and browser-device availability are prepared concurrently, and subtitle search opens without an unnecessary metadata round trip.
+- The HTTP server uses a larger connection queue and daemon request workers for cleaner recovery under bursts and shutdowns.
+
+**Fixed**
+
+- Slower obsolete library and search responses can no longer overwrite a newer library, filter, sort, view, or query selection.
+- Refresh failures preserve the last usable grid instead of replacing it with a blank screen.
+- Closing the player invalidates unfinished playback preparation, preventing a late response from reopening or changing closed playback state.
+- Missing streams now leave a clear No playable source state instead of an apparently unresponsive player.
+- Plex thumbnail resize parameters are now sent through the actual photo-transcode endpoint instead of being ignored by direct thumbnail URLs.
+- Repeated saved-playback status reads now reuse one filesystem stat result.
 
 ### 0.12.0
 

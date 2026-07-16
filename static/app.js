@@ -15,6 +15,10 @@ const state = {
   libraryStart: 0,
   libraryTotal: 0,
   libraryLoadingMore: false,
+  libraryRequestId: 0,
+  libraryAbortController: null,
+  searchRequestId: 0,
+  searchAbortController: null,
   scanInProgress: false,
   surpriseInProgress: false,
   watchStateRatingKey: null,
@@ -25,6 +29,7 @@ const state = {
   collectionCreating: false,
   collectionRenameTarget: null,
   playerItem: null,
+  playerPreparationId: 0,
   playerNeighbors: null,
   autoplayNext: true,
   autoplayTimer: null,
@@ -341,9 +346,10 @@ function subtitleSearchTitle(item) {
   return [title, item.year || item.originallyAvailableAt?.slice(0, 4)].filter(Boolean).join(" ");
 }
 
-function posterMarkup(item) {
+function posterMarkup(item, index = Number.MAX_SAFE_INTEGER) {
   if (item.posterUrl) {
-    return `<img loading="lazy" src="${escapeAttr(item.posterUrl)}" alt="">`;
+    const firstViewport = index < 6;
+    return `<img loading="${firstViewport ? "eager" : "lazy"}" decoding="async" fetchpriority="${firstViewport ? "high" : "low"}" src="${escapeAttr(item.posterUrl)}" alt="">`;
   }
   const letter = (item.title || "?").trim().slice(0, 1).toUpperCase();
   return `<div class="poster-fallback">${escapeHtml(letter)}</div>`;
@@ -407,12 +413,59 @@ function renderBreadcrumbs() {
   });
 }
 
-function renderItems(items) {
+function createMediaCard(item, index) {
+  const inMyList = Boolean(item.ratingKey && state.myListKeys.has(String(item.ratingKey)));
+  const card = document.createElement("article");
+  card.className = "media-card";
+  card.dataset.itemIndex = String(index);
+  card.innerHTML = `
+    <button class="poster-button" data-action="open">
+      ${posterMarkup(item, index)}
+      ${item.type === "collection" ? '<span class="collection-badge">Collection</span>' : ""}
+      ${item.viewCount ? '<span class="watched">Watched</span>' : ""}
+      ${inMyList ? '<span class="my-list-badge">My List</span>' : ""}
+      ${supportedSubtitles(item).length ? `<span class="subtitle-badge${inMyList ? " stacked" : ""}">CC</span>` : ""}
+      ${progressMarkup(item)}
+    </button>
+    <div class="card-body">
+      <h3>${escapeHtml(item.title)}</h3>
+      <p>${escapeHtml(labelFor(item))}</p>
+      <div class="card-actions">
+        ${item.streamUrl ? '<button data-action="play" class="mini-primary">Play</button>' : ""}
+        ${item.type === "collection"
+          ? '<button data-action="open" class="mini-secondary">Open</button>'
+          : '<button data-action="details" class="mini-secondary">Details</button>'}
+      </div>
+    </div>
+  `;
+  return card;
+}
+
+function renderLoadingGrid() {
+  el.grid.classList.remove("is-refreshing");
+  el.grid.setAttribute("aria-busy", "true");
+  el.grid.innerHTML = Array.from({ length: 12 }, () => `
+    <article class="media-card skeleton-card" aria-hidden="true">
+      <div class="poster-button skeleton-block"></div>
+      <div class="card-body">
+        <div class="skeleton-line skeleton-title"></div>
+        <div class="skeleton-line skeleton-meta"></div>
+      </div>
+    </article>
+  `).join("");
+}
+
+function renderItems(items, { append = false } = {}) {
+  const previousLength = append ? state.currentItems.length : 0;
   state.currentItems = items;
   renderBreadcrumbs();
   const current = state.stack.at(-1);
   el.viewTitle.textContent = current?.title || state.selectedLibrary?.title || "Library";
-  el.grid.innerHTML = "";
+  el.grid.classList.remove("is-refreshing");
+  el.grid.setAttribute("aria-busy", "false");
+  if (!append) {
+    el.grid.innerHTML = "";
+  }
   if (!items.length) {
     const emptyContinueView = state.stack.length === 0 && state.selectedView === "continue";
     const emptyCollectionsView = state.stack.length === 0 && state.selectedView === "collections";
@@ -432,48 +485,8 @@ function renderItems(items) {
   }
   setStatus(statusTextForItems(items.length), "muted");
   const fragment = document.createDocumentFragment();
-  for (const item of items) {
-    const inMyList = Boolean(item.ratingKey && state.myListKeys.has(String(item.ratingKey)));
-    const card = document.createElement("article");
-    card.className = "media-card";
-    card.innerHTML = `
-      <button class="poster-button" data-action="open">
-        ${posterMarkup(item)}
-        ${item.type === "collection" ? '<span class="collection-badge">Collection</span>' : ""}
-        ${item.viewCount ? '<span class="watched">Watched</span>' : ""}
-        ${inMyList ? '<span class="my-list-badge">My List</span>' : ""}
-        ${supportedSubtitles(item).length ? `<span class="subtitle-badge${inMyList ? " stacked" : ""}">CC</span>` : ""}
-        ${progressMarkup(item)}
-      </button>
-      <div class="card-body">
-        <h3>${escapeHtml(item.title)}</h3>
-        <p>${escapeHtml(labelFor(item))}</p>
-        <div class="card-actions">
-          ${item.streamUrl ? '<button data-action="play" class="mini-primary">Play</button>' : ""}
-          ${item.type === "collection"
-            ? '<button data-action="open" class="mini-secondary">Open</button>'
-            : '<button data-action="details" class="mini-secondary">Details</button>'}
-        </div>
-      </div>
-    `;
-    card.addEventListener("click", (event) => {
-      const action = event.target.closest("button")?.dataset.action;
-      if (action === "play") {
-        event.stopPropagation();
-        playItem(item);
-      } else if (action === "details") {
-        event.stopPropagation();
-        openDetails(item);
-      } else if (action === "open") {
-        event.stopPropagation();
-        if (itemCanOpen(item)) {
-          openChildren(item);
-        } else {
-          openDetails(item);
-        }
-      }
-    });
-    fragment.append(card);
+  for (let index = previousLength; index < items.length; index += 1) {
+    fragment.append(createMediaCard(items[index], index));
   }
   el.grid.append(fragment);
   updateLoadMore();
@@ -508,19 +521,12 @@ function updateLoadMore() {
   }
 }
 
-async function loadServerInfo() {
-  try {
-    const data = await api("/api/server");
-    el.serverName.textContent = data.friendlyName || "Plex server";
-  } catch {
-    el.serverName.textContent = "Plex server";
-  }
-}
-
 async function loadLibraries() {
   setStatus("Loading libraries...");
-  await loadMyListKeys();
-  const data = await api("/api/libraries");
+  const data = await api("/api/bootstrap");
+  el.serverName.textContent = data.server?.friendlyName || "Plex server";
+  showVersion(data.version);
+  state.myListKeys = new Set((data.ratingKeys || []).map(String));
   state.libraries = data.libraries || [];
   state.selectedLibrary = state.libraries.find((library) => library.key === state.preferredLibraryKey)
     || state.libraries[0]
@@ -535,15 +541,6 @@ async function loadLibraries() {
     await loadLibrary();
   } else {
     renderItems([]);
-  }
-}
-
-async function loadMyListKeys() {
-  try {
-    const data = await api("/api/my-list?keysOnly=1");
-    state.myListKeys = new Set((data.ratingKeys || []).map(String));
-  } catch {
-    // Browsing remains available if My List state cannot be loaded temporarily.
   }
 }
 
@@ -595,9 +592,20 @@ function resetLibraryPaging() {
 
 async function loadLibrary({ append = false } = {}) {
   if (!state.selectedLibrary) return false;
+  if (append && state.libraryLoadingMore) return false;
+  state.libraryAbortController?.abort();
+  const controller = new AbortController();
+  state.libraryAbortController = controller;
+  const requestId = ++state.libraryRequestId;
   if (!append) {
     resetLibraryPaging();
     setStatus("Loading media...");
+    if (state.currentItems.length) {
+      el.grid.classList.add("is-refreshing");
+      el.grid.setAttribute("aria-busy", "true");
+    } else {
+      renderLoadingGrid();
+    }
   } else {
     state.libraryLoadingMore = true;
     updateLoadMore();
@@ -612,26 +620,33 @@ async function loadLibrary({ append = false } = {}) {
     limit: String(state.pageSize),
   });
   try {
-    const data = await api(`/api/library/${encodeURIComponent(state.selectedLibrary.key)}?${params}`);
+    const data = await api(`/api/library/${encodeURIComponent(state.selectedLibrary.key)}?${params}`, {
+      signal: controller.signal,
+    });
+    if (requestId !== state.libraryRequestId) return false;
     if (state.selectedView === "mylist" && data.ratingKeys) {
       state.myListKeys = new Set(data.ratingKeys.map(String));
     }
     state.libraryStart = start;
     state.libraryTotal = data.totalSize || data.size || 0;
     const incoming = data.items || [];
-    renderItems(append ? [...state.currentItems, ...incoming] : incoming);
+    renderItems(append ? [...state.currentItems, ...incoming] : incoming, { append });
     return true;
   } catch (error) {
-    if (!append) {
-      state.currentItems = [];
-      state.libraryTotal = 0;
-      el.grid.innerHTML = "";
-    }
+    if (error.name === "AbortError" || requestId !== state.libraryRequestId) return false;
+    el.grid.classList.remove("is-refreshing");
+    el.grid.setAttribute("aria-busy", "false");
+    if (!state.currentItems.length) el.grid.innerHTML = "";
     setStatus(`Could not load media: ${error.message}`, "error");
     return false;
   } finally {
-    state.libraryLoadingMore = false;
-    updateLoadMore();
+    if (requestId === state.libraryRequestId) {
+      state.libraryLoadingMore = false;
+      state.libraryAbortController = null;
+      el.grid.classList.remove("is-refreshing");
+      el.grid.setAttribute("aria-busy", "false");
+      updateLoadMore();
+    }
   }
 }
 
@@ -2053,18 +2068,34 @@ function scheduleAutoplayNext() {
 
 async function playItem(item) {
   cancelAutoplayCountdown();
-  item = await hydrateItem(item);
-  try {
-    await refreshSavedPlayback(item);
-  } catch {
-    item.savedPlayback = item.savedPlayback || { state: "unavailable", ready: false };
+  const preparationId = ++state.playerPreparationId;
+  state.playerItem = item;
+  el.playerTitle.textContent = displayTitle(item);
+  el.playbackMode.textContent = "Preparing...";
+  el.playbackMode.title = "Checking the best available playback source.";
+  el.playbackMode.hidden = false;
+  if (!el.playerDialog.open) {
+    el.playerDialog.showModal();
   }
-  try {
-    await pruneDeviceCache();
-    await refreshDevicePlayback(item);
-  } catch {
+  const results = await Promise.allSettled([
+    hydrateItem(item),
+    (async () => {
+      await pruneDeviceCache();
+      await refreshDevicePlayback(item);
+    })(),
+  ]);
+  if (preparationId !== state.playerPreparationId || !el.playerDialog.open) return;
+  if (results[1].status === "rejected") {
     item.devicePlayback = { state: "unsupported", ready: false, supported: false };
   }
+  if (!item.savedPlayback || item.savedPlayback.state === "unknown") {
+    try {
+      await refreshSavedPlayback(item);
+    } catch {
+      item.savedPlayback = item.savedPlayback || { state: "unavailable", ready: false };
+    }
+  }
+  if (preparationId !== state.playerPreparationId || !el.playerDialog.open) return;
   state.playerItem = item;
   state.playerNeighbors = null;
   state.lastProgressReportAt = 0;
@@ -2082,7 +2113,12 @@ async function playItem(item) {
   } else {
     revokeDeviceObjectUrls();
     const streamUrl = streamUrlFor(item);
-    if (!streamUrl) return;
+    if (!streamUrl) {
+      el.playbackMode.textContent = "No playable source";
+      el.playbackMode.title = "Plex did not return a stream for this item.";
+      setStatus(`Could not play ${displayTitle(item)}: no playable source.`, "error");
+      return;
+    }
     state.usingDevicePlayback = false;
     state.usingSavedPlayback = isSavedPlaybackUrl(item, streamUrl);
     setPlaybackMode(item, state.usingSavedPlayback ? "saved" : "live");
@@ -2098,9 +2134,6 @@ async function playItem(item) {
   }
   updatePlayerEpisodeControls(item);
   loadPlayerEpisodeNeighbors(item);
-  if (!el.playerDialog.open) {
-    el.playerDialog.showModal();
-  }
 }
 
 function setSubtitleStatus(message = "", kind = "") {
@@ -2169,7 +2202,6 @@ async function searchSubtitles() {
 }
 
 async function openSubtitleDialog(item) {
-  item = await hydrateItem(item);
   state.subtitleItem = item;
   state.subtitleResults = [];
   el.subtitleQuery.value = subtitleSearchTitle(item);
@@ -2214,6 +2246,8 @@ async function downloadSubtitle(result, button) {
 }
 
 async function search(query) {
+  state.searchAbortController?.abort();
+  state.searchRequestId += 1;
   if (query.trim().length < 2) {
     await loadLibrary();
     return;
@@ -2222,7 +2256,11 @@ async function search(query) {
   state.libraryTotal = 0;
   updateLoadMore();
   setStatus("Searching...");
-  const data = await api(`/api/search?${new URLSearchParams({ query })}`);
+  const controller = new AbortController();
+  state.searchAbortController = controller;
+  const requestId = state.searchRequestId;
+  const data = await api(`/api/search?${new URLSearchParams({ query })}`, { signal: controller.signal });
+  if (requestId !== state.searchRequestId) return;
   state.stack = [{ title: `Search: ${query}`, items: data.items || [] }];
   renderItems(data.items || []);
 }
@@ -2248,7 +2286,6 @@ async function boot() {
     return;
   }
   showApp();
-  await loadServerInfo();
   await loadLibraries();
 }
 
@@ -2261,7 +2298,6 @@ el.loginForm.addEventListener("submit", async (event) => {
       body: JSON.stringify({ password: el.password.value.trim() }),
     });
     showApp();
-    await loadServerInfo();
     await loadLibraries();
   } catch (error) {
     el.loginError.textContent = error.message === "invalid_password" ? "Invalid password." : error.message;
@@ -2278,7 +2314,31 @@ el.appTheme.addEventListener("change", () => applyTheme(el.appTheme.value));
 
 el.searchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  await search(el.searchInput.value);
+  try {
+    await search(el.searchInput.value);
+  } catch (error) {
+    if (error.name !== "AbortError") setStatus(`Could not search: ${error.message}`, "error");
+  }
+});
+
+el.grid.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-action]");
+  const card = event.target.closest(".media-card[data-item-index]");
+  if (!button || !card) return;
+  const item = state.currentItems[Number(card.dataset.itemIndex)];
+  if (!item) return;
+  const action = button.dataset.action;
+  if (action === "play") {
+    playItem(item);
+  } else if (action === "details") {
+    openDetails(item);
+  } else if (action === "open") {
+    if (itemCanOpen(item)) {
+      openChildren(item);
+    } else {
+      openDetails(item);
+    }
+  }
 });
 
 el.loadMore.addEventListener("click", async () => {
@@ -2376,6 +2436,7 @@ el.playerNextEpisode.addEventListener("click", () => {
 el.playerUpNextCancel.addEventListener("click", cancelAutoplayCountdown);
 el.playerClose.addEventListener("click", () => el.playerDialog.close());
 el.playerDialog.addEventListener("close", async () => {
+  state.playerPreparationId += 1;
   const hadPlayer = Boolean(state.playerItem);
   const reloadFilteredView = state.stack.length === 0 && ["continue", "unwatched"].includes(state.selectedView);
   const progressReport = reportPlaybackProgress("stopped", { force: true, keepalive: true });

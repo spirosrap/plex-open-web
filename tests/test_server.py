@@ -1,5 +1,11 @@
+import gzip
+import io
+import json
+import threading
+import time
 import unittest
 import tempfile
+import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
@@ -179,11 +185,100 @@ class FakeCollectionPlex(FakePlex):
 
 
 def handler_with_payload(payload):
+    server.API_CACHE.clear()
     handler = object.__new__(server.AppHandler)
     responses = []
     handler.read_json = lambda: payload
     handler.send_json = lambda body, status=200, headers=None: responses.append((status, body))
     return handler, responses
+
+
+class PerformancePathTests(unittest.TestCase):
+    def setUp(self):
+        server.API_CACHE.clear()
+
+    def test_image_urls_request_right_sized_cacheable_artwork(self):
+        url = server.image_url("/library/metadata/42/thumb/123")
+        raw_path = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["path"][0]
+        path, params = server.plex_image_request(raw_path)
+
+        self.assertEqual("/library/metadata/42/thumb/123", path)
+        self.assertEqual(str(server.POSTER_WIDTH), params["width"])
+        self.assertEqual(str(server.POSTER_HEIGHT), params["height"])
+        self.assertEqual("0", params["upscale"])
+        upstream_path, upstream_params = server.plex_image_upstream_request(raw_path)
+        self.assertEqual("/photo/:/transcode", upstream_path)
+        self.assertEqual("/library/metadata/42/thumb/123", upstream_params["url"])
+
+    def test_browse_items_skip_expensive_saved_status_and_guid_work(self):
+        root = ET.fromstring(
+            '<MediaContainer><Video ratingKey="42" type="movie" title="Fast">'
+            '<Guid id="imdb://tt123" />'
+            '<Media><Part key="/library/parts/42/file.mp4" /></Media>'
+            '</Video></MediaContainer>'
+        )
+        with mock.patch.object(server, "saved_playback_status") as saved_status:
+            item = server.items_from_container(root)[0]
+
+        saved_status.assert_not_called()
+        self.assertEqual({"state": "unknown", "ready": False}, item["savedPlayback"])
+        self.assertEqual([], item["guids"])
+
+    def test_result_cache_coalesces_concurrent_identical_loads(self):
+        cache = server.TimedResultCache()
+        barrier = threading.Barrier(6)
+        lock = threading.Lock()
+        calls = 0
+        results = []
+
+        def loader():
+            nonlocal calls
+            with lock:
+                calls += 1
+            time.sleep(0.04)
+            return {"ok": True}
+
+        def worker():
+            barrier.wait()
+            results.append(cache.get_or_load("same", 1.0, loader))
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(2)
+
+        self.assertEqual(1, calls)
+        self.assertEqual([{"ok": True}] * 6, results)
+
+    def test_large_json_responses_are_gzipped_when_supported(self):
+        handler = object.__new__(server.AppHandler)
+        handler.headers = {"Accept-Encoding": "gzip, deflate"}
+        handler.command = "GET"
+        handler.wfile = io.BytesIO()
+        response_headers = {}
+        handler.send_response = lambda status: None
+        handler.send_header = lambda key, value: response_headers.__setitem__(key, value)
+        handler.end_headers = lambda: None
+
+        handler.send_json({"items": ["x" * 3000]})
+
+        self.assertEqual("gzip", response_headers["Content-Encoding"])
+        self.assertEqual({"items": ["x" * 3000]}, json.loads(gzip.decompress(handler.wfile.getvalue())))
+
+    def test_bootstrap_combines_server_libraries_and_my_list(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(
+            server, "my_list_keys", return_value=["101"]
+        ):
+            handler.api_bootstrap()
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("0.13.0", responses[0][1]["version"])
+        self.assertEqual(["101"], responses[0][1]["ratingKeys"])
+        self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
+        self.assertEqual(["/", "/library/sections"], [call[0] for call in plex.xml_calls])
 
 
 class LibraryViewTests(unittest.TestCase):
