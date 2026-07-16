@@ -5,6 +5,8 @@ const state = {
   genres: [],
   genreKeysByLibrary: {},
   genresLoading: false,
+  myListKeys: new Set(),
+  myListUpdatingKey: null,
   selectedView: "all",
   sort: "addedAt:desc",
   stack: [],
@@ -36,7 +38,7 @@ const LOCAL_PROGRESS_KEY = "plex-open-web-progress-v1";
 const THEME_KEY = "plex-open-web-theme-v1";
 const BROWSE_KEY = "plex-open-web-browse-v1";
 const THEME_VALUES = new Set(["system", "light", "dark"]);
-const VIEW_VALUES = new Set(["continue", "recent", "all", "unwatched", "collections"]);
+const VIEW_VALUES = new Set(["continue", "recent", "all", "unwatched", "collections", "mylist"]);
 const SORT_VALUES = new Set(["addedAt:desc", "titleSort", "year:desc", "lastViewedAt:desc"]);
 const PROGRESS_REPORT_INTERVAL_MS = 15000;
 
@@ -81,6 +83,7 @@ const el = {
   detailsOpen: document.querySelector("#details-open"),
   detailsSubtitles: document.querySelector("#details-subtitles"),
   detailsWatchState: document.querySelector("#details-watch-state"),
+  detailsMyList: document.querySelector("#details-my-list"),
   detailsClose: document.querySelector("#details-close"),
   playerDialog: document.querySelector("#player-dialog"),
   playerTitle: document.querySelector("#player-title"),
@@ -196,7 +199,7 @@ function selectedGenreKey() {
 
 function activeGenreKey() {
   const selected = selectedGenreKey();
-  return state.selectedView === "collections" || !state.genres.some((genre) => genre.key === selected)
+  return ["collections", "mylist"].includes(state.selectedView) || !state.genres.some((genre) => genre.key === selected)
     ? ""
     : selected;
 }
@@ -211,13 +214,13 @@ function renderGenreFilter() {
   el.genreFilter.disabled = !state.selectedLibrary
     || state.genresLoading
     || !state.genres.length
-    || state.selectedView === "collections";
+    || ["collections", "mylist"].includes(state.selectedView);
 }
 
 function syncBrowseControls() {
   el.viewButtons.forEach((button) => button.classList.toggle("active", button.dataset.view === state.selectedView));
   el.sort.value = state.sort;
-  el.sort.disabled = ["continue", "collections"].includes(state.selectedView);
+  el.sort.disabled = ["continue", "collections", "mylist"].includes(state.selectedView);
   renderGenreFilter();
 }
 
@@ -315,7 +318,7 @@ function updateScanButton() {
 
 function updateSurpriseButton() {
   if (!el.surpriseMe) return;
-  el.surpriseMe.disabled = !state.selectedLibrary || state.surpriseInProgress;
+  el.surpriseMe.disabled = !state.selectedLibrary || state.surpriseInProgress || state.selectedView === "mylist";
   el.surpriseMe.textContent = state.surpriseInProgress ? "Choosing..." : "Surprise me";
 }
 
@@ -356,13 +359,24 @@ function renderItems(items) {
   if (!items.length) {
     const emptyContinueView = state.stack.length === 0 && state.selectedView === "continue";
     const emptyCollectionsView = state.stack.length === 0 && state.selectedView === "collections";
-    setStatus(emptyContinueView ? "Nothing to continue." : emptyCollectionsView ? "No collections found." : "No items found.", "muted");
+    const emptyMyListView = state.stack.length === 0 && state.selectedView === "mylist";
+    setStatus(
+      emptyContinueView
+        ? "Nothing to continue."
+        : emptyCollectionsView
+          ? "No collections found."
+          : emptyMyListView
+            ? "My List is empty."
+            : "No items found.",
+      "muted",
+    );
     updateLoadMore();
     return;
   }
   setStatus(statusTextForItems(items.length), "muted");
   const fragment = document.createDocumentFragment();
   for (const item of items) {
+    const inMyList = Boolean(item.ratingKey && state.myListKeys.has(String(item.ratingKey)));
     const card = document.createElement("article");
     card.className = "media-card";
     card.innerHTML = `
@@ -370,7 +384,8 @@ function renderItems(items) {
         ${posterMarkup(item)}
         ${item.type === "collection" ? '<span class="collection-badge">Collection</span>' : ""}
         ${item.viewCount ? '<span class="watched">Watched</span>' : ""}
-        ${supportedSubtitles(item).length ? '<span class="subtitle-badge">CC</span>' : ""}
+        ${inMyList ? '<span class="my-list-badge">My List</span>' : ""}
+        ${supportedSubtitles(item).length ? `<span class="subtitle-badge${inMyList ? " stacked" : ""}">CC</span>` : ""}
         ${progressMarkup(item)}
       </button>
       <div class="card-body">
@@ -409,7 +424,13 @@ function renderItems(items) {
 
 function statusTextForItems(count) {
   const collectionsView = state.stack.length === 0 && state.selectedView === "collections";
-  const noun = collectionsView ? "collections" : "items";
+  const myListView = state.stack.length === 0 && state.selectedView === "mylist";
+  const nounCount = state.libraryTotal && state.libraryTotal > count ? state.libraryTotal : count;
+  const noun = collectionsView
+    ? nounCount === 1 ? "collection" : "collections"
+    : myListView
+      ? nounCount === 1 ? "saved item" : "saved items"
+      : nounCount === 1 ? "item" : "items";
   if (state.libraryTotal && state.libraryTotal > count) {
     return `${count} of ${state.libraryTotal} ${noun}`;
   }
@@ -441,6 +462,7 @@ async function loadServerInfo() {
 
 async function loadLibraries() {
   setStatus("Loading libraries...");
+  await loadMyListKeys();
   const data = await api("/api/libraries");
   state.libraries = data.libraries || [];
   state.selectedLibrary = state.libraries.find((library) => library.key === state.preferredLibraryKey)
@@ -456,6 +478,15 @@ async function loadLibraries() {
     await loadLibrary();
   } else {
     renderItems([]);
+  }
+}
+
+async function loadMyListKeys() {
+  try {
+    const data = await api("/api/my-list?keysOnly=1");
+    state.myListKeys = new Set((data.ratingKeys || []).map(String));
+  } catch {
+    // Browsing remains available if My List state cannot be loaded temporarily.
   }
 }
 
@@ -525,6 +556,9 @@ async function loadLibrary({ append = false } = {}) {
   });
   try {
     const data = await api(`/api/library/${encodeURIComponent(state.selectedLibrary.key)}?${params}`);
+    if (state.selectedView === "mylist" && data.ratingKeys) {
+      state.myListKeys = new Set(data.ratingKeys.map(String));
+    }
     state.libraryStart = start;
     state.libraryTotal = data.totalSize || data.size || 0;
     const incoming = data.items || [];
@@ -642,8 +676,45 @@ function openDetails(item) {
       ? "Mark unwatched"
       : "Mark watched";
   el.detailsWatchState.onclick = () => setWatchState(item, !Boolean(item.viewCount));
+  const canUseMyList = Boolean(item.ratingKey && ["movie", "show", "episode"].includes(item.type));
+  const inMyList = canUseMyList && state.myListKeys.has(String(item.ratingKey));
+  el.detailsMyList.hidden = !canUseMyList;
+  el.detailsMyList.disabled = state.myListUpdatingKey === item.ratingKey;
+  el.detailsMyList.textContent = state.myListUpdatingKey === item.ratingKey
+    ? "Updating..."
+    : inMyList
+      ? "Remove from My List"
+      : "Add to My List";
+  el.detailsMyList.onclick = () => setMyList(item, !inMyList);
   if (!el.detailsDialog.open) {
     el.detailsDialog.showModal();
+  }
+}
+
+async function setMyList(item, saved) {
+  if (!item?.ratingKey || state.myListUpdatingKey) return;
+  state.myListUpdatingKey = item.ratingKey;
+  openDetails(item);
+  try {
+    const data = await api("/api/my-list", {
+      method: "POST",
+      body: JSON.stringify({ ratingKey: item.ratingKey, saved }),
+    });
+    state.myListKeys = new Set((data.ratingKeys || []).map(String));
+    item.inMyList = saved;
+    const reloadMyList = state.stack.length === 0 && state.selectedView === "mylist";
+    if (reloadMyList) {
+      el.detailsDialog.close();
+      await loadLibrary();
+    } else {
+      renderItems([...state.currentItems]);
+    }
+    setStatus(`${displayTitle(item)} ${saved ? "added to" : "removed from"} My List.`, "success");
+  } catch (error) {
+    setStatus(`Could not update My List: ${error.message}`, "error");
+  } finally {
+    state.myListUpdatingKey = null;
+    if (el.detailsDialog.open) openDetails(item);
   }
 }
 
@@ -1764,6 +1835,7 @@ for (const button of el.viewButtons) {
   button.addEventListener("click", async () => {
     state.selectedView = button.dataset.view;
     syncBrowseControls();
+    updateSurpriseButton();
     persistBrowsePreferences();
     state.stack = [];
     resetLibraryPaging();

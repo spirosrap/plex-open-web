@@ -489,6 +489,18 @@ select:focus-visible {
   color: var(--on-accent);
 }
 
+.my-list-badge {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  padding: 4px 7px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .resume-progress {
   position: absolute;
   right: 8px;
@@ -517,6 +529,10 @@ select:focus-visible {
   color: var(--accent);
   font-size: 12px;
   font-weight: 900;
+}
+
+.subtitle-badge.stacked {
+  top: 38px;
 }
 
 .card-body {
@@ -862,17 +878,12 @@ select:focus-visible {
   .segmented {
     width: 100%;
     grid-auto-flow: row;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .segmented button {
-    grid-column: span 2;
     padding: 0 7px;
     font-size: 13px;
-  }
-
-  .segmented button:nth-child(n + 4) {
-    grid-column: span 3;
   }
 
   .media-grid {

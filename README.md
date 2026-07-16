@@ -9,6 +9,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Password-protected web UI with signed HttpOnly session cookies.
 - Library list, continue/recent/all/unwatched views, persistent genre filtering, sorting, and search.
 - Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
+- Server-backed My List shared with the Android app, with per-library browsing and poster badges.
 - Surprise Me selection for opening a random item from the active genre and Unwatched filters.
 - Persistent library, view, genre, and sort context across reloads and sign-in sessions.
 - Resume-progress indicators and manual watched/unwatched controls synchronized with Plex.
@@ -26,6 +27,26 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.9.0
+
+**Added**
+
+- Added a persistent My List shared by the web and Android clients.
+- Added Add to My List and Remove from My List actions for movies, shows, and episodes.
+- Added a paged My List library view and poster badges for saved items.
+
+**Improved**
+
+- My List refreshes from the server when opened so changes from another client appear immediately.
+- Saved metadata is loaded in efficient Plex batches while preserving newest-first order.
+- Six library views use balanced controls on desktop and in a three-by-two mobile layout.
+
+**Fixed**
+
+- My List state is stored atomically outside the deployed source tree so deployments and service restarts preserve it.
+- Invalid item identifiers and unsupported media types are rejected before saved state changes.
+- Empty My List libraries now show a specific empty-state message and disable unrelated sort, genre, and random controls.
 
 ### 0.8.0
 
@@ -192,6 +213,10 @@ Required settings:
 - `APP_SECRET`: long random string used to sign sessions.
 - `PLEX_BASE_URL`: usually `http://127.0.0.1:32400` when running on the Plex host.
 - `PLEX_TOKEN`: a token for your Plex server.
+
+Optional app settings:
+
+- `APP_DATA_DIR`: persistent directory for server-owned state such as My List; defaults outside the source directory.
 
 Optional subtitle search/download settings:
 

@@ -37,8 +37,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 COOKIE_NAME = "plex_open_session"
+MY_LIST_MAX_ITEMS = 500
+MY_LIST_LOCK = threading.Lock()
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
 DEFAULT_PREFS = (
@@ -96,6 +98,7 @@ class Settings:
     stream_timeout = env_int("PLEX_STREAM_TIMEOUT", 3600)
     ffmpeg_path = os.environ.get("FFMPEG_PATH", "ffmpeg")
     saved_media_dir = os.environ.get("SAVED_MEDIA_DIR", str(ROOT.parent / "plex-open-web-saved"))
+    data_dir = Path(os.environ.get("APP_DATA_DIR", str(ROOT.parent / "plex-open-web-data")))
     opensubtitles_base_url = os.environ.get(
         "OPENSUBTITLES_BASE_URL", "https://api.opensubtitles.com/api/v1"
     )
@@ -105,6 +108,9 @@ class Settings:
     opensubtitles_user_agent = os.environ.get(
         "OPENSUBTITLES_USER_AGENT", f"PlexOpenWeb v{APP_VERSION}"
     )
+
+
+MY_LIST_FILE = Settings.data_dir / "my-list.json"
 
 
 def read_plex_token_from_preferences(path: str) -> str:
@@ -1632,6 +1638,74 @@ def items_from_container(root: ET.Element, recursive: bool = False) -> List[Dict
     return items
 
 
+def _read_my_list_keys() -> List[str]:
+    try:
+        payload = json.loads(MY_LIST_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    values = payload.get("ratingKeys", []) if isinstance(payload, dict) else payload
+    if not isinstance(values, list):
+        return []
+    keys: List[str] = []
+    seen = set()
+    for value in values:
+        key = str(value).strip()
+        if not re.fullmatch(r"\d+", key) or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+        if len(keys) >= MY_LIST_MAX_ITEMS:
+            break
+    return keys
+
+
+def my_list_keys() -> List[str]:
+    with MY_LIST_LOCK:
+        return _read_my_list_keys()
+
+
+def update_my_list(rating_key: str, saved: bool) -> List[str]:
+    with MY_LIST_LOCK:
+        keys = [key for key in _read_my_list_keys() if key != rating_key]
+        if saved:
+            keys.insert(0, rating_key)
+        keys = keys[:MY_LIST_MAX_ITEMS]
+        MY_LIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = MY_LIST_FILE.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"ratingKeys": keys, "updatedAt": int(time.time())}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, MY_LIST_FILE)
+        return keys
+
+
+def metadata_items_for_rating_keys(rating_keys: List[str]) -> List[Dict[str, Any]]:
+    found: Dict[str, Dict[str, Any]] = {}
+    for start in range(0, len(rating_keys), 50):
+        chunk = rating_keys[start : start + 50]
+        if not chunk:
+            continue
+        joined = urllib.parse.quote(",".join(chunk), safe=",")
+        root = PLEX.xml(f"/library/metadata/{joined}", params={"includeGuids": "1"})
+        for item in items_from_container(root):
+            rating_key = str(item.get("ratingKey") or "")
+            if rating_key:
+                found[rating_key] = item
+    return [found[key] for key in rating_keys if key in found]
+
+
+def my_list_items(section_key: str = "") -> Tuple[List[str], List[Dict[str, Any]]]:
+    keys = my_list_keys()
+    items = metadata_items_for_rating_keys(keys)
+    if section_key:
+        items = [item for item in items if str(item.get("librarySectionID") or "") == section_key]
+    key_set = set(keys)
+    for item in items:
+        item["inMyList"] = str(item.get("ratingKey") or "") in key_set
+    return keys, items
+
+
 class AppHandler(BaseHTTPRequestHandler):
     server_version = f"PlexOpenWeb/{APP_VERSION}"
     protocol_version = "HTTP/1.1"
@@ -1800,6 +1874,9 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_json({"authenticated": False}, headers={"Set-Cookie": cookie.output(header="").strip()})
 
     def handle_api(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
+        if path == "/api/my-list":
+            self.api_my_list(method, query)
+            return
         if path == "/api/library-scan":
             self.api_library_scan(method)
             return
@@ -2015,6 +2092,64 @@ class AppHandler(BaseHTTPRequestHandler):
             refreshed["viewOffset"] = 0
         self.send_json({"ok": True, "watched": watched, "item": refreshed})
 
+    def api_my_list(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method == "POST":
+            payload = self.read_json()
+            rating_key = str(payload.get("ratingKey") or "").strip()
+            saved = payload.get("saved")
+            if not re.fullmatch(r"\d+", rating_key):
+                self.send_json({"error": "invalid_rating_key"}, status=400)
+                return
+            if not isinstance(saved, bool):
+                self.send_json({"error": "invalid_saved_state"}, status=400)
+                return
+            item = metadata_item_for_rating_key(rating_key) if saved else None
+            if saved and item is None:
+                self.send_json({"error": "metadata_not_found"}, status=404)
+                return
+            if saved and item.get("type") not in {"movie", "show", "episode"}:
+                self.send_json({"error": "unsupported_media_type"}, status=400)
+                return
+            keys = update_my_list(rating_key, saved)
+            if item is not None:
+                item["inMyList"] = saved
+            self.send_json(
+                {
+                    "ok": True,
+                    "ratingKey": rating_key,
+                    "saved": saved,
+                    "ratingKeys": keys,
+                    "item": item,
+                }
+            )
+            return
+        if method not in {"GET", "HEAD"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        keys = my_list_keys()
+        if one(query, "keysOnly", "").strip().lower() in {"1", "true", "yes", "on"}:
+            self.send_json({"ratingKeys": keys, "totalSize": len(keys)})
+            return
+        section_key = one(query, "sectionKey", "").strip()
+        if section_key and not re.fullmatch(r"\d+", section_key):
+            self.send_json({"error": "invalid_section"}, status=400)
+            return
+        start = max(0, to_int(one(query, "start", "0")) or 0)
+        limit = min(300, max(1, to_int(one(query, "limit", "48")) or 48))
+        keys, items = my_list_items(section_key)
+        total = len(items)
+        self.send_json(
+            {
+                "ratingKeys": keys,
+                "sectionKey": section_key or None,
+                "start": start,
+                "limit": limit,
+                "size": len(items[start : start + limit]),
+                "totalSize": total,
+                "items": items[start : start + limit],
+            }
+        )
+
     def api_library(self, path: str, query: Dict[str, List[str]]) -> None:
         section_key = path[len("/api/library/") :].strip("/").split("/", 1)[0]
         if not section_key:
@@ -2027,6 +2162,27 @@ class AppHandler(BaseHTTPRequestHandler):
         genre = one(query, "genre", "").strip()
         if genre and not re.fullmatch(r"\d+", genre):
             self.send_json({"error": "invalid_genre"}, status=400)
+            return
+        if view == "mylist":
+            if not re.fullmatch(r"\d+", section_key):
+                self.send_json({"error": "invalid_section"}, status=400)
+                return
+            keys, items = my_list_items(section_key)
+            total = len(items)
+            page = items[start : start + limit]
+            self.send_json(
+                {
+                    "library": section_key,
+                    "view": view,
+                    "ratingKeys": keys,
+                    "genre": None,
+                    "start": start,
+                    "limit": limit,
+                    "size": len(page),
+                    "totalSize": total,
+                    "items": page,
+                }
+            )
             return
         params: Dict[str, Any] = {
             "includeGuids": "1",

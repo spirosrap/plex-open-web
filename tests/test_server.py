@@ -1,5 +1,7 @@
 import unittest
+import tempfile
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from unittest import mock
 
 import server
@@ -49,9 +51,14 @@ class FakePlex:
                 f'</Video></MediaContainer>'
             )
         if path.startswith("/library/metadata/"):
-            rating_key = path.rsplit("/", 1)[-1]
+            rating_keys = path.rsplit("/", 1)[-1].split(",")
+            videos = "".join(
+                f'<Video ratingKey="{rating_key}" librarySectionID="{8 if rating_key == "202" else 7}" '
+                f'type="movie" title="Test {rating_key}" duration="600000" />'
+                for rating_key in rating_keys
+            )
             return ET.fromstring(
-                f'<MediaContainer><Video ratingKey="{rating_key}" type="movie" title="Test" duration="600000" /></MediaContainer>'
+                f'<MediaContainer size="{len(rating_keys)}">{videos}</MediaContainer>'
             )
         if path.endswith("/onDeck"):
             return ET.fromstring(
@@ -232,6 +239,59 @@ class WatchStateTests(unittest.TestCase):
 
         self.assertEqual(400, responses[0][0])
         self.assertEqual("invalid_watched_state", responses[0][1]["error"])
+
+
+class MyListTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path_patch = mock.patch.object(server, "MY_LIST_FILE", Path(self.temp_dir.name) / "my-list.json")
+        self.path_patch.start()
+
+    def tearDown(self):
+        self.path_patch.stop()
+        self.temp_dir.cleanup()
+
+    def test_add_list_and_remove_are_persisted_in_newest_first_order(self):
+        plex = FakePlex()
+        with mock.patch.object(server, "PLEX", plex):
+            for rating_key in ("101", "102"):
+                handler, responses = handler_with_payload({"ratingKey": rating_key, "saved": True})
+                handler.api_my_list("POST", {})
+                self.assertEqual(200, responses[0][0])
+
+            handler, responses = handler_with_payload({})
+            handler.api_my_list("GET", {"keysOnly": ["1"]})
+            self.assertEqual(["102", "101"], responses[0][1]["ratingKeys"])
+
+            handler, responses = handler_with_payload({"ratingKey": "102", "saved": False})
+            handler.api_my_list("POST", {})
+            self.assertEqual(["101"], responses[0][1]["ratingKeys"])
+
+        self.assertTrue(server.MY_LIST_FILE.exists())
+        self.assertEqual(["101"], server.my_list_keys())
+
+    def test_my_list_library_view_filters_items_by_section(self):
+        server.update_my_list("101", True)
+        server.update_my_list("202", True)
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library(
+                "/api/library/7",
+                {"view": ["mylist"], "start": ["0"], "limit": ["10"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(1, responses[0][1]["totalSize"])
+        self.assertEqual(["101"], [item["ratingKey"] for item in responses[0][1]["items"]])
+        self.assertTrue(responses[0][1]["items"][0]["inMyList"])
+
+    def test_my_list_rejects_non_boolean_saved_state(self):
+        handler, responses = handler_with_payload({"ratingKey": "101", "saved": "true"})
+        handler.api_my_list("POST", {})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_saved_state", responses[0][1]["error"])
 
 
 if __name__ == "__main__":
