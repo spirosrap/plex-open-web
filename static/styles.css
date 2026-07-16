@@ -708,6 +708,31 @@ select:focus-visible {
   font-size: 13px;
 }
 
+.player-controls .toggle-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.player-controls .toggle-field[hidden],
+.up-next-banner[hidden] {
+  display: none;
+}
+
+.toggle-field input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
 .playback-mode {
   padding: 5px 8px;
   border-radius: 5px;
@@ -738,6 +763,24 @@ select:focus-visible {
   width: 100%;
   max-height: calc(100vh - 120px);
   background: #000;
+}
+
+.up-next-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 50px;
+  padding: 8px 12px 8px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+.up-next-banner strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .subtitle-dialog {
@@ -902,5 +945,20 @@ select:focus-visible {
   .subtitle-form,
   .subtitle-result {
     grid-template-columns: 1fr;
+  }
+
+  .player-dialog header {
+    align-items: flex-start;
+    flex-direction: column;
+    padding: 10px 12px;
+  }
+
+  .player-controls {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .player-dialog video {
+    max-height: calc(100vh - 210px);
   }
 }

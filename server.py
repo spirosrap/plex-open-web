@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.10.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -1695,6 +1695,31 @@ def metadata_items_for_rating_keys(rating_keys: List[str]) -> List[Dict[str, Any
     return [found[key] for key in rating_keys if key in found]
 
 
+def episode_neighbors(rating_key: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], int, int]:
+    current = metadata_item_element(rating_key)
+    if current is None:
+        raise LookupError("metadata_not_found")
+    if current.get("type") != "episode":
+        raise ValueError("unsupported_media_type")
+    show_key = str(current.get("grandparentRatingKey") or "").strip()
+    if not re.fullmatch(r"\d+", show_key):
+        raise LookupError("show_not_found")
+    root = PLEX.xml(
+        f"/library/metadata/{urllib.parse.quote(show_key)}/allLeaves",
+        params={"includeGuids": "1"},
+    )
+    episodes = [item for item in items_from_container(root) if item.get("type") == "episode"]
+    position = next(
+        (index for index, item in enumerate(episodes) if str(item.get("ratingKey") or "") == rating_key),
+        -1,
+    )
+    if position < 0:
+        raise LookupError("episode_not_in_show")
+    previous_item = episodes[position - 1] if position > 0 else None
+    next_item = episodes[position + 1] if position + 1 < len(episodes) else None
+    return previous_item, next_item, position, len(episodes)
+
+
 def my_list_items(section_key: str = "") -> Tuple[List[str], List[Dict[str, Any]]]:
     keys = my_list_keys()
     items = metadata_items_for_rating_keys(keys)
@@ -1756,6 +1781,8 @@ class AppHandler(BaseHTTPRequestHandler):
         except urllib.error.HTTPError as exc:
             message = exc.read(4096).decode("utf-8", errors="ignore") if method != "HEAD" else ""
             self.send_json({"error": "plex_http_error", "status": exc.code, "message": message}, status=502)
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except Exception as exc:
             traceback.print_exc()
             self.send_json({"error": "server_error", "message": str(exc)}, status=500)
@@ -1901,6 +1928,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.api_libraries()
         elif path == "/api/random-item":
             self.api_random_item(query)
+        elif path == "/api/episode-neighbors":
+            self.api_episode_neighbors(query)
         elif path.startswith("/api/library/") and path.endswith("/genres"):
             self.api_library_genres(path)
         elif path.startswith("/api/library/"):
@@ -2238,6 +2267,29 @@ class AppHandler(BaseHTTPRequestHandler):
                 "parentTitle": root.get("parentTitle") or root.get("grandparentTitle"),
                 "parentRatingKey": root.get("parentRatingKey"),
                 "items": items_from_container(root),
+            }
+        )
+
+    def api_episode_neighbors(self, query: Dict[str, List[str]]) -> None:
+        rating_key = one(query, "ratingKey", "").strip()
+        if not re.fullmatch(r"\d+", rating_key):
+            self.send_json({"error": "invalid_rating_key"}, status=400)
+            return
+        try:
+            previous_item, next_item, position, total = episode_neighbors(rating_key)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        except LookupError as exc:
+            self.send_json({"error": str(exc)}, status=404)
+            return
+        self.send_json(
+            {
+                "ratingKey": rating_key,
+                "position": position,
+                "totalSize": total,
+                "previous": previous_item,
+                "next": next_item,
             }
         )
 

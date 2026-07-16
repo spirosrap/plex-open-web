@@ -18,7 +18,12 @@ const state = {
   scanInProgress: false,
   surpriseInProgress: false,
   watchStateRatingKey: null,
+  detailsItem: null,
   playerItem: null,
+  playerNeighbors: null,
+  autoplayNext: true,
+  autoplayTimer: null,
+  autoplaySeconds: 0,
   subtitleTrackElements: [],
   savePollTimer: null,
   progressTimer: null,
@@ -37,6 +42,7 @@ const DEVICE_CACHE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const LOCAL_PROGRESS_KEY = "plex-open-web-progress-v1";
 const THEME_KEY = "plex-open-web-theme-v1";
 const BROWSE_KEY = "plex-open-web-browse-v1";
+const AUTOPLAY_NEXT_KEY = "plex-open-web-autoplay-next-v1";
 const THEME_VALUES = new Set(["system", "light", "dark"]);
 const VIEW_VALUES = new Set(["continue", "recent", "all", "unwatched", "collections", "mylist"]);
 const SORT_VALUES = new Set(["addedAt:desc", "titleSort", "year:desc", "lastViewedAt:desc"]);
@@ -47,6 +53,11 @@ state.preferredLibraryKey = typeof savedBrowse.libraryKey === "string" ? savedBr
 state.genreKeysByLibrary = normalizeGenrePreferences(savedBrowse.genreKeys);
 state.selectedView = VIEW_VALUES.has(savedBrowse.view) ? savedBrowse.view : "all";
 state.sort = SORT_VALUES.has(savedBrowse.sort) ? savedBrowse.sort : "addedAt:desc";
+try {
+  state.autoplayNext = localStorage.getItem(AUTOPLAY_NEXT_KEY) !== "false";
+} catch {
+  state.autoplayNext = true;
+}
 
 const el = {
   login: document.querySelector("#login"),
@@ -81,6 +92,8 @@ const el = {
   detailsMeta: document.querySelector("#details-meta"),
   detailsPlay: document.querySelector("#details-play"),
   detailsOpen: document.querySelector("#details-open"),
+  detailsPreviousEpisode: document.querySelector("#details-previous-episode"),
+  detailsNextEpisode: document.querySelector("#details-next-episode"),
   detailsSubtitles: document.querySelector("#details-subtitles"),
   detailsWatchState: document.querySelector("#details-watch-state"),
   detailsMyList: document.querySelector("#details-my-list"),
@@ -97,6 +110,12 @@ const el = {
   playerDeviceDelete: document.querySelector("#player-device-delete"),
   playerDownloadOriginal: document.querySelector("#player-download-original"),
   playerSubtitleSearch: document.querySelector("#player-subtitle-search"),
+  autoplayNextLabel: document.querySelector("#autoplay-next-label"),
+  autoplayNext: document.querySelector("#autoplay-next"),
+  playerNextEpisode: document.querySelector("#player-next-episode"),
+  playerUpNext: document.querySelector("#player-up-next"),
+  playerUpNextText: document.querySelector("#player-up-next-text"),
+  playerUpNextCancel: document.querySelector("#player-up-next-cancel"),
   player: document.querySelector("#player"),
   subtitleDialog: document.querySelector("#subtitle-dialog"),
   subtitleClose: document.querySelector("#subtitle-close"),
@@ -274,6 +293,23 @@ function displayTitle(item) {
   return item.type === "episode" && item.grandparentTitle
     ? `${item.grandparentTitle}: ${item.title}`
     : item.title;
+}
+
+function episodeCode(item) {
+  if (item?.type !== "episode") return "";
+  const hasSeason = item.parentIndex !== null && item.parentIndex !== undefined && Number.isFinite(Number(item.parentIndex));
+  const hasEpisode = item.index !== null && item.index !== undefined && Number.isFinite(Number(item.index));
+  const season = hasSeason ? `S${String(item.parentIndex).padStart(2, "0")}` : "";
+  const episode = hasEpisode ? `E${String(item.index).padStart(2, "0")}` : "";
+  return `${season}${episode}`;
+}
+
+async function fetchEpisodeNeighbors(item) {
+  if (item?.type !== "episode" || !item.ratingKey) return null;
+  if (item._episodeNeighbors) return item._episodeNeighbors;
+  const data = await api(`/api/episode-neighbors?${new URLSearchParams({ ratingKey: item.ratingKey })}`);
+  item._episodeNeighbors = data;
+  return data;
 }
 
 function subtitleSearchTitle(item) {
@@ -640,7 +676,48 @@ async function openChildren(item) {
   renderItems(data.items || []);
 }
 
+function renderDetailsEpisodeActions(item, neighbors = null) {
+  const previous = neighbors?.previous;
+  const next = neighbors?.next;
+  el.detailsPreviousEpisode.hidden = !previous;
+  el.detailsNextEpisode.hidden = !next;
+  if (previous) {
+    el.detailsPreviousEpisode.textContent = `Previous ${episodeCode(previous)}`.trim();
+    el.detailsPreviousEpisode.title = displayTitle(previous);
+    el.detailsPreviousEpisode.onclick = () => {
+      el.detailsDialog.close();
+      playItem(previous);
+    };
+  }
+  if (next) {
+    el.detailsNextEpisode.textContent = `Next ${episodeCode(next)}`.trim();
+    el.detailsNextEpisode.title = displayTitle(next);
+    el.detailsNextEpisode.onclick = () => {
+      el.detailsDialog.close();
+      playItem(next);
+    };
+  }
+  if (state.detailsItem !== item) {
+    el.detailsPreviousEpisode.hidden = true;
+    el.detailsNextEpisode.hidden = true;
+  }
+}
+
+async function loadDetailsEpisodeActions(item) {
+  renderDetailsEpisodeActions(item);
+  if (item?.type !== "episode") return;
+  try {
+    const neighbors = await fetchEpisodeNeighbors(item);
+    if (state.detailsItem === item) {
+      renderDetailsEpisodeActions(item, neighbors);
+    }
+  } catch {
+    // Episode details remain usable when adjacent metadata is temporarily unavailable.
+  }
+}
+
 function openDetails(item) {
+  state.detailsItem = item;
   el.detailsPoster.src = item.posterUrl || "";
   el.detailsPoster.hidden = !item.posterUrl;
   el.detailsKicker.textContent = [item.type, item.year || item.originallyAvailableAt].filter(Boolean).join(" / ");
@@ -659,7 +736,10 @@ function openDetails(item) {
     .join("");
   el.detailsMeta.innerHTML = meta;
   el.detailsPlay.hidden = !item.streamUrl;
-  el.detailsPlay.onclick = () => playItem(item);
+  el.detailsPlay.onclick = () => {
+    el.detailsDialog.close();
+    playItem(item);
+  };
   el.detailsOpen.hidden = !itemCanOpen(item);
   el.detailsOpen.onclick = async () => {
     el.detailsDialog.close();
@@ -689,6 +769,7 @@ function openDetails(item) {
   if (!el.detailsDialog.open) {
     el.detailsDialog.showModal();
   }
+  loadDetailsEpisodeActions(item);
 }
 
 async function setMyList(item, saved) {
@@ -1578,7 +1659,94 @@ async function deleteSavedPlayback(item = state.playerItem) {
   updateDeviceControls(item);
 }
 
+function persistAutoplayNext() {
+  try {
+    localStorage.setItem(AUTOPLAY_NEXT_KEY, String(state.autoplayNext));
+  } catch {
+    // The setting remains active for this page when storage is unavailable.
+  }
+}
+
+function cancelAutoplayCountdown() {
+  if (state.autoplayTimer) {
+    clearInterval(state.autoplayTimer);
+    state.autoplayTimer = null;
+  }
+  state.autoplaySeconds = 0;
+  el.playerUpNext.hidden = true;
+}
+
+function updatePlayerEpisodeControls(item = state.playerItem) {
+  const isEpisode = item?.type === "episode";
+  const next = isEpisode ? state.playerNeighbors?.next : null;
+  el.autoplayNext.checked = state.autoplayNext;
+  el.autoplayNextLabel.hidden = !isEpisode;
+  el.playerNextEpisode.hidden = !next;
+  if (next) {
+    el.playerNextEpisode.textContent = `Next ${episodeCode(next)}`.trim();
+    el.playerNextEpisode.title = displayTitle(next);
+  }
+}
+
+async function loadPlayerEpisodeNeighbors(item) {
+  state.playerNeighbors = null;
+  updatePlayerEpisodeControls(item);
+  if (item?.type !== "episode") return;
+  try {
+    const neighbors = await fetchEpisodeNeighbors(item);
+    if (state.playerItem === item) {
+      state.playerNeighbors = neighbors;
+      updatePlayerEpisodeControls(item);
+    }
+  } catch {
+    // Playback remains available if adjacent episode metadata cannot be loaded.
+  }
+}
+
+function renderAutoplayCountdown(next) {
+  const code = episodeCode(next);
+  el.playerUpNextText.textContent = `Up next in ${state.autoplaySeconds}s: ${code} ${next.title}`.trim();
+  el.playerUpNext.hidden = false;
+}
+
+async function playAdjacentEpisode(item, { ended = false } = {}) {
+  if (!item || !state.playerItem) return;
+  cancelAutoplayCountdown();
+  if (!ended) {
+    await reportPlaybackProgress("stopped", { force: true });
+  }
+  stopProgressReporting();
+  stopSavePolling();
+  el.player.pause();
+  await playItem(item);
+}
+
+function scheduleAutoplayNext() {
+  cancelAutoplayCountdown();
+  const currentKey = state.playerItem?.ratingKey;
+  const next = state.playerNeighbors?.next;
+  if (!state.autoplayNext || !currentKey || !next) return;
+  state.autoplaySeconds = 5;
+  renderAutoplayCountdown(next);
+  state.autoplayTimer = setInterval(() => {
+    if (state.playerItem?.ratingKey !== currentKey || !state.autoplayNext) {
+      cancelAutoplayCountdown();
+      return;
+    }
+    state.autoplaySeconds -= 1;
+    if (state.autoplaySeconds <= 0) {
+      cancelAutoplayCountdown();
+      playAdjacentEpisode(next, { ended: true }).catch((error) => {
+        setStatus(`Could not play the next episode: ${error.message}`, "error");
+      });
+      return;
+    }
+    renderAutoplayCountdown(next);
+  }, 1000);
+}
+
 async function playItem(item) {
+  cancelAutoplayCountdown();
   item = await hydrateItem(item);
   try {
     await refreshSavedPlayback(item);
@@ -1592,6 +1760,7 @@ async function playItem(item) {
     item.devicePlayback = { state: "unsupported", ready: false, supported: false };
   }
   state.playerItem = item;
+  state.playerNeighbors = null;
   state.lastProgressReportAt = 0;
   state.lastReportedTimeMs = 0;
   el.playerTitle.textContent = displayTitle(item);
@@ -1605,6 +1774,7 @@ async function playItem(item) {
     state.deviceObjectUrls = prepared.objectUrls;
     loadPlayerSource(prepared.item, prepared.streamUrl, { resumeTime });
   } else {
+    revokeDeviceObjectUrls();
     const streamUrl = streamUrlFor(item);
     if (!streamUrl) return;
     state.usingDevicePlayback = false;
@@ -1620,7 +1790,11 @@ async function playItem(item) {
   if (item.savedPlayback?.state === "saving") {
     pollSavedPlayback(item, false);
   }
-  el.playerDialog.showModal();
+  updatePlayerEpisodeControls(item);
+  loadPlayerEpisodeNeighbors(item);
+  if (!el.playerDialog.open) {
+    el.playerDialog.showModal();
+  }
 }
 
 function setSubtitleStatus(message = "", kind = "") {
@@ -1844,12 +2018,31 @@ for (const button of el.viewButtons) {
 }
 
 el.detailsClose.addEventListener("click", () => el.detailsDialog.close());
+el.detailsDialog.addEventListener("close", () => {
+  state.detailsItem = null;
+});
+el.autoplayNext.addEventListener("change", () => {
+  state.autoplayNext = el.autoplayNext.checked;
+  persistAutoplayNext();
+  if (!state.autoplayNext) {
+    cancelAutoplayCountdown();
+  }
+});
+el.playerNextEpisode.addEventListener("click", () => {
+  const next = state.playerNeighbors?.next;
+  playAdjacentEpisode(next).catch((error) => {
+    setStatus(`Could not play the next episode: ${error.message}`, "error");
+  });
+});
+el.playerUpNextCancel.addEventListener("click", cancelAutoplayCountdown);
 el.playerClose.addEventListener("click", () => el.playerDialog.close());
 el.playerDialog.addEventListener("close", async () => {
   const hadPlayer = Boolean(state.playerItem);
   const reloadFilteredView = state.stack.length === 0 && ["continue", "unwatched"].includes(state.selectedView);
   const progressReport = reportPlaybackProgress("stopped", { force: true, keepalive: true });
+  cancelAutoplayCountdown();
   state.playerItem = null;
+  state.playerNeighbors = null;
   stopProgressReporting();
   stopSavePolling();
   el.player.pause();
@@ -1861,6 +2054,8 @@ el.playerDialog.addEventListener("close", async () => {
   el.playerDeviceSave.hidden = true;
   el.playerDeviceDelete.hidden = true;
   el.playerDownloadOriginal.hidden = true;
+  el.autoplayNextLabel.hidden = true;
+  el.playerNextEpisode.hidden = true;
   state.usingSavedPlayback = false;
   state.usingDevicePlayback = false;
   revokeDeviceObjectUrls();
@@ -1893,6 +2088,7 @@ el.player.addEventListener("timeupdate", () => {
 el.player.addEventListener("ended", () => {
   stopProgressReporting();
   reportPlaybackProgress("ended", { force: true }).catch(() => {});
+  scheduleAutoplayNext();
 });
 window.addEventListener("pagehide", () => {
   reportPlaybackProgress("stopped", { force: true, keepalive: true }).catch(() => {});

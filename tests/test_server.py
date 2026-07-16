@@ -74,6 +74,37 @@ class FakePlex:
         return FakeResponse()
 
 
+class FakeEpisodePlex(FakePlex):
+    def xml(self, path, params=None):
+        self.xml_calls.append((path, dict(params or {})))
+        if path == "/library/metadata/12":
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                '<Video ratingKey="12" type="episode" title="Season Finale" index="2" parentIndex="1" '
+                'parentRatingKey="20" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/13":
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                '<Video ratingKey="13" type="episode" title="New Season" index="1" parentIndex="2" '
+                'parentRatingKey="21" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/10/allLeaves":
+            return ET.fromstring(
+                '<MediaContainer size="3" librarySectionID="7">'
+                '<Video ratingKey="11" type="episode" title="Pilot" index="1" parentIndex="1" '
+                'parentRatingKey="20" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '<Video ratingKey="12" type="episode" title="Season Finale" index="2" parentIndex="1" '
+                'parentRatingKey="20" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '<Video ratingKey="13" type="episode" title="New Season" index="1" parentIndex="2" '
+                'parentRatingKey="21" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '</MediaContainer>'
+            )
+        return super().xml(path, params=params)
+
+
 def handler_with_payload(payload):
     handler = object.__new__(server.AppHandler)
     responses = []
@@ -239,6 +270,41 @@ class WatchStateTests(unittest.TestCase):
 
         self.assertEqual(400, responses[0][0])
         self.assertEqual("invalid_watched_state", responses[0][1]["error"])
+
+
+class EpisodeNeighborTests(unittest.TestCase):
+    def test_returns_adjacent_episodes_across_season_boundaries(self):
+        plex = FakeEpisodePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_episode_neighbors({"ratingKey": ["12"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("11", responses[0][1]["previous"]["ratingKey"])
+        self.assertEqual("13", responses[0][1]["next"]["ratingKey"])
+        self.assertEqual(1, responses[0][1]["position"])
+        self.assertEqual(3, responses[0][1]["totalSize"])
+        self.assertEqual("/library/metadata/10/allLeaves", plex.xml_calls[1][0])
+
+    def test_last_episode_has_no_next_episode(self):
+        plex = FakeEpisodePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_episode_neighbors({"ratingKey": ["13"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("12", responses[0][1]["previous"]["ratingKey"])
+        self.assertIsNone(responses[0][1]["next"])
+
+    def test_rejects_invalid_rating_key_before_calling_plex(self):
+        plex = FakeEpisodePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_episode_neighbors({"ratingKey": ["../12"]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_rating_key", responses[0][1]["error"])
+        self.assertEqual([], plex.xml_calls)
 
 
 class MyListTests(unittest.TestCase):

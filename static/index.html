@@ -124,6 +124,8 @@
           <div class="details-actions">
             <button id="details-play" class="primary-button">Play</button>
             <button id="details-open" class="secondary-button">Open</button>
+            <button id="details-previous-episode" class="secondary-button" hidden>Previous episode</button>
+            <button id="details-next-episode" class="secondary-button" hidden>Next episode</button>
             <button id="details-subtitles" class="secondary-button">Subtitles</button>
             <button id="details-watch-state" class="secondary-button">Mark watched</button>
             <button id="details-my-list" class="secondary-button">Add to My List</button>
@@ -145,10 +147,19 @@
           <button id="player-device-delete" class="secondary-button danger-button" type="button" hidden>Delete device</button>
           <button id="player-download-original" class="secondary-button" type="button" hidden>Download</button>
           <button id="player-subtitle-search" class="secondary-button" type="button" hidden>Find</button>
+          <label id="autoplay-next-label" class="toggle-field" hidden>
+            <input id="autoplay-next" type="checkbox" />
+            <span>Auto next</span>
+          </label>
+          <button id="player-next-episode" class="secondary-button" type="button" hidden>Next episode</button>
           <button id="player-close" class="icon-button" aria-label="Close">x</button>
         </div>
       </header>
       <video id="player" controls playsinline></video>
+      <div id="player-up-next" class="up-next-banner" hidden>
+        <strong id="player-up-next-text"></strong>
+        <button id="player-up-next-cancel" class="secondary-button" type="button">Cancel</button>
+      </div>
     </dialog>
 
     <dialog id="subtitle-dialog" class="subtitle-dialog">

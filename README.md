@@ -17,6 +17,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - One-tap scanning for the selected Plex library with progress feedback and an automatic result reload.
 - Movie playback in the browser through a Range-aware stream proxy.
 - TV show navigation from show to season to episode.
+- Previous/next episode navigation with optional persisted autoplay and a cancellable Up Next countdown.
 - Browser subtitle selection from Plex subtitle streams and sidecar subtitle files.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
@@ -27,6 +28,27 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.10.0
+
+**Added**
+
+- Added Previous and Next episode actions to episode details.
+- Added an in-player Next episode control and a persisted Auto next checkbox.
+- Added a five-second Up Next countdown with a one-time Cancel action.
+
+**Improved**
+
+- Episode order comes from Plex's native show feed and continues correctly across season boundaries.
+- The player changes episodes in place while refreshing playback, subtitle, save, download, and device-copy controls.
+- Adjacent episode metadata is cached per item so reopening details or playback does not repeat unnecessary lookups.
+
+**Fixed**
+
+- The details dialog now closes before playback starts, avoiding stacked media dialogs.
+- Auto next stops cleanly at the final available episode and does not block playback if neighbor metadata is unavailable.
+- Browser device object URLs are released when continuation switches back to a live stream.
+- Cancelled stream or subtitle requests no longer trigger a second server error after the client disconnects.
 
 ### 0.9.0
 
