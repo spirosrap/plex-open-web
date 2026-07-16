@@ -50,6 +50,7 @@ Release notes cover user-facing changes and intentionally omit deployment-specif
 - Browse records skip saved-file filesystem checks and external-ID parsing until full metadata is requested.
 - Versioned JavaScript and CSS use immutable caching, while server-side static bytes are retained in memory.
 - Library paging appends only new cards, uses one delegated grid listener, defers off-screen rendering, and prioritizes first-viewport poster decoding.
+- Phone layouts use compact horizontal library and view strips plus a denser filter grid, bringing the first movie posters into the initial viewport.
 - Playback metadata and browser-device availability are prepared concurrently, and subtitle search opens without an unnecessary metadata round trip.
 - The HTTP server uses a larger connection queue and daemon request workers for cleaner recovery under bursts and shutdowns.
 
