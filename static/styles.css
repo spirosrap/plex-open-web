@@ -1119,12 +1119,60 @@ select:focus-visible {
   .sidebar {
     position: static;
     height: auto;
+    gap: 12px;
+    padding: 14px 16px;
     border-right: 0;
     border-bottom: 1px solid var(--line);
   }
 
   .library-list {
-    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 2px;
+    scrollbar-width: thin;
+    scroll-snap-type: x proximity;
+  }
+
+  .library-button {
+    flex: 0 0 auto;
+    width: auto;
+    min-height: 42px;
+    padding: 7px 11px;
+    scroll-snap-align: start;
+  }
+
+  .library-button span,
+  .library-button small {
+    white-space: nowrap;
+  }
+
+  .library-button small {
+    display: inline;
+    margin: 0 0 0 6px;
+  }
+
+  .sidebar-footer {
+    display: flex;
+    align-items: end;
+    gap: 8px;
+    margin-top: 0;
+  }
+
+  .sidebar-footer .theme-field {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .sidebar-footer .ghost-button {
+    flex: 0 0 auto;
+    width: auto;
+    min-height: 42px;
+    padding-inline: 14px;
+  }
+
+  .content {
+    padding: 16px;
   }
 
   .topbar,
@@ -1133,8 +1181,13 @@ select:focus-visible {
     flex-direction: column;
   }
 
+  .topbar {
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+
   .topbar h1 {
-    font-size: 30px;
+    font-size: 28px;
   }
 
   .search,
@@ -1144,7 +1197,8 @@ select:focus-visible {
   }
 
   .toolbar-actions select {
-    grid-column: 1 / -1;
+    min-width: 0;
+    width: 100%;
   }
 
   .toolbar-actions {
@@ -1161,14 +1215,18 @@ select:focus-visible {
   }
 
   .segmented {
+    display: flex;
     width: 100%;
-    grid-auto-flow: row;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    overflow-x: auto;
+    scrollbar-width: thin;
+    scroll-snap-type: x proximity;
   }
 
   .segmented button {
-    padding: 0 7px;
+    flex: 0 0 auto;
+    padding: 0 12px;
     font-size: 13px;
+    scroll-snap-align: start;
   }
 
   .media-grid {
