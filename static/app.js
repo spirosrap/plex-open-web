@@ -19,6 +19,9 @@ const state = {
   surpriseInProgress: false,
   watchStateRatingKey: null,
   detailsItem: null,
+  collectionItem: null,
+  collectionMembership: null,
+  collectionUpdating: new Set(),
   playerItem: null,
   playerNeighbors: null,
   autoplayNext: true,
@@ -97,7 +100,14 @@ const el = {
   detailsSubtitles: document.querySelector("#details-subtitles"),
   detailsWatchState: document.querySelector("#details-watch-state"),
   detailsMyList: document.querySelector("#details-my-list"),
+  detailsCollections: document.querySelector("#details-collections"),
   detailsClose: document.querySelector("#details-close"),
+  collectionDialog: document.querySelector("#collection-dialog"),
+  collectionTitle: document.querySelector("#collection-title"),
+  collectionFilter: document.querySelector("#collection-filter"),
+  collectionStatus: document.querySelector("#collection-status"),
+  collectionList: document.querySelector("#collection-list"),
+  collectionClose: document.querySelector("#collection-close"),
   playerDialog: document.querySelector("#player-dialog"),
   playerTitle: document.querySelector("#player-title"),
   playbackMode: document.querySelector("#playback-mode"),
@@ -766,10 +776,136 @@ function openDetails(item) {
       ? "Remove from My List"
       : "Add to My List";
   el.detailsMyList.onclick = () => setMyList(item, !inMyList);
+  const canManageCollections = Boolean(item.ratingKey && item.type === "movie");
+  const collectionCount = Array.isArray(item.collections) ? item.collections.length : 0;
+  el.detailsCollections.hidden = !canManageCollections;
+  el.detailsCollections.textContent = collectionCount ? `Collections (${collectionCount})` : "Collections";
+  el.detailsCollections.onclick = () => openCollectionMembership(item);
   if (!el.detailsDialog.open) {
     el.detailsDialog.showModal();
   }
   loadDetailsEpisodeActions(item);
+}
+
+function setCollectionStatus(message, kind = "muted") {
+  el.collectionStatus.textContent = message;
+  el.collectionStatus.dataset.kind = kind;
+}
+
+function renderCollectionMembership() {
+  const data = state.collectionMembership;
+  const query = el.collectionFilter.value.trim().toLowerCase();
+  const collections = (data?.collections || []).filter((collection) =>
+    !query || collection.title.toLowerCase().includes(query)
+  );
+  el.collectionList.innerHTML = "";
+  if (!data) {
+    setCollectionStatus("Loading collections...");
+    return;
+  }
+  if (!collections.length) {
+    setCollectionStatus(query ? "No collections match this filter." : "This library has no collections.");
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const collection of collections) {
+    const row = document.createElement("label");
+    row.className = `collection-row${collection.editable ? "" : " is-readonly"}`;
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = Boolean(collection.member);
+    checkbox.disabled = !collection.editable || state.collectionUpdating.has(collection.ratingKey);
+    checkbox.setAttribute("aria-label", `${collection.member ? "Remove from" : "Add to"} ${collection.title}`);
+    checkbox.addEventListener("change", () => {
+      setCollectionMembership(collection, checkbox.checked);
+    });
+
+    const label = document.createElement("span");
+    const title = document.createElement("strong");
+    title.textContent = collection.title;
+    label.append(title);
+    if (!collection.editable) {
+      const note = document.createElement("small");
+      note.textContent = "Smart collection - managed automatically by Plex";
+      label.append(note);
+    }
+    const count = document.createElement("span");
+    count.className = "collection-count";
+    count.textContent = `${collection.childCount} ${collection.childCount === 1 ? "movie" : "movies"}`;
+    row.append(checkbox, label, count);
+    fragment.append(row);
+  }
+  el.collectionList.append(fragment);
+  const memberCount = data.collections.filter((collection) => collection.member).length;
+  setCollectionStatus(`${memberCount} of ${data.collections.length} collections selected.`);
+}
+
+async function openCollectionMembership(item) {
+  if (!item?.ratingKey || item.type !== "movie") return;
+  state.collectionItem = item;
+  state.collectionMembership = null;
+  state.collectionUpdating.clear();
+  el.collectionTitle.textContent = `Collections for ${displayTitle(item)}`;
+  el.collectionFilter.value = "";
+  renderCollectionMembership();
+  if (!el.collectionDialog.open) {
+    el.collectionDialog.showModal();
+  }
+  try {
+    state.collectionMembership = await api(
+      `/api/collection-membership?${new URLSearchParams({ ratingKey: item.ratingKey })}`
+    );
+    if (state.collectionItem === item) {
+      Object.assign(item, state.collectionMembership.item || {});
+      renderCollectionMembership();
+      if (el.detailsDialog.open) openDetails(item);
+    }
+  } catch (error) {
+    setCollectionStatus(`Could not load collections: ${error.message}`, "error");
+  }
+}
+
+async function refreshOpenCollection() {
+  const current = state.stack.at(-1);
+  if (current?.item?.type !== "collection" || !current.item.ratingKey) return;
+  const data = await api(`/api/children/${encodeURIComponent(current.item.ratingKey)}`);
+  current.items = data.items || [];
+  renderItems(current.items);
+}
+
+async function setCollectionMembership(collection, member) {
+  const item = state.collectionItem;
+  if (!item?.ratingKey || !collection?.ratingKey || state.collectionUpdating.has(collection.ratingKey)) return;
+  state.collectionUpdating.add(collection.ratingKey);
+  renderCollectionMembership();
+  setCollectionStatus(`${member ? "Adding to" : "Removing from"} ${collection.title}...`);
+  let resultStatus = null;
+  try {
+    const data = await api("/api/collection-membership", {
+      method: "POST",
+      body: JSON.stringify({
+        ratingKey: item.ratingKey,
+        collectionRatingKey: collection.ratingKey,
+        member,
+      }),
+    });
+    state.collectionMembership = data;
+    Object.assign(item, data.item || {});
+    if (el.detailsDialog.open) openDetails(item);
+    try {
+      await refreshOpenCollection();
+    } catch {
+      // The confirmed Plex membership remains authoritative if the background list refresh fails.
+    }
+    resultStatus = [`${member ? "Added to" : "Removed from"} ${collection.title}.`, "success"];
+  } catch (error) {
+    resultStatus = [`Could not update ${collection.title}: ${error.message}`, "error"];
+  } finally {
+    state.collectionUpdating.delete(collection.ratingKey);
+    renderCollectionMembership();
+    if (resultStatus) setCollectionStatus(...resultStatus);
+  }
 }
 
 async function setMyList(item, saved) {
@@ -2020,6 +2156,13 @@ for (const button of el.viewButtons) {
 el.detailsClose.addEventListener("click", () => el.detailsDialog.close());
 el.detailsDialog.addEventListener("close", () => {
   state.detailsItem = null;
+});
+el.collectionFilter.addEventListener("input", renderCollectionMembership);
+el.collectionClose.addEventListener("click", () => el.collectionDialog.close());
+el.collectionDialog.addEventListener("close", () => {
+  state.collectionItem = null;
+  state.collectionMembership = null;
+  state.collectionUpdating.clear();
 });
 el.autoplayNext.addEventListener("change", () => {
   state.autoplayNext = el.autoplayNext.checked;

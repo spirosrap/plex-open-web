@@ -129,9 +129,23 @@
             <button id="details-subtitles" class="secondary-button">Subtitles</button>
             <button id="details-watch-state" class="secondary-button">Mark watched</button>
             <button id="details-my-list" class="secondary-button">Add to My List</button>
+            <button id="details-collections" class="secondary-button" hidden>Collections</button>
           </div>
         </section>
       </div>
+    </dialog>
+
+    <dialog id="collection-dialog" class="collection-dialog">
+      <header class="collection-head">
+        <div>
+          <p>Plex collections</p>
+          <h2 id="collection-title">Manage collections</h2>
+        </div>
+        <button id="collection-close" class="icon-button" aria-label="Close">x</button>
+      </header>
+      <input id="collection-filter" type="search" placeholder="Filter collections" autocomplete="off" />
+      <div id="collection-status" class="collection-status" aria-live="polite"></div>
+      <section id="collection-list" class="collection-list" aria-live="polite"></section>
     </dialog>
 
     <dialog id="player-dialog" class="player-dialog">

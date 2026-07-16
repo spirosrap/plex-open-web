@@ -9,6 +9,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Password-protected web UI with signed HttpOnly session cookies.
 - Library list, continue/recent/all/unwatched views, persistent genre filtering, sorting, and search.
 - Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
+- Movie collection membership management with searchable, immediate add/remove controls.
 - Server-backed My List shared with the Android app, with per-library browsing and poster badges.
 - Surprise Me selection for opening a random item from the active genre and Unwatched filters.
 - Persistent library, view, genre, and sort context across reloads and sign-in sessions.
@@ -28,6 +29,25 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.11.0
+
+**Added**
+
+- Added a Collections action to movie details for adding or removing the movie from existing Plex collections.
+- Added a searchable collection checklist with membership counts and immediate updates.
+
+**Improved**
+
+- Collection changes use Plex's native collection IDs and refresh membership from Plex after every operation.
+- Collection counts in movie details and open collection contents update without a page reload.
+- Smart collections remain visible with a clear read-only explanation because Plex controls their membership automatically.
+
+**Fixed**
+
+- Collection membership is validated against the movie's library before Plex is changed.
+- Invalid item IDs, invalid collection IDs, unsupported media types, and non-boolean membership requests are rejected.
+- Repeated add or remove requests are idempotent and do not issue duplicate Plex mutations.
 
 ### 0.10.0
 

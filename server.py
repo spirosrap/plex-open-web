@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.11.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -1031,6 +1031,13 @@ def item_from_xml(elem: ET.Element) -> Dict[str, Any]:
         "leafCount": to_int(elem.get("leafCount")),
         "viewedLeafCount": to_int(elem.get("viewedLeafCount")),
         "childCount": to_int(elem.get("childCount")),
+        "subtype": elem.get("subtype"),
+        "smart": elem.get("smart") in {"1", "true", "True"},
+        "collections": [
+            {"id": child.get("id"), "tag": child.get("tag")}
+            for child in elem.findall("Collection")
+            if child.get("tag")
+        ],
         "thumb": elem.get("thumb"),
         "art": elem.get("art"),
         "posterUrl": image_url(elem.get("thumb")),
@@ -1904,6 +1911,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/my-list":
             self.api_my_list(method, query)
             return
+        if path == "/api/collection-membership":
+            self.api_collection_membership(method, query)
+            return
         if path == "/api/library-scan":
             self.api_library_scan(method)
             return
@@ -2179,6 +2189,124 @@ class AppHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def collection_membership(self, rating_key: str) -> Dict[str, Any]:
+        metadata_root = PLEX.xml(
+            f"/library/metadata/{urllib.parse.quote(rating_key)}",
+            params={"includeCollections": "1"},
+        )
+        movie_elem = next(iter(metadata_root), None)
+        if movie_elem is None:
+            raise LookupError("metadata_not_found")
+        if movie_elem.get("type") != "movie":
+            raise ValueError("unsupported_media_type")
+        section_key = movie_elem.get("librarySectionID") or ""
+        if not re.fullmatch(r"\d+", section_key):
+            raise ValueError("invalid_library_section")
+
+        collections_root = PLEX.xml(
+            f"/library/sections/{section_key}/collections",
+            params={
+                "sort": "titleSort",
+                "X-Plex-Container-Start": 0,
+                "X-Plex-Container-Size": 500,
+            },
+        )
+        member_titles = {
+            child.get("tag")
+            for child in movie_elem.findall("Collection")
+            if child.get("tag")
+        }
+        collections = []
+        for elem in list(collections_root):
+            if elem.get("type") != "collection" or elem.get("subtype") not in {None, "movie"}:
+                continue
+            title = elem.get("title") or "Untitled collection"
+            smart = elem.get("smart") in {"1", "true", "True"}
+            collections.append(
+                {
+                    "ratingKey": elem.get("ratingKey"),
+                    "title": title,
+                    "smart": smart,
+                    "editable": not smart,
+                    "member": title in member_titles,
+                    "childCount": to_int(elem.get("childCount")) or 0,
+                }
+            )
+        collections.sort(key=lambda collection: collection["title"].casefold())
+        item = item_from_xml(movie_elem)
+        return {
+            "ratingKey": rating_key,
+            "librarySectionID": section_key,
+            "item": item,
+            "collections": collections,
+            "memberCount": sum(1 for collection in collections if collection["member"]),
+        }
+
+    def api_collection_membership(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method == "GET":
+            rating_key = one(query, "ratingKey", "").strip()
+        elif method == "POST":
+            payload = self.read_json()
+            rating_key = str(payload.get("ratingKey", "")).strip()
+        else:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        if not re.fullmatch(r"\d+", rating_key):
+            self.send_json({"error": "invalid_rating_key"}, status=400)
+            return
+
+        try:
+            membership = self.collection_membership(rating_key)
+        except LookupError as exc:
+            self.send_json({"error": str(exc)}, status=404)
+            return
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        if method == "GET":
+            self.send_json(membership)
+            return
+
+        collection_key = str(payload.get("collectionRatingKey", "")).strip()
+        member = payload.get("member")
+        if not re.fullmatch(r"\d+", collection_key):
+            self.send_json({"error": "invalid_collection_rating_key"}, status=400)
+            return
+        if not isinstance(member, bool):
+            self.send_json({"error": "invalid_member_state"}, status=400)
+            return
+        collection = next(
+            (item for item in membership["collections"] if item["ratingKey"] == collection_key),
+            None,
+        )
+        if collection is None:
+            self.send_json({"error": "collection_not_found"}, status=404)
+            return
+        if not collection["editable"]:
+            self.send_json({"error": "smart_collection_read_only"}, status=409)
+            return
+
+        if collection["member"] != member:
+            collection_path = f"/library/collections/{collection_key}/items"
+            if member:
+                server_root = PLEX.xml("/")
+                machine_id = server_root.get("machineIdentifier") or ""
+                if not machine_id:
+                    self.send_json({"error": "plex_machine_identifier_unavailable"}, status=502)
+                    return
+                uri = (
+                    f"server://{machine_id}/com.plexapp.plugins.library"
+                    f"/library/metadata/{rating_key}"
+                )
+                response = PLEX.open(collection_path, params={"uri": uri}, method="PUT")
+                response.close()
+            else:
+                response = PLEX.open(f"{collection_path}/{rating_key}", method="DELETE")
+                response.close()
+            membership = self.collection_membership(rating_key)
+
+        self.send_json({"ok": True, **membership})
+
     def api_library(self, path: str, query: Dict[str, List[str]]) -> None:
         section_key = path[len("/api/library/") :].strip("/").split("/", 1)[0]
         if not section_key:
@@ -2256,7 +2384,10 @@ class AppHandler(BaseHTTPRequestHandler):
         )
 
     def api_metadata(self, rating_key: str) -> None:
-        root = PLEX.xml(f"/library/metadata/{urllib.parse.quote(rating_key)}", params={"includeGuids": "1"})
+        root = PLEX.xml(
+            f"/library/metadata/{urllib.parse.quote(rating_key)}",
+            params={"includeGuids": "1", "includeCollections": "1"},
+        )
         items = items_from_container(root)
         self.send_json({"item": items[0] if items else None})
 
