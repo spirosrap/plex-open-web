@@ -631,6 +631,7 @@ select:focus-visible {
 
 .mini-primary,
 .mini-secondary,
+.mini-danger,
 .secondary-button,
 .icon-button {
   min-height: 32px;
@@ -642,6 +643,11 @@ select:focus-visible {
 .icon-button {
   background: var(--panel-2);
   color: var(--text);
+}
+
+.mini-danger {
+  background: var(--danger-background);
+  color: var(--danger-text);
 }
 
 .danger-button {

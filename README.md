@@ -33,6 +33,32 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.14.0
+
+**Added**
+
+- Added one authenticated startup response containing session state, server identity, libraries, My List keys, genres, and the first media page.
+- Added a combined browse endpoint that loads a library's genres and first media page concurrently.
+- Added a visible Delete action to manual collection cards, with confirmation that the movies remain in Plex.
+- Added hover and keyboard-focus metadata prefetch plus in-flight request sharing, making Details and Play react faster without duplicate metadata calls.
+- Added direct server-side collection deletion by library and collection ID, while keeping smart collections read-only.
+
+**Improved**
+
+- Cold startup median fell from 110.9 ms to 61.2 ms in the release benchmark, while the slowest measured cold run fell from 531.4 ms to 87.9 ms.
+- Cold library switching fell from a 91.7 ms median to 54.8 ms, and warm startup fell from 5.12 ms to 3.02 ms.
+- Browse responses now use short private client caching with stale-on-error support, while server-side library and search entries remain mutation-aware.
+- Repeated metadata reads are coalesced and cached for ten seconds, with all API caches invalidated by mutations.
+- Plex browse requests no longer ask the server to compute GUID data that card rendering does not use.
+- Collection deletion updates the current grid immediately instead of forcing an extra library round trip.
+
+**Fixed**
+
+- Startup no longer performs separate session, bootstrap, genre, and media requests in sequence.
+- Signed-out startup checks do not contact Plex or expose library data.
+- A collection can now be deleted directly from the Collections view instead of requiring an unrelated movie as an entry point.
+- Smart collection deletion remains blocked in both the interface and server API.
+
 ### 0.13.0
 
 **Added**

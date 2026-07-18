@@ -189,7 +189,7 @@ def handler_with_payload(payload):
     handler = object.__new__(server.AppHandler)
     responses = []
     handler.read_json = lambda: payload
-    handler.send_json = lambda body, status=200, headers=None: responses.append((status, body))
+    handler.send_json = lambda body, status=200, headers=None, **kwargs: responses.append((status, body))
     return handler, responses
 
 
@@ -269,16 +269,30 @@ class PerformancePathTests(unittest.TestCase):
     def test_bootstrap_combines_server_libraries_and_my_list(self):
         plex = FakePlex()
         handler, responses = handler_with_payload({})
+        handler.is_authenticated = lambda: True
         with mock.patch.object(server, "PLEX", plex), mock.patch.object(
             server, "my_list_keys", return_value=["101"]
         ):
-            handler.api_bootstrap()
+            handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.13.0", responses[0][1]["version"])
+        self.assertEqual("0.14.0", responses[0][1]["version"])
+        self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
-        self.assertEqual(["/", "/library/sections"], [call[0] for call in plex.xml_calls])
+        self.assertEqual(["/library/sections", "/"], [call[0] for call in plex.xml_calls])
+
+    def test_bootstrap_returns_auth_state_without_touching_plex_when_signed_out(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        handler.is_authenticated = lambda: False
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_bootstrap("GET", {"includeBrowse": ["1"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertFalse(responses[0][1]["authenticated"])
+        self.assertEqual("0.14.0", responses[0][1]["version"])
+        self.assertEqual([], plex.xml_calls)
 
 
 class LibraryViewTests(unittest.TestCase):
@@ -310,6 +324,25 @@ class LibraryViewTests(unittest.TestCase):
         self.assertEqual("/library/sections/7/all", path)
         self.assertEqual("11", params["genre"])
         self.assertEqual("titleSort", params["sort"])
+        self.assertNotIn("includeGuids", params)
+
+    def test_browse_bundle_loads_filters_and_first_page_together(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_browse(
+                "/api/browse/7",
+                {"view": ["all"], "sort": ["addedAt:desc"], "start": ["0"], "limit": ["24"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("7", responses[0][1]["library"])
+        self.assertEqual("Action", responses[0][1]["genres"][0]["title"])
+        self.assertEqual("Pick 0", responses[0][1]["page"]["items"][0]["title"])
+        self.assertEqual(
+            {"/library/sections/7/genre", "/library/sections/7/all"},
+            {call[0] for call in plex.xml_calls},
+        )
 
     def test_library_view_rejects_an_invalid_genre_filter(self):
         handler, responses = handler_with_payload({})
@@ -569,6 +602,31 @@ class CollectionManagementTests(unittest.TestCase):
         self.assertEqual("/library/collections/101", plex.open_calls[0][0])
         self.assertEqual("DELETE", plex.open_calls[0][2]["method"])
         self.assertEqual("501", responses[0][1]["item"]["ratingKey"])
+
+    def test_deletes_collection_directly_from_library_view(self):
+        plex = FakeCollectionPlex()
+        handler, responses = handler_with_payload(
+            {"action": "delete", "sectionKey": "7", "collectionRatingKey": "101"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("101", responses[0][1]["collectionRatingKey"])
+        self.assertEqual("/library/collections/101", plex.open_calls[0][0])
+        self.assertNotIn("101", [item["ratingKey"] for item in plex.collections])
+
+    def test_rejects_direct_delete_for_smart_collection(self):
+        plex = FakeCollectionPlex()
+        handler, responses = handler_with_payload(
+            {"action": "delete", "sectionKey": "7", "collectionRatingKey": "102"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(409, responses[0][0])
+        self.assertEqual("smart_collection_read_only", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
 
     def test_rejects_duplicate_and_invalid_titles(self):
         plex = FakeCollectionPlex()

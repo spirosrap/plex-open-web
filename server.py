@@ -31,6 +31,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -38,13 +39,14 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.13.0"
+APP_VERSION = "0.14.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
 JSON_COMPRESSION_MIN_BYTES = 1024
+BROWSE_CACHE_CONTROL = "private, max-age=3, stale-if-error=86400"
 POSTER_WIDTH = 480
 POSTER_HEIGHT = 720
 ART_WIDTH = 1280
@@ -176,6 +178,7 @@ class TimedResultCache:
 
 
 API_CACHE = TimedResultCache()
+BROWSE_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="plex-browse")
 STATIC_CACHE_LOCK = threading.Lock()
 STATIC_CACHE: Dict[Path, Tuple[int, bytes]] = {}
 
@@ -1879,6 +1882,101 @@ def my_list_items(section_key: str = "") -> Tuple[List[str], List[Dict[str, Any]
     return keys, items
 
 
+def library_genres_for_section(section_key: str) -> List[Dict[str, Any]]:
+    def load() -> List[Dict[str, Any]]:
+        root = PLEX.xml(f"/library/sections/{urllib.parse.quote(section_key)}/genre")
+        genres = [
+            {"key": item.get("key"), "title": item.get("title")}
+            for item in root.findall("Directory")
+            if item.get("key") and item.get("title")
+        ]
+        genres.sort(key=lambda item: item["title"].casefold())
+        return genres
+
+    return API_CACHE.get_or_load(f"genres:{id(PLEX)}:{section_key}", 300.0, load)
+
+
+def library_page_for_section(section_key: str, query: Dict[str, List[str]]) -> Dict[str, Any]:
+    view = one(query, "view", "all")
+    start = max(0, to_int(one(query, "start", "0")) or 0)
+    limit = min(300, max(1, to_int(one(query, "limit", "48")) or 48))
+    sort = one(query, "sort", "")
+    genre = one(query, "genre", "").strip()
+    if genre and not re.fullmatch(r"\d+", genre):
+        raise ValueError("invalid_genre")
+    if view == "mylist":
+        keys, items = my_list_items(section_key)
+        total = len(items)
+        page = items[start : start + limit]
+        return {
+            "library": section_key,
+            "view": view,
+            "ratingKeys": keys,
+            "genre": None,
+            "start": start,
+            "limit": limit,
+            "size": len(page),
+            "totalSize": total,
+            "items": page,
+        }
+
+    params: Dict[str, Any] = {
+        "includeCollections": "1",
+        "X-Plex-Container-Start": start,
+        "X-Plex-Container-Size": limit,
+    }
+    endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/all"
+    if view == "continue":
+        endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/onDeck"
+        start = 0
+        limit = 300
+        params["X-Plex-Container-Start"] = start
+        params["X-Plex-Container-Size"] = limit
+    elif view == "recent":
+        endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/recentlyAdded"
+    elif view == "unwatched":
+        params["unwatched"] = "1"
+    elif view == "collections":
+        endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/collections"
+        params["sort"] = "titleSort"
+    active_genre = genre if view != "collections" else ""
+    if active_genre:
+        params["genre"] = active_genre
+    if sort and view not in {"continue", "collections"}:
+        params["sort"] = sort
+    cache_key = ":".join(
+        ["library", str(id(PLEX)), section_key, view, sort, active_genre, str(start), str(limit)]
+    )
+
+    def load() -> Dict[str, Any]:
+        root = PLEX.xml(endpoint, params=params)
+        items = items_from_container(root)
+        if view == "continue":
+            items = [item for item in items if not item.get("viewCount")]
+        return {
+            "library": section_key,
+            "view": view,
+            "genre": active_genre or None,
+            "start": start,
+            "limit": limit,
+            "size": len(items) if view == "continue" else to_int(root.get("size")),
+            "totalSize": len(items) if view == "continue" else to_int(root.get("totalSize")),
+            "items": items,
+        }
+
+    return API_CACHE.get_or_load(cache_key, 3.0, load)
+
+
+def browse_bundle(section_key: str, query: Dict[str, List[str]]) -> Dict[str, Any]:
+    genres_future = BROWSE_EXECUTOR.submit(library_genres_for_section, section_key)
+    page_future = BROWSE_EXECUTOR.submit(library_page_for_section, section_key, query)
+    return {
+        "library": section_key,
+        "genres": genres_future.result(),
+        "page": page_future.result(),
+    }
+
+
 class AppHandler(BaseHTTPRequestHandler):
     server_version = f"PlexOpenWeb/{APP_VERSION}"
     protocol_version = "HTTP/1.1"
@@ -1916,6 +2014,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.handle_login(method)
             elif path == "/api/logout":
                 self.handle_logout(method)
+            elif path == "/api/bootstrap":
+                self.api_bootstrap(method, query)
             elif path.startswith("/api/"):
                 self.require_auth()
                 self.handle_api(method, path, query)
@@ -1945,7 +2045,13 @@ class AppHandler(BaseHTTPRequestHandler):
         if not self.is_authenticated():
             raise AuthError()
 
-    def send_json(self, payload: Any, status: int = 200, headers: Optional[Dict[str, str]] = None) -> None:
+    def send_json(
+        self,
+        payload: Any,
+        status: int = 200,
+        headers: Optional[Dict[str, str]] = None,
+        cache_control: str = "no-store",
+    ) -> None:
         body = json_bytes(payload)
         compressed = False
         accept_encoding = self.headers.get("Accept-Encoding", "") if hasattr(self, "headers") else ""
@@ -1954,7 +2060,7 @@ class AppHandler(BaseHTTPRequestHandler):
             compressed = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache_control)
         self.send_header("X-Content-Type-Options", "nosniff")
         if compressed:
             self.send_header("Content-Encoding", "gzip")
@@ -2102,8 +2208,6 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/server":
             self.api_server()
-        elif path == "/api/bootstrap":
-            self.api_bootstrap()
         elif path == "/api/libraries":
             self.api_libraries()
         elif path == "/api/random-item":
@@ -2112,6 +2216,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.api_episode_neighbors(query)
         elif path.startswith("/api/library/") and path.endswith("/genres"):
             self.api_library_genres(path)
+        elif path.startswith("/api/browse/"):
+            self.api_browse(path, query)
         elif path.startswith("/api/library/"):
             self.api_library(path, query)
         elif path.startswith("/api/metadata/"):
@@ -2146,15 +2252,42 @@ class AppHandler(BaseHTTPRequestHandler):
     def api_server(self) -> None:
         self.send_json(cached_server_info())
 
-    def api_bootstrap(self) -> None:
-        self.send_json(
+    def api_bootstrap(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method not in {"GET", "HEAD"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        authenticated = self.is_authenticated()
+        payload: Dict[str, Any] = {
+            "authenticated": authenticated,
+            "authRequired": not Settings.disable_auth,
+            "version": APP_VERSION,
+        }
+        if not authenticated:
+            self.send_json(payload)
+            return
+
+        libraries = cached_libraries()
+        requested_key = one(query, "libraryKey", "").strip()
+        selected = next(
+            (library for library in libraries if str(library.get("key") or "") == requested_key),
+            libraries[0] if libraries else None,
+        )
+        payload.update(
             {
                 "server": cached_server_info(),
-                "libraries": cached_libraries(),
+                "libraries": libraries,
                 "ratingKeys": my_list_keys(),
-                "version": APP_VERSION,
+                "selectedLibraryKey": selected.get("key") if selected else None,
             }
         )
+        include_browse = one(query, "includeBrowse", "").strip().lower() in {"1", "true", "yes", "on"}
+        if include_browse and selected and re.fullmatch(r"\d+", str(selected.get("key") or "")):
+            try:
+                payload["browse"] = browse_bundle(str(selected["key"]), query)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, status=400)
+                return
+        self.send_json(payload)
 
     def api_libraries(self) -> None:
         self.send_json({"libraries": cached_libraries()})
@@ -2164,18 +2297,22 @@ class AppHandler(BaseHTTPRequestHandler):
         if not re.fullmatch(r"\d+", section_key):
             self.send_json({"error": "invalid_section"}, status=400)
             return
-        def load() -> List[Dict[str, Any]]:
-            root = PLEX.xml(f"/library/sections/{urllib.parse.quote(section_key)}/genre")
-            genres = [
-                {"key": item.get("key"), "title": item.get("title")}
-                for item in root.findall("Directory")
-                if item.get("key") and item.get("title")
-            ]
-            genres.sort(key=lambda item: item["title"].casefold())
-            return genres
+        self.send_json(
+            {"library": section_key, "genres": library_genres_for_section(section_key)},
+            cache_control=BROWSE_CACHE_CONTROL,
+        )
 
-        genres = API_CACHE.get_or_load(f"genres:{id(PLEX)}:{section_key}", 300.0, load)
-        self.send_json({"library": section_key, "genres": genres})
+    def api_browse(self, path: str, query: Dict[str, List[str]]) -> None:
+        section_key = path[len("/api/browse/") :].strip("/").split("/", 1)[0]
+        if not re.fullmatch(r"\d+", section_key):
+            self.send_json({"error": "invalid_section"}, status=400)
+            return
+        try:
+            payload = browse_bundle(section_key, query)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
+            return
+        self.send_json(payload, cache_control=BROWSE_CACHE_CONTROL)
 
     def api_random_item(self, query: Dict[str, List[str]]) -> None:
         section_key = one(query, "sectionKey", "").strip()
@@ -2489,6 +2626,41 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "invalid_collection_action"}, status=400)
             return
         rating_key = str(payload.get("ratingKey", "")).strip()
+        section_key = str(payload.get("sectionKey", "")).strip()
+        collection_key = str(payload.get("collectionRatingKey", "")).strip()
+        if action == "delete" and not rating_key and section_key:
+            if not re.fullmatch(r"\d+", section_key):
+                self.send_json({"error": "invalid_section"}, status=400)
+                return
+            if not re.fullmatch(r"\d+", collection_key):
+                self.send_json({"error": "invalid_collection_rating_key"}, status=400)
+                return
+            root = PLEX.xml(
+                f"/library/sections/{section_key}/collections",
+                params={"X-Plex-Container-Start": 0, "X-Plex-Container-Size": 500},
+            )
+            collection_elem = next(
+                (elem for elem in root if elem.get("ratingKey") == collection_key),
+                None,
+            )
+            if collection_elem is None:
+                self.send_json({"error": "collection_not_found"}, status=404)
+                return
+            if str(collection_elem.get("smart") or "").lower() in {"1", "true"}:
+                self.send_json({"error": "smart_collection_read_only"}, status=409)
+                return
+            response = PLEX.open(f"/library/collections/{collection_key}", method="DELETE")
+            response.close()
+            self.send_json(
+                {
+                    "ok": True,
+                    "action": "delete",
+                    "sectionKey": section_key,
+                    "collectionRatingKey": collection_key,
+                    "title": collection_elem.get("title") or "Collection",
+                }
+            )
+            return
         if not re.fullmatch(r"\d+", rating_key):
             self.send_json({"error": "invalid_rating_key"}, status=400)
             return
@@ -2512,7 +2684,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
 
         collection = None
-        collection_key = str(payload.get("collectionRatingKey", "")).strip()
         if action in {"rename", "delete"}:
             if not re.fullmatch(r"\d+", collection_key):
                 self.send_json({"error": "invalid_collection_rating_key"}, status=400)
@@ -2586,92 +2757,27 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def api_library(self, path: str, query: Dict[str, List[str]]) -> None:
         section_key = path[len("/api/library/") :].strip("/").split("/", 1)[0]
-        if not section_key:
-            self.send_json({"error": "missing_section"}, status=400)
+        if not re.fullmatch(r"\d+", section_key):
+            self.send_json({"error": "invalid_section"}, status=400)
             return
-        view = one(query, "view", "all")
-        start = max(0, to_int(one(query, "start", "0")) or 0)
-        limit = min(300, max(1, to_int(one(query, "limit", "48")) or 48))
-        sort = one(query, "sort", "")
-        genre = one(query, "genre", "").strip()
-        if genre and not re.fullmatch(r"\d+", genre):
-            self.send_json({"error": "invalid_genre"}, status=400)
+        try:
+            payload = library_page_for_section(section_key, query)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, status=400)
             return
-        if view == "mylist":
-            if not re.fullmatch(r"\d+", section_key):
-                self.send_json({"error": "invalid_section"}, status=400)
-                return
-            keys, items = my_list_items(section_key)
-            total = len(items)
-            page = items[start : start + limit]
-            self.send_json(
-                {
-                    "library": section_key,
-                    "view": view,
-                    "ratingKeys": keys,
-                    "genre": None,
-                    "start": start,
-                    "limit": limit,
-                    "size": len(page),
-                    "totalSize": total,
-                    "items": page,
-                }
-            )
-            return
-        params: Dict[str, Any] = {
-            "includeGuids": "1",
-            "includeCollections": "1",
-            "X-Plex-Container-Start": start,
-            "X-Plex-Container-Size": limit,
-        }
-        endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/all"
-        if view == "continue":
-            endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/onDeck"
-            start = 0
-            limit = 300
-            params["X-Plex-Container-Start"] = start
-            params["X-Plex-Container-Size"] = limit
-        elif view == "recent":
-            endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/recentlyAdded"
-        elif view == "unwatched":
-            params["unwatched"] = "1"
-        elif view == "collections":
-            endpoint = f"/library/sections/{urllib.parse.quote(section_key)}/collections"
-            params["sort"] = "titleSort"
-        active_genre = genre if view != "collections" else ""
-        if active_genre:
-            params["genre"] = active_genre
-        if sort and view not in {"continue", "collections"}:
-            params["sort"] = sort
-        cache_key = ":".join(
-            ["library", str(id(PLEX)), section_key, view, sort, active_genre, str(start), str(limit)]
-        )
-
-        def load() -> Dict[str, Any]:
-            root = PLEX.xml(endpoint, params=params)
-            items = items_from_container(root)
-            if view == "continue":
-                items = [item for item in items if not item.get("viewCount")]
-            return {
-                "library": section_key,
-                "view": view,
-                "genre": active_genre or None,
-                "start": start,
-                "limit": limit,
-                "size": len(items) if view == "continue" else to_int(root.get("size")),
-                "totalSize": len(items) if view == "continue" else to_int(root.get("totalSize")),
-                "items": items,
-            }
-
-        self.send_json(API_CACHE.get_or_load(cache_key, 1.0, load))
+        self.send_json(payload, cache_control=BROWSE_CACHE_CONTROL)
 
     def api_metadata(self, rating_key: str) -> None:
-        root = PLEX.xml(
-            f"/library/metadata/{urllib.parse.quote(rating_key)}",
-            params={"includeGuids": "1", "includeCollections": "1"},
-        )
-        items = items_from_container(root, detailed=True)
-        self.send_json({"item": items[0] if items else None})
+        def load() -> Dict[str, Any]:
+            root = PLEX.xml(
+                f"/library/metadata/{urllib.parse.quote(rating_key)}",
+                params={"includeGuids": "1", "includeCollections": "1"},
+            )
+            items = items_from_container(root, detailed=True)
+            return {"item": items[0] if items else None}
+
+        payload = API_CACHE.get_or_load(f"metadata:{id(PLEX)}:{rating_key}", 10.0, load)
+        self.send_json(payload, cache_control=BROWSE_CACHE_CONTROL)
 
     def api_children(self, rating_key: str) -> None:
         def load() -> Dict[str, Any]:
@@ -2683,7 +2789,8 @@ class AppHandler(BaseHTTPRequestHandler):
             }
 
         self.send_json(
-            API_CACHE.get_or_load(f"children:{id(PLEX)}:{rating_key}", 2.0, load)
+            API_CACHE.get_or_load(f"children:{id(PLEX)}:{rating_key}", 5.0, load),
+            cache_control=BROWSE_CACHE_CONTROL,
         )
 
     def api_episode_neighbors(self, query: Dict[str, List[str]]) -> None:
@@ -2720,7 +2827,10 @@ class AppHandler(BaseHTTPRequestHandler):
             return {"query": search_query, "items": items[:150]}
 
         key = f"search:{id(PLEX)}:{search_query.casefold()}"
-        self.send_json(API_CACHE.get_or_load(key, 1.0, load))
+        self.send_json(
+            API_CACHE.get_or_load(key, 5.0, load),
+            cache_control=BROWSE_CACHE_CONTROL,
+        )
 
     def handle_image(self, method: str, query: Dict[str, List[str]]) -> None:
         if method not in {"GET", "HEAD"}:

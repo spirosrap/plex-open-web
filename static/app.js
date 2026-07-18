@@ -19,6 +19,7 @@ const state = {
   libraryAbortController: null,
   searchRequestId: 0,
   searchAbortController: null,
+  metadataRequests: new Map(),
   scanInProgress: false,
   surpriseInProgress: false,
   watchStateRatingKey: null,
@@ -359,6 +360,10 @@ function itemCanOpen(item) {
   return ["show", "season", "collection"].includes(item.type);
 }
 
+function itemIsPlayable(item) {
+  return ["movie", "episode"].includes(item.type);
+}
+
 function renderLibraries() {
   el.libraries.innerHTML = "";
   for (const library of state.libraries) {
@@ -431,9 +436,9 @@ function createMediaCard(item, index) {
       <h3>${escapeHtml(item.title)}</h3>
       <p>${escapeHtml(labelFor(item))}</p>
       <div class="card-actions">
-        ${item.streamUrl ? '<button data-action="play" class="mini-primary">Play</button>' : ""}
+        ${itemIsPlayable(item) ? '<button data-action="play" class="mini-primary">Play</button>' : ""}
         ${item.type === "collection"
-          ? '<button data-action="open" class="mini-secondary">Open</button>'
+          ? `<button data-action="open" class="mini-secondary">Open</button>${item.smart ? "" : '<button data-action="delete-collection" class="mini-danger">Delete</button>'}`
           : '<button data-action="details" class="mini-secondary">Details</button>'}
       </div>
     </div>
@@ -521,27 +526,80 @@ function updateLoadMore() {
   }
 }
 
+function browseRequestParams(libraryKey, { start = 0, includeBrowse = false } = {}) {
+  const savedGenre = state.genreKeysByLibrary[libraryKey] || "";
+  const genre = ["collections", "mylist"].includes(state.selectedView) ? "" : savedGenre;
+  const params = new URLSearchParams({
+    view: state.selectedView,
+    sort: state.sort,
+    genre,
+    start: String(start),
+    limit: String(state.pageSize),
+  });
+  if (includeBrowse) {
+    params.set("includeBrowse", "1");
+    if (libraryKey) params.set("libraryKey", libraryKey);
+  }
+  return params;
+}
+
+function applyGenres(libraryKey, genres) {
+  state.genres = genres || [];
+  state.genresLoading = false;
+  const savedGenre = state.genreKeysByLibrary[libraryKey];
+  const invalidSavedGenre = Boolean(savedGenre && !state.genres.some((genre) => genre.key === savedGenre));
+  if (invalidSavedGenre) delete state.genreKeysByLibrary[libraryKey];
+  renderGenreFilter();
+  persistBrowsePreferences();
+  return invalidSavedGenre;
+}
+
+function applyLibraryPage(data, { append = false } = {}) {
+  if (state.selectedView === "mylist" && data.ratingKeys) {
+    state.myListKeys = new Set(data.ratingKeys.map(String));
+  }
+  const incoming = data.items || [];
+  state.libraryStart = Number(data.start || 0);
+  state.libraryTotal = data.totalSize || data.size || 0;
+  renderItems(append ? [...state.currentItems, ...incoming] : incoming, { append });
+}
+
 async function loadLibraries() {
-  setStatus("Loading libraries...");
-  const data = await api("/api/bootstrap");
-  el.serverName.textContent = data.server?.friendlyName || "Plex server";
+  const params = browseRequestParams(state.preferredLibraryKey, { includeBrowse: true });
+  const data = await api(`/api/bootstrap?${params}`);
   showVersion(data.version);
+  if (!data.authenticated && data.authRequired) {
+    showLogin();
+    return false;
+  }
+  showApp();
+  el.serverName.textContent = data.server?.friendlyName || "Plex server";
   state.myListKeys = new Set((data.ratingKeys || []).map(String));
   state.libraries = data.libraries || [];
-  state.selectedLibrary = state.libraries.find((library) => library.key === state.preferredLibraryKey)
+  const selectedKey = String(data.selectedLibraryKey || state.preferredLibraryKey || "");
+  state.selectedLibrary = state.libraries.find((library) => String(library.key) === selectedKey)
     || state.libraries[0]
     || null;
   state.preferredLibraryKey = state.selectedLibrary?.key || "";
+  state.stack = [];
   resetLibraryPaging();
   syncBrowseControls();
   persistBrowsePreferences();
   renderLibraries();
-  if (state.selectedLibrary) {
-    await loadGenres();
-    await loadLibrary();
-  } else {
+  if (!state.selectedLibrary) {
     renderItems([]);
+    return true;
   }
+  const bundle = data.browse;
+  if (bundle && String(bundle.library) === String(state.selectedLibrary.key)) {
+    const invalidGenre = applyGenres(state.selectedLibrary.key, bundle.genres);
+    if (!invalidGenre) {
+      applyLibraryPage(bundle.page || {});
+      return true;
+    }
+  }
+  await loadBrowse();
+  return true;
 }
 
 async function selectLibrary(key) {
@@ -552,33 +610,58 @@ async function selectLibrary(key) {
   resetLibraryPaging();
   persistBrowsePreferences();
   renderLibraries();
-  await loadGenres();
-  await loadLibrary();
+  await loadBrowse();
 }
 
-async function loadGenres() {
-  if (!state.selectedLibrary) return;
+async function loadBrowse() {
+  if (!state.selectedLibrary) return false;
+  state.libraryAbortController?.abort();
+  const controller = new AbortController();
+  state.libraryAbortController = controller;
+  const requestId = ++state.libraryRequestId;
   const libraryKey = state.selectedLibrary.key;
+  resetLibraryPaging();
   state.genres = [];
   state.genresLoading = true;
   renderGenreFilter();
+  setStatus("Loading library...");
+  if (state.currentItems.length) {
+    el.grid.classList.add("is-refreshing");
+    el.grid.setAttribute("aria-busy", "true");
+  } else {
+    renderLoadingGrid();
+  }
   try {
-    const data = await api(`/api/library/${encodeURIComponent(libraryKey)}/genres`);
-    if (state.selectedLibrary?.key !== libraryKey) return;
-    state.genres = data.genres || [];
-    const savedGenre = state.genreKeysByLibrary[libraryKey];
-    if (savedGenre && !state.genres.some((genre) => genre.key === savedGenre)) {
-      delete state.genreKeysByLibrary[libraryKey];
+    const params = browseRequestParams(libraryKey);
+    const bundle = await api(`/api/browse/${encodeURIComponent(libraryKey)}?${params}`, {
+      signal: controller.signal,
+    });
+    if (requestId !== state.libraryRequestId || state.selectedLibrary?.key !== libraryKey) return false;
+    const invalidGenre = applyGenres(libraryKey, bundle.genres);
+    if (invalidGenre) {
+      params.set("genre", "");
+      const page = await api(`/api/library/${encodeURIComponent(libraryKey)}?${params}`, {
+        signal: controller.signal,
+      });
+      if (requestId !== state.libraryRequestId) return false;
+      applyLibraryPage(page);
+    } else {
+      applyLibraryPage(bundle.page || {});
     }
-  } catch {
-    if (state.selectedLibrary?.key === libraryKey) {
-      state.genres = [];
-    }
+    return true;
+  } catch (error) {
+    if (error.name === "AbortError" || requestId !== state.libraryRequestId) return false;
+    if (!state.currentItems.length) el.grid.innerHTML = "";
+    setStatus(`Could not load library: ${error.message}`, "error");
+    return false;
   } finally {
-    if (state.selectedLibrary?.key === libraryKey) {
+    if (requestId === state.libraryRequestId) {
       state.genresLoading = false;
+      state.libraryAbortController = null;
+      el.grid.classList.remove("is-refreshing");
+      el.grid.setAttribute("aria-busy", "false");
       renderGenreFilter();
-      persistBrowsePreferences();
+      updateLoadMore();
     }
   }
 }
@@ -624,13 +707,7 @@ async function loadLibrary({ append = false } = {}) {
       signal: controller.signal,
     });
     if (requestId !== state.libraryRequestId) return false;
-    if (state.selectedView === "mylist" && data.ratingKeys) {
-      state.myListKeys = new Set(data.ratingKeys.map(String));
-    }
-    state.libraryStart = start;
-    state.libraryTotal = data.totalSize || data.size || 0;
-    const incoming = data.items || [];
-    renderItems(append ? [...state.currentItems, ...incoming] : incoming, { append });
+    applyLibraryPage(data, { append });
     return true;
   } catch (error) {
     if (error.name === "AbortError" || requestId !== state.libraryRequestId) return false;
@@ -771,7 +848,7 @@ function openDetails(item) {
     .map((value) => `<span>${escapeHtml(String(value))}</span>`)
     .join("");
   el.detailsMeta.innerHTML = meta;
-  el.detailsPlay.hidden = !item.streamUrl;
+  el.detailsPlay.hidden = !itemIsPlayable(item);
   el.detailsPlay.onclick = () => {
     el.detailsDialog.close();
     playItem(item);
@@ -781,7 +858,7 @@ function openDetails(item) {
     el.detailsDialog.close();
     await openChildren(item);
   };
-  el.detailsSubtitles.hidden = !item.streamUrl;
+  el.detailsSubtitles.hidden = !itemIsPlayable(item);
   el.detailsSubtitles.onclick = () => openSubtitleDialog(item);
   const canChangeWatchState = Boolean(item.ratingKey && ["movie", "episode"].includes(item.type));
   el.detailsWatchState.hidden = !canChangeWatchState;
@@ -811,6 +888,13 @@ function openDetails(item) {
     el.detailsDialog.showModal();
   }
   loadDetailsEpisodeActions(item);
+  if (item.ratingKey && !item._hydrated) {
+    hydrateItem(item).then(() => {
+      if (item._hydrated && state.detailsItem === item && el.detailsDialog.open) {
+        openDetails(item);
+      }
+    });
+  }
 }
 
 function setCollectionStatus(message, kind = "muted") {
@@ -1051,6 +1135,37 @@ async function deleteCollection(collection) {
   }
 }
 
+async function deleteCollectionFromLibrary(item) {
+  if (!state.selectedLibrary?.key || item?.type !== "collection" || !item.ratingKey || item.smart) return;
+  const libraryKey = state.selectedLibrary.key;
+  const requestId = state.libraryRequestId;
+  const confirmed = window.confirm(
+    `Delete ${item.title}? The movies will remain in your Plex library.`
+  );
+  if (!confirmed) return;
+  setStatus(`Deleting ${item.title}...`);
+  try {
+    await api("/api/collection-management", {
+      method: "POST",
+      body: JSON.stringify({
+        action: "delete",
+        sectionKey: libraryKey,
+        collectionRatingKey: item.ratingKey,
+      }),
+    });
+    if (state.selectedLibrary?.key !== libraryKey || state.libraryRequestId !== requestId) {
+      setStatus(`Deleted ${item.title}. Movies remain in the library.`, "success");
+      return;
+    }
+    const remaining = state.currentItems.filter((candidate) => candidate.ratingKey !== item.ratingKey);
+    state.libraryTotal = Math.max(0, state.libraryTotal - 1);
+    renderItems(remaining);
+    setStatus(`Deleted ${item.title}. Movies remain in the library.`, "success");
+  } catch (error) {
+    setStatus(`Could not delete collection: ${collectionErrorMessage(error.message)}`, "error");
+  }
+}
+
 async function refreshOpenCollection() {
   const current = state.stack.at(-1);
   if (current?.item?.type !== "collection" || !current.item.ratingKey) return;
@@ -1163,13 +1278,23 @@ async function hydrateItem(item) {
   if (!item.ratingKey || item._hydrated) {
     return item;
   }
+  if (item._metadataFailedAt && Date.now() - item._metadataFailedAt < 10000) {
+    return item;
+  }
+  const key = String(item.ratingKey);
+  let request = state.metadataRequests.get(key);
+  if (!request) {
+    request = api(`/api/metadata/${encodeURIComponent(key)}`)
+      .finally(() => state.metadataRequests.delete(key));
+    state.metadataRequests.set(key, request);
+  }
   try {
-    const data = await api(`/api/metadata/${encodeURIComponent(item.ratingKey)}`);
-    if (data.item) {
-      Object.assign(item, data.item, { _hydrated: true });
+    const data = await request;
+    if (data?.item) {
+      Object.assign(item, data.item, { _hydrated: true, _metadataFailedAt: 0 });
     }
   } catch {
-    item._hydrated = true;
+    item._metadataFailedAt = Date.now();
   }
   return item;
 }
@@ -2279,13 +2404,6 @@ function escapeAttr(value = "") {
 }
 
 async function boot() {
-  const me = await api("/api/me");
-  showVersion(me.version);
-  if (!me.authenticated && me.authRequired) {
-    showLogin();
-    return;
-  }
-  showApp();
   await loadLibraries();
 }
 
@@ -2297,7 +2415,6 @@ el.loginForm.addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify({ password: el.password.value.trim() }),
     });
-    showApp();
     await loadLibraries();
   } catch (error) {
     el.loginError.textContent = error.message === "invalid_password" ? "Invalid password." : error.message;
@@ -2321,6 +2438,18 @@ el.searchForm.addEventListener("submit", async (event) => {
   }
 });
 
+function prefetchCardMetadata(event) {
+  const card = event.target.closest(".media-card[data-item-index]");
+  if (!card) return;
+  const item = state.currentItems[Number(card.dataset.itemIndex)];
+  if (item?.ratingKey && itemIsPlayable(item) && !item._hydrated) {
+    hydrateItem(item).catch(() => {});
+  }
+}
+
+el.grid.addEventListener("pointerover", prefetchCardMetadata, { passive: true });
+el.grid.addEventListener("focusin", prefetchCardMetadata);
+
 el.grid.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
   const card = event.target.closest(".media-card[data-item-index]");
@@ -2330,6 +2459,8 @@ el.grid.addEventListener("click", (event) => {
   const action = button.dataset.action;
   if (action === "play") {
     playItem(item);
+  } else if (action === "delete-collection") {
+    deleteCollectionFromLibrary(item);
   } else if (action === "details") {
     openDetails(item);
   } else if (action === "open") {
