@@ -128,6 +128,21 @@ class FakeEpisodePlex(FakePlex):
         return super().xml(path, params=params)
 
 
+class FakeSubtitleSelectionPlex(FakePlex):
+    def xml(self, path, params=None):
+        self.xml_calls.append((path, dict(params or {})))
+        if path == "/library/metadata/801":
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                '<Video ratingKey="801" type="movie" title="Subtitle Test">'
+                '<Media><Part id="901" key="/library/parts/901/file.mkv">'
+                '<Stream id="1001" streamType="3" codec="srt" languageCode="ell" />'
+                '<Stream id="1002" streamType="3" codec="srt" languageCode="eng" />'
+                '</Part></Media></Video></MediaContainer>'
+            )
+        return super().xml(path, params=params)
+
+
 class FakeCollectionPlex(FakePlex):
     def __init__(self, member=False):
         super().__init__()
@@ -355,7 +370,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.17.0", responses[0][1]["version"])
+        self.assertEqual("0.18.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -370,7 +385,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.17.0", responses[0][1]["version"])
+        self.assertEqual("0.18.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -856,6 +871,51 @@ class WatchStateTests(unittest.TestCase):
 
         self.assertEqual(400, responses[0][0])
         self.assertEqual("invalid_watched_state", responses[0][1]["error"])
+
+
+class SubtitleSelectionTests(unittest.TestCase):
+    def setUp(self):
+        server.API_CACHE.clear()
+
+    def test_selects_a_valid_subtitle_stream_for_the_item_part(self):
+        plex = FakeSubtitleSelectionPlex()
+        handler, responses = handler_with_payload(
+            {"ratingKey": "801", "partId": "901", "streamId": "1002"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_subtitle_selection("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("1002", responses[0][1]["streamId"])
+        self.assertFalse(responses[0][1]["off"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/parts/901", path)
+        self.assertEqual({"subtitleStreamID": "1002", "allParts": "1"}, params)
+        self.assertEqual("PUT", kwargs["method"])
+
+    def test_persists_an_explicit_subtitles_off_choice(self):
+        plex = FakeSubtitleSelectionPlex()
+        handler, responses = handler_with_payload(
+            {"ratingKey": "801", "partId": "901", "streamId": "0"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_subtitle_selection("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertTrue(responses[0][1]["off"])
+        self.assertEqual("0", plex.open_calls[0][1]["subtitleStreamID"])
+
+    def test_rejects_a_subtitle_stream_outside_the_item_part(self):
+        plex = FakeSubtitleSelectionPlex()
+        handler, responses = handler_with_payload(
+            {"ratingKey": "801", "partId": "901", "streamId": "9999"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_subtitle_selection("POST")
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("subtitle_stream_not_found", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
 
 
 class CollectionMembershipTests(unittest.TestCase):

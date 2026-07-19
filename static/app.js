@@ -53,6 +53,7 @@ const state = {
   usingSavedPlayback: false,
   usingDevicePlayback: false,
   activeHlsSessionId: null,
+  subtitleSelectionPromise: Promise.resolve(),
   deviceSaveInProgress: false,
   deviceObjectUrls: [],
   subtitleItem: null,
@@ -62,6 +63,8 @@ const state = {
 const DEVICE_CACHE_MAX_BYTES = 12 * 1024 * 1024 * 1024;
 const DEVICE_CACHE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 const LOCAL_PROGRESS_KEY = "plex-open-web-progress-v1";
+const SUBTITLE_PREFERENCES_KEY = "plex-open-web-subtitle-preferences-v1";
+const SUBTITLE_PREFERENCES_MAX_ITEMS = 500;
 const THEME_KEY = "plex-open-web-theme-v1";
 const BROWSE_KEY = "plex-open-web-browse-v1";
 const AUTOPLAY_NEXT_KEY = "plex-open-web-autoplay-next-v1";
@@ -2181,6 +2184,101 @@ function clearSubtitleTracks() {
   el.subtitleLabel.hidden = true;
 }
 
+function subtitlePreferenceStore() {
+  try {
+    const value = JSON.parse(localStorage.getItem(SUBTITLE_PREFERENCES_KEY) || "{}");
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function subtitlePreferenceIdentity(subtitle) {
+  for (const [prefix, value] of [
+    ["id", subtitle?.id],
+    ["stream", subtitle?.streamId],
+    ["key", subtitle?.key],
+  ]) {
+    const normalized = String(value || "").trim();
+    if (normalized) {
+      return `${prefix}:${normalized}`;
+    }
+  }
+  return `meta:${[
+    subtitle?.source,
+    subtitle?.srclang || subtitle?.languageCode,
+    subtitle?.label || subtitle?.displayTitle || subtitle?.title,
+    subtitle?.codec,
+    subtitle?.forced ? "forced" : "",
+    subtitle?.hearingImpaired ? "sdh" : "",
+  ].map((value) => String(value || "").trim().toLowerCase()).join("|")}`;
+}
+
+function subtitlePreferenceFor(item) {
+  if (!item?.ratingKey) return null;
+  const entry = subtitlePreferenceStore()[item.ratingKey];
+  return entry && typeof entry.choice === "string" ? entry : null;
+}
+
+function rememberSubtitlePreference(item, index, subtitles = supportedSubtitles(item)) {
+  if (!item?.ratingKey) return;
+  const choice = index < 0 ? "off" : subtitlePreferenceIdentity(subtitles[index]);
+  if (!choice || choice === "meta:|||||") return;
+  const store = subtitlePreferenceStore();
+  store[item.ratingKey] = { choice, updatedAt: Date.now() };
+  const staleKeys = Object.entries(store)
+    .sort((left, right) => Number(right[1]?.updatedAt || 0) - Number(left[1]?.updatedAt || 0))
+    .slice(SUBTITLE_PREFERENCES_MAX_ITEMS)
+    .map(([ratingKey]) => ratingKey);
+  staleKeys.forEach((ratingKey) => delete store[ratingKey]);
+  try {
+    localStorage.setItem(SUBTITLE_PREFERENCES_KEY, JSON.stringify(store));
+  } catch {
+    // Plex persistence still applies when browser storage is unavailable.
+  }
+}
+
+function preferredSubtitleIndex(item, subtitles) {
+  const preference = subtitlePreferenceFor(item);
+  if (preference?.choice === "off") {
+    return -1;
+  }
+  if (preference?.choice) {
+    const rememberedIndex = subtitles.findIndex(
+      (subtitle) => subtitlePreferenceIdentity(subtitle) === preference.choice,
+    );
+    if (rememberedIndex >= 0) {
+      return rememberedIndex;
+    }
+  }
+  let selectedIndex = subtitles.findIndex((subtitle) => subtitle.selected);
+  if (selectedIndex < 0) {
+    selectedIndex = subtitles.findIndex((subtitle) => subtitle.default || subtitle.forced);
+  }
+  return selectedIndex;
+}
+
+async function persistSubtitleSelection(item, index) {
+  const subtitles = supportedSubtitles(item);
+  const subtitle = index >= 0 ? subtitles[index] : null;
+  const partId = String(subtitle?.partId || item?.media?.partId || "").trim();
+  const candidateStreamId = subtitle?.streamId || subtitle?.id;
+  const streamId = index < 0 ? "0" : String(candidateStreamId || "").trim();
+  if (!item?.ratingKey || !/^\d+$/.test(partId) || !/^\d+$/.test(streamId)) {
+    return { ok: true, plexSaved: false };
+  }
+  const data = await api("/api/subtitle-selection", {
+    method: "POST",
+    body: JSON.stringify({ ratingKey: item.ratingKey, partId, streamId }),
+    keepalive: true,
+  });
+  for (const candidate of item.subtitles || []) {
+    const candidateId = String(candidate.streamId || candidate.id || "");
+    candidate.selected = streamId !== "0" && candidateId === streamId;
+  }
+  return { ...data, plexSaved: true };
+}
+
 function disableAllTextTracks() {
   for (const track of [...el.player.textTracks]) {
     track.mode = "disabled";
@@ -2216,10 +2314,7 @@ function configureSubtitles(item) {
   }
   el.subtitleSelect.hidden = false;
   el.subtitleLabel.hidden = false;
-  let selectedIndex = subtitles.findIndex((subtitle) => subtitle.selected);
-  if (selectedIndex < 0) {
-    selectedIndex = subtitles.findIndex((subtitle) => subtitle.default || subtitle.forced);
-  }
+  const selectedIndex = preferredSubtitleIndex(item, subtitles);
   subtitles.forEach((subtitle, index) => {
     const option = document.createElement("option");
     option.value = String(index);
@@ -3076,7 +3171,16 @@ el.playerDialog.addEventListener("close", async () => {
   }
 });
 el.subtitleSelect.addEventListener("change", () => {
-  setActiveSubtitle(Number(el.subtitleSelect.value));
+  const index = Number(el.subtitleSelect.value);
+  const item = state.playerItem;
+  setActiveSubtitle(index);
+  rememberSubtitlePreference(item, index);
+  state.subtitleSelectionPromise = state.subtitleSelectionPromise
+    .catch(() => {})
+    .then(() => persistSubtitleSelection(item, index))
+    .catch((error) => {
+      setStatus(`Subtitle selected, but Plex could not remember it: ${error.message}`, "error");
+    });
 });
 el.player.addEventListener("play", () => {
   startProgressReporting();

@@ -22,7 +22,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Movie playback in the browser through a Range-aware stream proxy.
 - TV show navigation from show to season to episode.
 - Previous/next episode navigation with optional persisted autoplay and a cancellable Up Next countdown.
-- Browser subtitle selection from Plex subtitle streams and sidecar subtitle files.
+- Persistent per-item subtitle selection from Plex subtitle streams and sidecar subtitle files, including an explicit remembered Off choice.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
 - Seekable Plex VOD playback for Safari and Apple-device browsers when video or audio conversion is required.
@@ -35,6 +35,25 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.18.0
+
+**Added**
+
+- Added persistent subtitle choices for every movie and episode, including a remembered `Off` selection.
+- Added an authenticated subtitle-selection endpoint that validates the requested media part and subtitle stream before updating Plex.
+- Added a browser-side fallback for locally added subtitle files that Plex has not indexed yet.
+
+**Improved**
+
+- Reopening the player, reloading the web app, or switching between live, saved, and device playback restores the last subtitle selected for that item.
+- Plex-backed choices are shared with other Plex clients, while the app keeps its own stable per-item identity for sidecar and OpenSubtitles tracks.
+- Subtitle preferences are bounded to the 500 most recently changed items so browser storage remains small.
+
+**Fixed**
+
+- Fixed manually selected subtitles reverting to Plex's default track after the player or browser restarted.
+- Fixed an explicit `Off` choice being lost when the same movie or episode was opened again.
 
 ### 0.17.0
 

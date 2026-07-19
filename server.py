@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.17.0"
+APP_VERSION = "0.18.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -3643,6 +3643,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/watch-state":
             self.api_watch_state(method)
             return
+        if path == "/api/subtitle-selection":
+            self.api_subtitle_selection(method)
+            return
         if path == "/api/subtitle-download":
             self.api_subtitle_download(method)
             return
@@ -3943,6 +3946,59 @@ class AppHandler(BaseHTTPRequestHandler):
         if not watched:
             refreshed["viewOffset"] = 0
         self.send_json({"ok": True, "watched": watched, "item": refreshed})
+
+    def api_subtitle_selection(self, method: str) -> None:
+        if method != "POST":
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload = self.read_json()
+        rating_key = str(payload.get("ratingKey") or "").strip()
+        part_id = str(payload.get("partId") or "").strip()
+        stream_id = str(payload.get("streamId") or "").strip()
+        if not re.fullmatch(r"\d+", rating_key):
+            self.send_json({"error": "invalid_rating_key"}, status=400)
+            return
+        if not re.fullmatch(r"\d+", part_id):
+            self.send_json({"error": "invalid_part_id"}, status=400)
+            return
+        if not re.fullmatch(r"\d+", stream_id):
+            self.send_json({"error": "invalid_subtitle_stream_id"}, status=400)
+            return
+
+        elem = metadata_item_element(rating_key)
+        if elem is None:
+            self.send_json({"error": "metadata_not_found"}, status=404)
+            return
+        part = next(
+            (candidate for candidate in elem.findall(".//Part") if candidate.get("id") == part_id),
+            None,
+        )
+        if part is None:
+            self.send_json({"error": "subtitle_part_not_found"}, status=400)
+            return
+        if stream_id != "0" and not any(
+            stream.get("streamType") == "3" and stream.get("id") == stream_id
+            for stream in part.findall("Stream")
+        ):
+            self.send_json({"error": "subtitle_stream_not_found"}, status=400)
+            return
+
+        response = PLEX.open(
+            f"/library/parts/{urllib.parse.quote(part_id)}",
+            params={"subtitleStreamID": stream_id, "allParts": "1"},
+            method="PUT",
+        )
+        response.close()
+        API_CACHE.clear()
+        self.send_json(
+            {
+                "ok": True,
+                "ratingKey": rating_key,
+                "partId": part_id,
+                "streamId": stream_id,
+                "off": stream_id == "0",
+            }
+        )
 
     def api_my_list(self, method: str, query: Dict[str, List[str]]) -> None:
         if method == "POST":
