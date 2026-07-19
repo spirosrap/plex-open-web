@@ -2102,9 +2102,10 @@ function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } =
   el.playerError.hidden = true;
   el.playerError.textContent = "";
   clearSubtitleTracks();
+  const isHlsStream = new URL(streamUrl, window.location.origin).searchParams.get("format") === "hls";
   const applyResume = () => {
     reapplyActiveSubtitle();
-    if (resumeTime > 0 && Number.isFinite(resumeTime)) {
+    if ((isHlsStream || resumeTime > 0) && Number.isFinite(resumeTime)) {
       try {
         el.player.currentTime = Math.max(0, resumeTime);
       } catch {

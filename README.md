@@ -34,6 +34,17 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.15.3
+
+**Improved**
+
+- Native HLS playlists now declare the beginning as their preferred start point even while FFmpeg is still generating later segments.
+
+**Fixed**
+
+- New Safari playback now begins at the start of an episode instead of jumping to the newest segment generated ahead of real time.
+- Existing episode resume positions are still applied after HLS metadata becomes available.
+
 ### 0.15.2
 
 **Added**

@@ -277,7 +277,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.15.2", responses[0][1]["version"])
+        self.assertEqual("0.15.3", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -292,7 +292,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.15.2", responses[0][1]["version"])
+        self.assertEqual("0.15.3", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -334,6 +334,7 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         raw = "#EXTM3U\n#EXTINF:4.0,\nsegment-00000.ts\n#EXT-X-ENDLIST\n"
         manifest = server.hls_manifest_text("a" * 24, raw)
 
+        self.assertIn("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES", manifest)
         self.assertIn("/api/hls-segment?id=" + "a" * 24, manifest)
         self.assertIn("name=segment-00000.ts", manifest)
         with self.assertRaises(ValueError):

@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.15.2"
+APP_VERSION = "0.15.3"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -1161,6 +1161,7 @@ def hls_stream_command(part_key: str, output_dir: Path, remote_quality: bool = F
 
 def hls_manifest_text(playback_id: str, raw_manifest: str) -> str:
     lines: List[str] = []
+    has_start = "#EXT-X-START:" in raw_manifest
     for raw_line in raw_manifest.splitlines():
         line = raw_line.strip()
         if line and not line.startswith("#"):
@@ -1171,6 +1172,8 @@ def hls_manifest_text(playback_id: str, raw_manifest: str) -> str:
                 {"id": playback_id, "name": name}
             )
         lines.append(line)
+        if line == "#EXTM3U" and not has_start:
+            lines.append("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES")
     return "\n".join(lines) + "\n"
 
 
