@@ -277,7 +277,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.15.1", responses[0][1]["version"])
+        self.assertEqual("0.15.2", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -292,7 +292,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.15.1", responses[0][1]["version"])
+        self.assertEqual("0.15.2", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -315,6 +315,29 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertEqual("scale=-2:480", command[command.index("-vf") + 1])
         self.assertEqual("libx264", command[command.index("-c:v") + 1])
         self.assertEqual("96k", command[command.index("-b:a") + 1])
+
+    def test_hls_stream_uses_bounded_event_segments_for_native_safari_playback(self):
+        with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
+            command = server.hls_stream_command(
+                "/library/parts/42/file.mkv",
+                Path("/tmp/hls-test"),
+            )
+
+        self.assertEqual("copy", command[command.index("-c:v") + 1])
+        self.assertEqual("aac", command[command.index("-c:a") + 1])
+        self.assertEqual("4", command[command.index("-hls_time") + 1])
+        self.assertEqual("event", command[command.index("-hls_playlist_type") + 1])
+        self.assertEqual("mpegts", command[command.index("-hls_segment_type") + 1])
+        self.assertIn("temp_file", command[command.index("-hls_flags") + 1])
+
+    def test_hls_manifest_rewrites_only_valid_segment_paths(self):
+        raw = "#EXTM3U\n#EXTINF:4.0,\nsegment-00000.ts\n#EXT-X-ENDLIST\n"
+        manifest = server.hls_manifest_text("a" * 24, raw)
+
+        self.assertIn("/api/hls-segment?id=" + "a" * 24, manifest)
+        self.assertIn("name=segment-00000.ts", manifest)
+        with self.assertRaises(ValueError):
+            server.hls_manifest_text("a" * 24, "#EXTM3U\n../outside.ts\n")
 
 
 class LibraryViewTests(unittest.TestCase):

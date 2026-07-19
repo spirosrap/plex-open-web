@@ -34,17 +34,29 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.15.2
+
+**Added**
+
+- Added native HLS playback for Safari when unsupported source audio must be converted to AAC, with four-second independently playable segments for quick startup.
+- Added a bounded HLS cache that reuses completed streams, expires inactive sessions automatically, and prunes older completed streams toward a configurable disk limit.
+
+**Improved**
+
+- Safari and Apple-device browsers now use their supported streaming transport, while Chrome and Firefox retain the lightweight live MP4 path.
+- HLS playlists are updated atomically while conversion runs, and finished segments support byte ranges and private immutable caching.
+
+**Fixed**
+
+- Fixed the remaining Safari `FormatError` on chunked MP4 television episodes by replacing that Apple-specific path with native HLS delivery.
+- Multiple requests for the same episode now share one HLS conversion instead of starting duplicate FFmpeg work.
+
 ### 0.15.1
 
 **Improved**
 
 - Live audio conversion now sends a populated delayed MP4 initialization header, preserving immediate playback while remaining compatible with Safari's media stack.
 - Playback failures now show a clear in-player message with the existing saved-copy recovery path instead of leaving an unexplained black frame.
-
-**Fixed**
-
-- Fixed Safari rejecting MKV television episodes that use browser-incompatible E-AC-3, AC-3, DTS, TrueHD, or FLAC audio with a `FormatError` before playback began.
-- Kept direct movie playback and low-bandwidth 480p conversion behavior unchanged while applying the compatibility fix to the shared live remux path.
 
 ### 0.15.0
 
@@ -377,6 +389,15 @@ Required settings:
 Optional app settings:
 
 - `APP_DATA_DIR`: persistent directory for server-owned state such as My List; defaults outside the source directory.
+
+Optional compatible-playback settings:
+
+- `FFMPEG_PATH`: FFmpeg executable used for audio conversion, saved copies, embedded subtitles, and HLS playback.
+- `SAVED_MEDIA_DIR`: storage for prepared MP4 files and temporary HLS sessions; defaults outside the source directory.
+- `HLS_CACHE_TTL`: inactive HLS session lifetime in seconds; defaults to four hours.
+- `HLS_CACHE_MAX_BYTES`: target maximum for completed inactive HLS sessions; defaults to 6 GiB, while an active playback session is always preserved.
+- `HLS_STARTUP_TIMEOUT`: maximum wait for the first HLS segment; defaults to 15 seconds.
+- `HLS_TRANSCODE_TIMEOUT`: maximum HLS generation time; defaults to four hours.
 
 Optional permanent media deletion settings:
 

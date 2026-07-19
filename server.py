@@ -41,12 +41,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.15.1"
+APP_VERSION = "0.15.2"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
+HLS_SEGMENT_PATTERN = re.compile(r"segment-\d{5}\.ts")
 JSON_COMPRESSION_MIN_BYTES = 1024
 BROWSE_CACHE_CONTROL = "private, max-age=3, stale-if-error=86400"
 POSTER_WIDTH = 480
@@ -108,6 +109,10 @@ class Settings:
     stream_timeout = env_int("PLEX_STREAM_TIMEOUT", 3600)
     ffmpeg_path = os.environ.get("FFMPEG_PATH", "ffmpeg")
     saved_media_dir = os.environ.get("SAVED_MEDIA_DIR", str(ROOT.parent / "plex-open-web-saved"))
+    hls_cache_ttl = env_int("HLS_CACHE_TTL", 4 * 60 * 60)
+    hls_cache_max_bytes = env_int("HLS_CACHE_MAX_BYTES", 6 * 1024 * 1024 * 1024)
+    hls_startup_timeout = env_int("HLS_STARTUP_TIMEOUT", 15)
+    hls_transcode_timeout = env_int("HLS_TRANSCODE_TIMEOUT", 4 * 60 * 60)
     data_dir = Path(os.environ.get("APP_DATA_DIR", str(ROOT.parent / "plex-open-web-data")))
     media_delete_enabled = env_bool("MEDIA_DELETE_ENABLED", False)
     media_delete_roots = os.environ.get("MEDIA_DELETE_ROOTS", "")
@@ -531,6 +536,8 @@ BROWSER_VIDEO_CODECS = {"h264", "avc1"}
 TRANSCODE_AUDIO_CODECS = {"ac3", "eac3", "dca", "dts", "truehd", "mlp", "flac"}
 SAVE_JOBS: Dict[str, Dict[str, Any]] = {}
 SAVE_JOBS_LOCK = threading.Lock()
+HLS_JOBS: Dict[str, Dict[str, Any]] = {}
+HLS_JOBS_LOCK = threading.Lock()
 
 
 def subtitle_codec_aliases(codec: Optional[str]) -> set:
@@ -1055,6 +1062,265 @@ def compatible_stream_command(part_key: str, remote_quality: bool = False) -> Li
         ]
     )
     return command
+
+
+def hls_stream_id(part_key: str, remote_quality: bool = False) -> str:
+    quality = "480p" if remote_quality else "original"
+    return hashlib.sha256(f"{quality}:{part_key}".encode("utf-8")).hexdigest()[:24]
+
+
+def hls_cache_dir(create: bool = False) -> Path:
+    path = saved_playback_dir(create=create) / "hls"
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def hls_session_dir(playback_id: str, create: bool = False) -> Path:
+    path = hls_cache_dir(create=create) / playback_id
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def hls_stream_command(part_key: str, output_dir: Path, remote_quality: bool = False) -> List[str]:
+    plex_path = safe_plex_path(part_key, prefix="/library/parts/")
+    if not plex_path:
+        raise ValueError("bad_part_key")
+    input_url = PLEX._url(plex_path, {"download": "1"})
+    command = [
+        Settings.ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-nostdin",
+        "-fflags",
+        "+genpts",
+        "-i",
+        input_url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+    ]
+    if remote_quality:
+        command.extend(
+            [
+                "-vf",
+                "scale=-2:480",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-profile:v",
+                "main",
+                "-b:v",
+                "900k",
+                "-maxrate",
+                "1100k",
+                "-bufsize",
+                "1800k",
+                "-g",
+                "48",
+                "-keyint_min",
+                "48",
+                "-sc_threshold",
+                "0",
+            ]
+        )
+    else:
+        command.extend(["-c:v", "copy"])
+    command.extend(
+        [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k" if remote_quality else "192k",
+            "-ac",
+            "2",
+            "-hls_time",
+            "4",
+            "-hls_list_size",
+            "0",
+            "-hls_playlist_type",
+            "event",
+            "-hls_segment_type",
+            "mpegts",
+            "-hls_flags",
+            "independent_segments+temp_file",
+            "-hls_segment_filename",
+            str(output_dir / "segment-%05d.ts"),
+            str(output_dir / "index.m3u8"),
+        ]
+    )
+    return command
+
+
+def hls_manifest_text(playback_id: str, raw_manifest: str) -> str:
+    lines: List[str] = []
+    for raw_line in raw_manifest.splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#"):
+            name = Path(line).name
+            if not HLS_SEGMENT_PATTERN.fullmatch(name):
+                raise ValueError("invalid_hls_segment")
+            line = "/api/hls-segment?" + urllib.parse.urlencode(
+                {"id": playback_id, "name": name}
+            )
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def ready_hls_manifest(session_dir: Path) -> Optional[str]:
+    manifest_path = session_dir / "index.m3u8"
+    try:
+        raw = manifest_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return None
+    segment_names = [
+        Path(line.strip()).name
+        for line in raw.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if not segment_names or not all(
+        HLS_SEGMENT_PATTERN.fullmatch(name) and (session_dir / name).is_file()
+        for name in segment_names
+    ):
+        return None
+    return raw
+
+
+def hls_directory_size(path: Path) -> int:
+    total = 0
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return 0
+    for child in children:
+        try:
+            if child.is_file() and not child.is_symlink():
+                total += child.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def touch_hls_session(path: Path) -> None:
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+
+
+def prune_hls_cache(keep_ids: Optional[set] = None) -> None:
+    root = hls_cache_dir()
+    if not root.is_dir():
+        return
+    keep = set(keep_ids or set())
+    with HLS_JOBS_LOCK:
+        keep.update(
+            playback_id
+            for playback_id, job in HLS_JOBS.items()
+            if job.get("state") == "generating"
+        )
+    now = time.time()
+    sessions: List[Tuple[float, int, Path]] = []
+    try:
+        candidates = list(root.iterdir())
+    except OSError:
+        return
+    for path in candidates:
+        if not path.is_dir() or not re.fullmatch(r"[a-f0-9]{24}", path.name):
+            continue
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        if path.name not in keep and now - modified > max(60, Settings.hls_cache_ttl):
+            shutil.rmtree(path, ignore_errors=True)
+            with HLS_JOBS_LOCK:
+                HLS_JOBS.pop(path.name, None)
+            continue
+        sessions.append((modified, hls_directory_size(path), path))
+
+    total = sum(size for _, size, _ in sessions)
+    maximum = max(256 * 1024 * 1024, Settings.hls_cache_max_bytes)
+    for _, size, path in sorted(sessions):
+        if total <= maximum:
+            break
+        if path.name in keep:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        total -= size
+        with HLS_JOBS_LOCK:
+            HLS_JOBS.pop(path.name, None)
+
+
+def run_hls_job(playback_id: str, part_key: str, remote_quality: bool) -> None:
+    session_dir = hls_session_dir(playback_id, create=True)
+    try:
+        process = subprocess.run(
+            hls_stream_command(part_key, session_dir, remote_quality),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            timeout=Settings.hls_transcode_timeout,
+        )
+        if process.returncode != 0:
+            message = process.stderr.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(message or "ffmpeg could not create the HLS stream")
+        with HLS_JOBS_LOCK:
+            HLS_JOBS[playback_id] = {"state": "ready", "message": None}
+        touch_hls_session(session_dir)
+        prune_hls_cache({playback_id})
+    except Exception as exc:
+        with HLS_JOBS_LOCK:
+            HLS_JOBS[playback_id] = {"state": "error", "message": str(exc)[:500]}
+
+
+def ensure_hls_stream(part_key: str, remote_quality: bool = False) -> Tuple[str, Path, str]:
+    plex_path = safe_plex_path(part_key, prefix="/library/parts/")
+    if not plex_path:
+        raise ValueError("bad_part_key")
+    playback_id = hls_stream_id(plex_path, remote_quality)
+    session_dir = hls_session_dir(playback_id)
+    manifest = ready_hls_manifest(session_dir)
+    if manifest and "#EXT-X-ENDLIST" in manifest:
+        touch_hls_session(session_dir)
+        return playback_id, session_dir, manifest
+
+    start_job = False
+    with HLS_JOBS_LOCK:
+        job = HLS_JOBS.get(playback_id)
+        if not job or job.get("state") not in {"generating", "ready"}:
+            HLS_JOBS[playback_id] = {"state": "generating", "message": None}
+            start_job = True
+    if start_job:
+        prune_hls_cache({playback_id})
+        shutil.rmtree(session_dir, ignore_errors=True)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        threading.Thread(
+            target=run_hls_job,
+            args=(playback_id, plex_path, remote_quality),
+            daemon=True,
+            name=f"plex-hls-{playback_id[:8]}",
+        ).start()
+
+    deadline = time.monotonic() + max(2, Settings.hls_startup_timeout)
+    while time.monotonic() < deadline:
+        manifest = ready_hls_manifest(session_dir)
+        if manifest:
+            touch_hls_session(session_dir)
+            return playback_id, session_dir, manifest
+        with HLS_JOBS_LOCK:
+            job = dict(HLS_JOBS.get(playback_id) or {})
+        if job.get("state") == "error":
+            raise RuntimeError(job.get("message") or "HLS stream failed")
+        time.sleep(0.05)
+    raise TimeoutError("HLS stream did not start in time")
 
 
 def metadata_item_for_rating_key(rating_key: str) -> Optional[Dict[str, Any]]:
@@ -2989,6 +3255,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.handle_stream(method, query)
         elif path == "/api/stream-compatible":
             self.handle_stream_compatible(method, query)
+        elif path == "/api/hls-segment":
+            self.handle_hls_segment(method, query)
         elif path == "/api/saved-stream":
             self.handle_saved_stream(method, query)
         elif path == "/api/download-original":
@@ -3716,6 +3984,10 @@ class AppHandler(BaseHTTPRequestHandler):
         if not plex_path:
             self.send_json({"error": "bad_part_key"}, status=400)
             return
+        stream_format = one(query, "format", "").strip().lower()
+        if stream_format == "hls":
+            self.handle_hls_stream(method, plex_path, query)
+            return
         if method == "HEAD":
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
@@ -3761,6 +4033,87 @@ class AppHandler(BaseHTTPRequestHandler):
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.terminate()
+
+    def handle_hls_stream(
+        self,
+        method: str,
+        part_key: str,
+        query: Dict[str, List[str]],
+    ) -> None:
+        if method == "HEAD":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        quality = one(query, "quality", "").strip().lower()
+        remote_quality = quality in {"remote", "low", "480p"}
+        try:
+            playback_id, _, raw_manifest = ensure_hls_stream(part_key, remote_quality)
+            body = hls_manifest_text(playback_id, raw_manifest).encode("utf-8")
+        except TimeoutError as exc:
+            self.send_json({"error": "hls_startup_timeout", "message": str(exc)}, status=504)
+            return
+        except RuntimeError as exc:
+            self.send_json({"error": "hls_transcode_failed", "message": str(exc)}, status=502)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Playback-Mode", "hls-audio-transcode-aac")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_hls_segment(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method not in {"GET", "HEAD"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        playback_id = one(query, "id", "").strip().lower()
+        name = one(query, "name", "").strip()
+        if not re.fullmatch(r"[a-f0-9]{24}", playback_id) or not HLS_SEGMENT_PATTERN.fullmatch(name):
+            self.send_json({"error": "bad_hls_segment"}, status=400)
+            return
+        session_dir = hls_session_dir(playback_id)
+        segment_path = session_dir / name
+        if not segment_path.is_file() or segment_path.is_symlink():
+            self.send_json({"error": "hls_segment_not_found"}, status=404)
+            return
+        touch_hls_session(session_dir)
+        size = segment_path.stat().st_size
+        range_header = self.headers.get("Range")
+        selected_range = parse_range_header(range_header, size)
+        if range_header and selected_range is None:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        start, end = selected_range or (0, size - 1)
+        length = end - start + 1
+        self.send_response(206 if selected_range else 200)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "private, max-age=14400, immutable")
+        self.send_header("Content-Length", str(length))
+        if selected_range:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if method == "HEAD":
+            return
+        try:
+            with segment_path.open("rb") as handle:
+                handle.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = handle.read(min(STREAM_CHUNK_SIZE, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def api_saved_playback(self, method: str, query: Dict[str, List[str]]) -> None:
         if method not in {"GET", "HEAD", "POST"}:

@@ -2012,6 +2012,9 @@ function liveStreamUrlFor(item) {
     return url;
   }
   const streamUrl = new URL(url, window.location.origin);
+  if (item.playback?.audioTranscodeRequired && el.player.canPlayType("application/vnd.apple.mpegurl")) {
+    streamUrl.searchParams.set("format", "hls");
+  }
   if (window.location.protocol === "http:" && /^100\./.test(window.location.hostname)) {
     streamUrl.searchParams.set("quality", "remote");
   }
@@ -2038,8 +2041,11 @@ function setPlaybackMode(item, mode) {
     return;
   }
   if (item.playback?.audioTranscodeRequired) {
-    el.playbackMode.textContent = "AAC audio";
-    el.playbackMode.title = item.playback.audioTranscodeReason || "Audio is being converted for browser playback.";
+    const nativeHls = Boolean(el.player.canPlayType("application/vnd.apple.mpegurl"));
+    el.playbackMode.textContent = nativeHls ? "HLS + AAC" : "AAC audio";
+    el.playbackMode.title = nativeHls
+      ? "Safari-compatible streaming with AAC audio."
+      : item.playback.audioTranscodeReason || "Audio is being converted for browser playback.";
     el.playbackMode.hidden = false;
   } else {
     el.playbackMode.hidden = true;
