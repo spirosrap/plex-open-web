@@ -656,6 +656,7 @@ select:focus-visible {
 }
 
 .details-dialog,
+.media-delete-dialog,
 .collection-dialog,
 .collection-name-dialog,
 .player-dialog,
@@ -669,11 +670,109 @@ select:focus-visible {
 }
 
 .details-dialog::backdrop,
+.media-delete-dialog::backdrop,
 .collection-dialog::backdrop,
 .collection-name-dialog::backdrop,
 .player-dialog::backdrop,
 .subtitle-dialog::backdrop {
   background: var(--backdrop);
+}
+
+.media-delete-dialog {
+  width: min(620px, calc(100vw - 28px));
+  overflow-x: hidden;
+}
+
+.media-delete-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.media-delete-head > div {
+  min-width: 0;
+}
+
+.media-delete-head p {
+  margin: 0 0 5px;
+  color: var(--danger-text);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.media-delete-head h2 {
+  margin: 0;
+  font-size: 24px;
+  line-height: 1.15;
+}
+
+.media-delete-status {
+  min-height: 22px;
+  margin: 16px 0 10px;
+  color: var(--muted);
+}
+
+.media-delete-status[data-kind="error"] {
+  color: var(--danger);
+}
+
+.media-delete-summary {
+  margin: 0 0 12px;
+  line-height: 1.5;
+}
+
+.media-delete-paths {
+  max-height: 170px;
+  overflow: auto;
+  border-block: 1px solid var(--line);
+  padding: 8px 0;
+}
+
+.media-delete-paths div {
+  padding: 5px 2px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.media-delete-warnings {
+  margin: 12px 0;
+  padding-left: 20px;
+  color: var(--danger-text);
+  line-height: 1.45;
+}
+
+.media-delete-confirm-field {
+  display: grid;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.media-delete-confirm-field input {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--field);
+  color: var(--text);
+}
+
+.media-delete-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.media-delete-actions button {
+  min-height: 40px;
+  padding: 0 16px;
+  border-radius: 6px;
 }
 
 .collection-dialog {

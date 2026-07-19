@@ -11,6 +11,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
 - Movie collection membership management with searchable, immediate add/remove controls.
 - Manual collection creation, rename, and confirmed deletion without removing library movies.
+- Permanent movie and episode deletion with an exact disk preview, typed confirmation, hardlink cleanup, and safe folder pruning.
 - Server-backed My List shared with the Android app, with per-library browsing and poster badges.
 - Surprise Me selection for opening a random item from the active genre and Unwatched filters.
 - Persistent library, view, genre, and sort context across reloads and sign-in sessions.
@@ -32,6 +33,30 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.15.0
+
+**Added**
+
+- Added Delete from disk to movie and episode details, backed by a server-generated preview of every file and complete folder that will be removed.
+- Added a dedicated irreversible-action dialog that requires typing `DELETE` exactly before the permanent command becomes available.
+- Added approved-root hardlink discovery so deleting an episode also removes linked source copies that would otherwise keep the disk data alive.
+- Added local deletion audit entries and qBittorrent download detection with active-download blocking and completed-torrent warnings.
+
+**Improved**
+
+- Movie releases stored in dedicated folders now remove the complete release folder, including subtitles, artwork, and release metadata.
+- Shared movie folders preserve unrelated videos and remove only the selected movie plus matching sidecars.
+- Episode deletion preserves sibling episodes and prunes only directories that become empty.
+- Hardlinked copies are located with a targeted inode lookup, keeping real multi-library previews responsive even across large media roots.
+- Successful deletion clears My List and resume state immediately, requests Plex metadata removal, starts a library refresh, and updates the visible grid without a full reload.
+
+**Fixed**
+
+- Media can now be deleted when Plex's own service account lacks write permission but the Plex Open Web service account owns the configured media folders.
+- A confirmation cannot be replayed for another item, reused after expiry, or executed after any planned file or folder changes.
+- Media outside explicitly approved roots, symlinked originals, library roots, and hardlinks outside approved roots are rejected before disk changes begin.
+- Read-only or permission-blocked media folders are reported in the preview and cannot reach the permanent confirmation action.
 
 ### 0.14.0
 
@@ -340,6 +365,15 @@ Required settings:
 Optional app settings:
 
 - `APP_DATA_DIR`: persistent directory for server-owned state such as My List; defaults outside the source directory.
+
+Optional permanent media deletion settings:
+
+- `MEDIA_DELETE_ENABLED`: set to `1` to expose permanent movie and episode deletion in authenticated clients. It is disabled by default.
+- `MEDIA_DELETE_ROOTS`: colon-separated absolute media roots. Every original and hardlink must stay inside these roots.
+- `MEDIA_DELETE_PLAN_TTL`: lifetime in seconds for a signed deletion preview; defaults to five minutes.
+- `QBITTORRENT_BACKUP_DIR`: optional qBittorrent `BT_backup` directory used to detect active or still-managed downloads.
+
+The service account must be able to write the approved roots. Do not approve a root broader than the actual media libraries. A changed plan always requires a new preview and confirmation.
 
 Optional subtitle search/download settings:
 

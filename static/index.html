@@ -130,9 +130,36 @@
             <button id="details-watch-state" class="secondary-button">Mark watched</button>
             <button id="details-my-list" class="secondary-button">Add to My List</button>
             <button id="details-collections" class="secondary-button" hidden>Collections</button>
+            <button id="details-delete-media" class="secondary-button danger-button" hidden>Delete from disk</button>
           </div>
         </section>
       </div>
+    </dialog>
+
+    <dialog id="media-delete-dialog" class="media-delete-dialog">
+      <form id="media-delete-form">
+        <header class="media-delete-head">
+          <div>
+            <p>Permanent deletion</p>
+            <h2 id="media-delete-title">Delete from disk?</h2>
+          </div>
+          <button id="media-delete-close" class="icon-button" type="button" aria-label="Close">x</button>
+        </header>
+        <div id="media-delete-status" class="media-delete-status" aria-live="polite">Inspecting files...</div>
+        <div id="media-delete-plan" hidden>
+          <p id="media-delete-summary" class="media-delete-summary"></p>
+          <section id="media-delete-paths" class="media-delete-paths" aria-label="Files and folders to delete"></section>
+          <ul id="media-delete-warnings" class="media-delete-warnings"></ul>
+          <label class="media-delete-confirm-field" for="media-delete-confirmation">
+            <span>Type <strong>DELETE</strong> to confirm</span>
+            <input id="media-delete-confirmation" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" />
+          </label>
+        </div>
+        <div class="media-delete-actions">
+          <button id="media-delete-cancel" type="button" class="secondary-button">Cancel</button>
+          <button id="media-delete-submit" type="submit" class="danger-button" disabled>Delete permanently</button>
+        </div>
+      </form>
     </dialog>
 
     <dialog id="collection-dialog" class="collection-dialog">

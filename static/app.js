@@ -24,6 +24,10 @@ const state = {
   surpriseInProgress: false,
   watchStateRatingKey: null,
   detailsItem: null,
+  mediaDeletionEnabled: false,
+  mediaDeleteItem: null,
+  mediaDeletePlan: null,
+  mediaDeleteBusy: false,
   collectionItem: null,
   collectionMembership: null,
   collectionUpdating: new Set(),
@@ -109,7 +113,20 @@ const el = {
   detailsWatchState: document.querySelector("#details-watch-state"),
   detailsMyList: document.querySelector("#details-my-list"),
   detailsCollections: document.querySelector("#details-collections"),
+  detailsDeleteMedia: document.querySelector("#details-delete-media"),
   detailsClose: document.querySelector("#details-close"),
+  mediaDeleteDialog: document.querySelector("#media-delete-dialog"),
+  mediaDeleteForm: document.querySelector("#media-delete-form"),
+  mediaDeleteTitle: document.querySelector("#media-delete-title"),
+  mediaDeleteStatus: document.querySelector("#media-delete-status"),
+  mediaDeletePlan: document.querySelector("#media-delete-plan"),
+  mediaDeleteSummary: document.querySelector("#media-delete-summary"),
+  mediaDeletePaths: document.querySelector("#media-delete-paths"),
+  mediaDeleteWarnings: document.querySelector("#media-delete-warnings"),
+  mediaDeleteConfirmation: document.querySelector("#media-delete-confirmation"),
+  mediaDeleteSubmit: document.querySelector("#media-delete-submit"),
+  mediaDeleteCancel: document.querySelector("#media-delete-cancel"),
+  mediaDeleteClose: document.querySelector("#media-delete-close"),
   collectionDialog: document.querySelector("#collection-dialog"),
   collectionTitle: document.querySelector("#collection-title"),
   collectionFilter: document.querySelector("#collection-filter"),
@@ -568,6 +585,7 @@ async function loadLibraries() {
   const params = browseRequestParams(state.preferredLibraryKey, { includeBrowse: true });
   const data = await api(`/api/bootstrap?${params}`);
   showVersion(data.version);
+  state.mediaDeletionEnabled = Boolean(data.mediaDeletionEnabled);
   if (!data.authenticated && data.authRequired) {
     showLogin();
     return false;
@@ -884,6 +902,11 @@ function openDetails(item) {
   el.detailsCollections.hidden = !canManageCollections;
   el.detailsCollections.textContent = collectionCount ? `Collections (${collectionCount})` : "Collections";
   el.detailsCollections.onclick = () => openCollectionMembership(item);
+  const canDeleteMedia = Boolean(
+    state.mediaDeletionEnabled && item.ratingKey && ["movie", "episode"].includes(item.type),
+  );
+  el.detailsDeleteMedia.hidden = !canDeleteMedia;
+  el.detailsDeleteMedia.onclick = () => openMediaDelete(item);
   if (!el.detailsDialog.open) {
     el.detailsDialog.showModal();
   }
@@ -894,6 +917,119 @@ function openDetails(item) {
         openDetails(item);
       }
     });
+  }
+}
+
+function setMediaDeleteStatus(message, kind = "") {
+  el.mediaDeleteStatus.textContent = message;
+  el.mediaDeleteStatus.dataset.kind = kind;
+}
+
+function updateMediaDeleteSubmit() {
+  const confirmed = el.mediaDeleteConfirmation.value.trim() === "DELETE";
+  el.mediaDeleteSubmit.disabled = state.mediaDeleteBusy
+    || !state.mediaDeletePlan?.canDelete
+    || !confirmed;
+  el.mediaDeleteSubmit.textContent = state.mediaDeleteBusy ? "Deleting..." : "Delete permanently";
+  el.mediaDeleteCancel.disabled = state.mediaDeleteBusy;
+  el.mediaDeleteClose.disabled = state.mediaDeleteBusy;
+  el.mediaDeleteConfirmation.disabled = state.mediaDeleteBusy || !state.mediaDeletePlan?.canDelete;
+}
+
+function renderMediaDeletePlan(plan) {
+  state.mediaDeletePlan = plan;
+  el.mediaDeletePlan.hidden = false;
+  const fileLabel = `${plan.fileCount} ${plan.fileCount === 1 ? "file" : "files"}`;
+  const folderLabel = plan.folderCount
+    ? ` and ${plan.folderCount} complete ${plan.folderCount === 1 ? "folder" : "folders"}`
+    : "";
+  el.mediaDeleteSummary.textContent = `${fileLabel}${folderLabel} (${plan.totalSizeText}) will be permanently removed.`;
+  const pathRows = [
+    ...(plan.folders || []).map((path) => ({ path, label: "Folder" })),
+    ...(plan.files || []).map((path) => ({ path, label: "File" })),
+  ];
+  el.mediaDeletePaths.innerHTML = pathRows
+    .map(({ path, label }) => `<div><strong>${label}:</strong> ${escapeHtml(path)}</div>`)
+    .join("");
+  el.mediaDeletePaths.hidden = pathRows.length === 0;
+  el.mediaDeleteWarnings.innerHTML = (plan.warnings || [])
+    .map((warning) => `<li>${escapeHtml(warning)}</li>`)
+    .join("");
+  el.mediaDeleteWarnings.hidden = !(plan.warnings || []).length;
+  setMediaDeleteStatus(
+    plan.canDelete ? "Review the exact disk changes below." : plan.blockReason || "Disk deletion is currently blocked.",
+    plan.canDelete ? "" : "error",
+  );
+  updateMediaDeleteSubmit();
+}
+
+async function openMediaDelete(item) {
+  if (!item?.ratingKey || !state.mediaDeletionEnabled) return;
+  state.mediaDeleteItem = item;
+  state.mediaDeletePlan = null;
+  state.mediaDeleteBusy = false;
+  el.mediaDeleteTitle.textContent = `Delete ${displayTitle(item)}?`;
+  el.mediaDeletePlan.hidden = true;
+  el.mediaDeleteConfirmation.value = "";
+  setMediaDeleteStatus("Inspecting files...");
+  updateMediaDeleteSubmit();
+  if (el.detailsDialog.open) el.detailsDialog.close();
+  if (!el.mediaDeleteDialog.open) el.mediaDeleteDialog.showModal();
+  try {
+    const plan = await api(`/api/media-delete?ratingKey=${encodeURIComponent(item.ratingKey)}`);
+    if (state.mediaDeleteItem !== item || !el.mediaDeleteDialog.open) return;
+    renderMediaDeletePlan(plan);
+    el.mediaDeleteConfirmation.focus();
+  } catch (error) {
+    if (state.mediaDeleteItem !== item || !el.mediaDeleteDialog.open) return;
+    setMediaDeleteStatus(error.message, "error");
+    updateMediaDeleteSubmit();
+  }
+}
+
+function removeDeletedItem(item) {
+  const ratingKey = String(item?.ratingKey || "");
+  if (!ratingKey) return;
+  const previousLength = state.currentItems.length;
+  const keep = (candidate) => String(candidate?.ratingKey || "") !== ratingKey;
+  state.stack.forEach((entry) => {
+    entry.items = (entry.items || []).filter(keep);
+  });
+  const nextItems = state.currentItems.filter(keep);
+  if (nextItems.length < previousLength && state.stack.length === 0) {
+    state.libraryTotal = Math.max(0, state.libraryTotal - 1);
+  }
+  state.myListKeys.delete(ratingKey);
+  state.metadataRequests.delete(ratingKey);
+  clearLocalProgress(item);
+  renderItems(nextItems);
+}
+
+async function submitMediaDelete() {
+  const item = state.mediaDeleteItem;
+  const plan = state.mediaDeletePlan;
+  if (!item?.ratingKey || !plan?.confirmationToken || state.mediaDeleteBusy) return;
+  state.mediaDeleteBusy = true;
+  setMediaDeleteStatus("Deleting original files from disk...");
+  updateMediaDeleteSubmit();
+  try {
+    const result = await api("/api/media-delete", {
+      method: "POST",
+      body: JSON.stringify({
+        ratingKey: item.ratingKey,
+        confirmationToken: plan.confirmationToken,
+        confirmation: el.mediaDeleteConfirmation.value.trim(),
+      }),
+    });
+    removeDeletedItem(item);
+    el.mediaDeleteDialog.close();
+    const scan = result.scanStarted ? " Plex is scanning the library." : "";
+    setStatus(`Deleted ${displayTitle(item)} from disk.${scan}`, "success");
+  } catch (error) {
+    setMediaDeleteStatus(error.message, "error");
+  } finally {
+    state.mediaDeleteBusy = false;
+    updateMediaDeleteSubmit();
   }
 }
 
@@ -2517,6 +2653,22 @@ for (const button of el.viewButtons) {
 el.detailsClose.addEventListener("click", () => el.detailsDialog.close());
 el.detailsDialog.addEventListener("close", () => {
   state.detailsItem = null;
+});
+el.mediaDeleteConfirmation.addEventListener("input", updateMediaDeleteSubmit);
+el.mediaDeleteForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitMediaDelete();
+});
+el.mediaDeleteCancel.addEventListener("click", () => el.mediaDeleteDialog.close());
+el.mediaDeleteClose.addEventListener("click", () => el.mediaDeleteDialog.close());
+el.mediaDeleteDialog.addEventListener("cancel", (event) => {
+  if (state.mediaDeleteBusy) event.preventDefault();
+});
+el.mediaDeleteDialog.addEventListener("close", () => {
+  state.mediaDeleteItem = null;
+  state.mediaDeletePlan = null;
+  state.mediaDeleteBusy = false;
+  el.mediaDeleteConfirmation.value = "";
 });
 el.collectionFilter.addEventListener("input", renderCollectionMembership);
 el.collectionCreateForm.addEventListener("submit", (event) => {

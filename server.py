@@ -21,6 +21,8 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -39,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.14.0"
+APP_VERSION = "0.15.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -107,6 +109,10 @@ class Settings:
     ffmpeg_path = os.environ.get("FFMPEG_PATH", "ffmpeg")
     saved_media_dir = os.environ.get("SAVED_MEDIA_DIR", str(ROOT.parent / "plex-open-web-saved"))
     data_dir = Path(os.environ.get("APP_DATA_DIR", str(ROOT.parent / "plex-open-web-data")))
+    media_delete_enabled = env_bool("MEDIA_DELETE_ENABLED", False)
+    media_delete_roots = os.environ.get("MEDIA_DELETE_ROOTS", "")
+    media_delete_plan_ttl = env_int("MEDIA_DELETE_PLAN_TTL", 300)
+    qbittorrent_backup_dir = os.environ.get("QBITTORRENT_BACKUP_DIR", "")
     opensubtitles_base_url = os.environ.get(
         "OPENSUBTITLES_BASE_URL", "https://api.opensubtitles.com/api/v1"
     )
@@ -184,6 +190,16 @@ STATIC_CACHE: Dict[Path, Tuple[int, bytes]] = {}
 
 
 MY_LIST_FILE = Settings.data_dir / "my-list.json"
+MEDIA_DELETE_LOG_FILE = Settings.data_dir / "media-delete-log.jsonl"
+MEDIA_DELETE_LOCK = threading.Lock()
+VIDEO_EXTENSIONS = {
+    ".3g2", ".3gp", ".asf", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov",
+    ".mp4", ".mpeg", ".mpg", ".mts", ".ogm", ".ogv", ".ts", ".vob", ".webm", ".wmv",
+}
+MEDIA_SIDECAR_EXTENSIONS = {
+    ".ass", ".idx", ".jpeg", ".jpg", ".nfo", ".png", ".sfv", ".srt", ".ssa",
+    ".sub", ".txt", ".vtt", ".webp",
+}
 
 
 def read_plex_token_from_preferences(path: str) -> str:
@@ -311,6 +327,18 @@ def to_float(value: Optional[str]) -> Optional[float]:
         return float(value)
     except ValueError:
         return None
+
+
+def format_bytes(value: int) -> str:
+    amount = float(max(0, value))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if amount < 1024 or candidate == units[-1]:
+            break
+        amount /= 1024
+    return f"{amount:.0f} {unit}" if unit == "B" else f"{amount:.1f} {unit}"
 
 
 def read_stream_chunk(stream: Any, chunk_size: int = STREAM_CHUNK_SIZE) -> bytes:
@@ -1429,6 +1457,663 @@ def first_part_element(elem: ET.Element) -> Optional[ET.Element]:
     return None
 
 
+class MediaDeletionError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+def configured_media_delete_roots() -> List[Path]:
+    raw = Settings.media_delete_roots
+    values = raw if isinstance(raw, (list, tuple)) else str(raw or "").split(os.pathsep)
+    roots: List[Path] = []
+    seen = set()
+    for value in values:
+        if not str(value).strip():
+            continue
+        root = Path(str(value).strip()).expanduser().resolve()
+        if root in seen or not root.is_dir():
+            continue
+        seen.add(root)
+        roots.append(root)
+    return sorted(roots, key=lambda path: len(path.parts), reverse=True)
+
+
+def approved_media_root(path: Path, roots: List[Path]) -> Optional[Path]:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return root
+        except ValueError:
+            continue
+    return None
+
+
+def media_delete_display_path(path: Path, roots: List[Path]) -> str:
+    root = approved_media_root(path, roots)
+    if root is None:
+        return path.name
+    relative = path.relative_to(root)
+    return f"{root.name}/{relative}" if str(relative) != "." else root.name
+
+
+def media_part_paths(elem: ET.Element) -> List[Path]:
+    paths: List[Path] = []
+    seen = set()
+    for media in elem.findall("Media"):
+        for part in media.findall("Part"):
+            value = str(part.get("file") or "").strip()
+            if not value:
+                continue
+            path = Path(value)
+            if path in seen:
+                continue
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
+def media_sidecars(video_path: Path) -> List[Path]:
+    matches: List[Path] = []
+    prefix = video_path.stem.casefold() + "."
+    try:
+        candidates = list(video_path.parent.iterdir())
+    except OSError:
+        return matches
+    for candidate in candidates:
+        try:
+            is_file = candidate.is_file() and not candidate.is_symlink()
+        except OSError:
+            continue
+        if not is_file or candidate.suffix.casefold() not in MEDIA_SIDECAR_EXTENSIONS:
+            continue
+        name = candidate.name.casefold()
+        if candidate.stem.casefold() == video_path.stem.casefold() or name.startswith(prefix):
+            matches.append(candidate.resolve())
+    return matches
+
+
+def find_approved_hardlinks(paths: List[Path], roots: List[Path]) -> Tuple[List[Path], int]:
+    inode_stats: Dict[Tuple[int, int], os.stat_result] = {}
+    locations: Dict[Tuple[int, int], set] = {}
+    for path in paths:
+        info = path.stat()
+        key = (info.st_dev, info.st_ino)
+        inode_stats[key] = info
+        locations.setdefault(key, set()).add(path)
+
+    wanted = {key for key, info in inode_stats.items() if info.st_nlink > len(locations[key])}
+    for device, inode in wanted:
+        device_roots = []
+        for root in roots:
+            try:
+                if root.stat().st_dev == device:
+                    device_roots.append(root)
+            except OSError:
+                continue
+        if not device_roots:
+            continue
+        command = [
+            "find",
+            *[str(root) for root in device_roots],
+            "-xdev",
+            "-type",
+            "f",
+            "-inum",
+            str(inode),
+            "-print0",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=max(5, min(60, Settings.request_timeout)),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result is not None:
+            candidates = [Path(os.fsdecode(value)) for value in result.stdout.split(b"\0") if value]
+        else:
+            candidates = []
+            for root in device_roots:
+                for directory, dirnames, filenames in os.walk(root, followlinks=False):
+                    dirnames[:] = [
+                        name for name in dirnames if not (Path(directory) / name).is_symlink()
+                    ]
+                    candidates.extend(Path(directory) / filename for filename in filenames)
+        for candidate in candidates:
+            try:
+                info = candidate.lstat()
+            except OSError:
+                continue
+            if (
+                info.st_dev == device
+                and info.st_ino == inode
+                and stat.S_ISREG(info.st_mode)
+                and not candidate.is_symlink()
+            ):
+                locations[(device, inode)].add(candidate.resolve())
+
+    missing = sum(max(0, inode_stats[key].st_nlink - len(found)) for key, found in locations.items())
+    all_paths = sorted({path for found in locations.values() for path in found}, key=str)
+    return all_paths, missing
+
+
+def auxiliary_movie_video(path: Path) -> bool:
+    return bool(re.search(r"(?:^|[ ._\-])(sample|trailer|featurette|extra)(?:[ ._\-]|$)", path.stem, re.I))
+
+
+def dedicated_movie_folders(
+    original_paths: List[Path],
+    all_video_paths: List[Path],
+    roots: List[Path],
+) -> Tuple[List[Path], bool]:
+    target_inodes = {(path.stat().st_dev, path.stat().st_ino) for path in all_video_paths}
+    folders = set()
+    shared_folder_found = False
+    for path in original_paths:
+        root = approved_media_root(path, roots)
+        if root is None:
+            continue
+        relative = path.relative_to(root)
+        if len(relative.parts) < 2:
+            shared_folder_found = True
+            continue
+        candidate = root / relative.parts[0]
+        if not candidate.is_dir() or candidate.is_symlink():
+            shared_folder_found = True
+            continue
+        safe = True
+        for directory, dirnames, filenames in os.walk(candidate, followlinks=False):
+            dirnames[:] = [
+                name for name in dirnames if not (Path(directory) / name).is_symlink()
+            ]
+            for filename in filenames:
+                nested = Path(directory) / filename
+                if nested.suffix.casefold() not in VIDEO_EXTENSIONS:
+                    continue
+                try:
+                    info = nested.stat()
+                except OSError:
+                    safe = False
+                    break
+                if (info.st_dev, info.st_ino) not in target_inodes and not auxiliary_movie_video(nested):
+                    safe = False
+                    break
+            if not safe:
+                break
+        if safe:
+            folders.add(candidate.resolve())
+        else:
+            shared_folder_found = True
+    return sorted(folders, key=str), shared_folder_found
+
+
+def _bdecode(raw: bytes) -> Any:
+    def parse(index: int) -> Tuple[Any, int]:
+        marker = raw[index : index + 1]
+        if marker == b"i":
+            end = raw.index(b"e", index)
+            return int(raw[index + 1 : end]), end + 1
+        if marker == b"l":
+            values = []
+            index += 1
+            while raw[index : index + 1] != b"e":
+                value, index = parse(index)
+                values.append(value)
+            return values, index + 1
+        if marker == b"d":
+            values = {}
+            index += 1
+            while raw[index : index + 1] != b"e":
+                key, index = parse(index)
+                value, index = parse(index)
+                values[key] = value
+            return values, index + 1
+        colon = raw.index(b":", index)
+        length = int(raw[index:colon])
+        start = colon + 1
+        return raw[start : start + length], start + length
+
+    value, end = parse(0)
+    if end != len(raw):
+        raise ValueError("trailing_bencode_data")
+    return value
+
+
+def _bvalue(mapping: Dict[bytes, Any], key: str, default: Any = None) -> Any:
+    return mapping.get(key.encode("utf-8"), default)
+
+
+def _btext(value: Any) -> str:
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value or "")
+
+
+def qbittorrent_records_for_paths(paths: List[Path]) -> List[Dict[str, Any]]:
+    raw_dir = str(Settings.qbittorrent_backup_dir or "").strip()
+    if not raw_dir:
+        return []
+    backup_dir = Path(raw_dir).expanduser()
+    if not backup_dir.is_dir():
+        return []
+    targets = {path.resolve() for path in paths}
+    records: List[Dict[str, Any]] = []
+    for resume_path in sorted(backup_dir.glob("*.fastresume")):
+        torrent_path = resume_path.with_suffix(".torrent")
+        if not torrent_path.is_file():
+            continue
+        try:
+            resume = _bdecode(resume_path.read_bytes())
+            torrent = _bdecode(torrent_path.read_bytes())
+            info = _bvalue(torrent, "info", {})
+            if not isinstance(resume, dict) or not isinstance(info, dict):
+                continue
+            save_path = Path(
+                _btext(_bvalue(resume, "qBt-savePath") or _bvalue(resume, "save_path"))
+            ).expanduser()
+            torrent_name = _btext(_bvalue(info, "name") or _bvalue(resume, "name"))
+            files = _bvalue(info, "files")
+            relative_paths: List[Path] = []
+            if isinstance(files, list):
+                for entry in files:
+                    components = _bvalue(entry, "path", []) if isinstance(entry, dict) else []
+                    if isinstance(components, list) and components:
+                        relative_paths.append(Path(*[_btext(component) for component in components]))
+            else:
+                relative_paths.append(Path(torrent_name))
+            candidates = set()
+            for relative in relative_paths:
+                candidates.add((save_path / relative).resolve())
+                if torrent_name:
+                    candidates.add((save_path / torrent_name / relative).resolve())
+            matched = targets.intersection(candidates)
+            if not matched:
+                continue
+            completed_time = int(_bvalue(resume, "completed_time", 0) or 0)
+            records.append(
+                {
+                    "name": _btext(_bvalue(resume, "qBt-name") or _bvalue(resume, "name") or torrent_name),
+                    "complete": completed_time > 0,
+                    "containsOtherFiles": len(relative_paths) > len(matched),
+                    "fileCount": len(relative_paths),
+                }
+            )
+        except (OSError, ValueError, TypeError, IndexError):
+            continue
+    return records
+
+
+def media_delete_fingerprint(files: List[Path], folders: List[Path]) -> Tuple[str, List[Path]]:
+    entries: List[Tuple[Any, ...]] = []
+    regular_files = set(files)
+    for folder in folders:
+        try:
+            root_info = folder.lstat()
+        except OSError as exc:
+            raise MediaDeletionError("media_changed", f"Could not inspect {folder.name}: {exc}", 409)
+        entries.append((str(folder), root_info.st_mode, root_info.st_size, root_info.st_mtime_ns, root_info.st_ino))
+        for directory, dirnames, filenames in os.walk(folder, followlinks=False):
+            dirnames.sort()
+            filenames.sort()
+            for name in dirnames + filenames:
+                path = Path(directory) / name
+                try:
+                    info = path.lstat()
+                except OSError as exc:
+                    raise MediaDeletionError("media_changed", f"Could not inspect {path.name}: {exc}", 409)
+                entries.append((str(path), info.st_mode, info.st_size, info.st_mtime_ns, info.st_ino))
+                if stat.S_ISREG(info.st_mode):
+                    regular_files.add(path)
+    for path in files:
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise MediaDeletionError("media_changed", f"Could not inspect {path.name}: {exc}", 409)
+        entries.append((str(path), info.st_mode, info.st_size, info.st_mtime_ns, info.st_ino))
+    digest = hashlib.sha256(json_bytes(sorted(entries, key=lambda entry: entry[0]))).hexdigest()
+    return digest, sorted(regular_files, key=str)
+
+
+def media_delete_title(elem: ET.Element) -> str:
+    title = elem.get("title") or "Untitled"
+    if elem.get("type") != "episode":
+        return title
+    season = to_int(elem.get("parentIndex"))
+    episode = to_int(elem.get("index"))
+    code = "".join(
+        [f"S{season:02}" if season is not None else "", f"E{episode:02}" if episode is not None else ""]
+    )
+    show = elem.get("grandparentTitle") or elem.get("parentTitle")
+    return " - ".join(part for part in [" ".join(part for part in [show, code] if part), title] if part)
+
+
+def build_media_delete_plan(rating_key: str) -> Dict[str, Any]:
+    if not Settings.media_delete_enabled:
+        raise MediaDeletionError(
+            "media_deletion_disabled",
+            "Deleting original media is not enabled on this server.",
+            403,
+        )
+    if not re.fullmatch(r"\d+", rating_key):
+        raise MediaDeletionError("invalid_rating_key", "Invalid Plex item identifier.")
+    roots = configured_media_delete_roots()
+    if not roots:
+        raise MediaDeletionError(
+            "media_delete_roots_missing",
+            "No approved media folders are configured for deletion.",
+            503,
+        )
+    elem = metadata_item_element(rating_key)
+    if elem is None:
+        raise MediaDeletionError("metadata_not_found", "This Plex item no longer exists.", 404)
+    item_type = str(elem.get("type") or "")
+    if item_type not in {"movie", "episode"}:
+        raise MediaDeletionError(
+            "unsupported_media_type",
+            "Only movies and individual TV episodes can be deleted.",
+        )
+    raw_paths = media_part_paths(elem)
+    if not raw_paths:
+        raise MediaDeletionError("media_file_unavailable", "Plex did not provide an original media file.", 404)
+
+    original_paths: List[Path] = []
+    for raw_path in raw_paths:
+        if not raw_path.is_absolute() or raw_path.is_symlink():
+            raise MediaDeletionError("unsafe_media_path", "The original media path is not safe to delete.", 409)
+        try:
+            path = raw_path.resolve(strict=True)
+        except OSError:
+            raise MediaDeletionError("media_file_missing", f"{raw_path.name} is already missing from disk.", 409)
+        if approved_media_root(path, roots) is None:
+            raise MediaDeletionError(
+                "media_outside_approved_roots",
+                f"{path.name} is outside the folders approved for deletion.",
+                403,
+            )
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise MediaDeletionError("unsafe_media_path", f"{path.name} is not a regular media file.", 409)
+        original_paths.append(path)
+
+    all_video_paths, missing_links = find_approved_hardlinks(original_paths, roots)
+    if missing_links:
+        raise MediaDeletionError(
+            "hardlinks_outside_approved_roots",
+            "This media has linked copies outside the approved folders, so a complete deletion cannot be guaranteed.",
+            409,
+        )
+
+    sidecars = sorted(
+        {sidecar for video_path in all_video_paths for sidecar in media_sidecars(video_path)},
+        key=str,
+    )
+    folders: List[Path] = []
+    shared_folder_found = False
+    if item_type == "movie":
+        folders, shared_folder_found = dedicated_movie_folders(original_paths, all_video_paths, roots)
+
+    def inside_deleted_folder(path: Path) -> bool:
+        return approved_media_root(path, folders) is not None
+
+    files = sorted(
+        {path for path in all_video_paths + sidecars if not inside_deleted_folder(path)},
+        key=str,
+    )
+    if not files and not folders:
+        raise MediaDeletionError("nothing_to_delete", "No original media remains on disk.", 409)
+    for path in files:
+        if approved_media_root(path, roots) is None:
+            raise MediaDeletionError("unsafe_media_path", f"{path.name} is outside approved folders.", 403)
+    for folder in folders:
+        if folder in roots or approved_media_root(folder, roots) is None:
+            raise MediaDeletionError("unsafe_media_folder", "A library root can never be deleted.", 403)
+
+    fingerprint, all_files = media_delete_fingerprint(files, folders)
+    digest = hashlib.sha256(
+        json_bytes(
+            {
+                "ratingKey": rating_key,
+                "type": item_type,
+                "sectionKey": elem.get("librarySectionID"),
+                "files": [str(path) for path in files],
+                "folders": [str(path) for path in folders],
+                "fingerprint": fingerprint,
+            }
+        )
+    ).hexdigest()
+    unique_bytes = 0
+    seen_inodes = set()
+    for path in all_files:
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        inode = (info.st_dev, info.st_ino)
+        if inode not in seen_inodes:
+            seen_inodes.add(inode)
+            unique_bytes += info.st_size
+
+    torrents = qbittorrent_records_for_paths(all_video_paths)
+    incomplete = [torrent for torrent in torrents if not torrent["complete"]]
+    unwritable = []
+    for path in files:
+        if not os.access(path.parent, os.W_OK | os.X_OK):
+            unwritable.append(path.parent)
+    for folder in folders:
+        if not os.access(folder.parent, os.W_OK | os.X_OK):
+            unwritable.append(folder.parent)
+        for directory, _, _ in os.walk(folder, followlinks=False):
+            directory_path = Path(directory)
+            if not os.access(directory_path, os.W_OK | os.X_OK):
+                unwritable.append(directory_path)
+                break
+    warnings: List[str] = []
+    hardlink_copies = max(0, len(all_video_paths) - len(original_paths))
+    if hardlink_copies:
+        warnings.append(
+            f"{hardlink_copies} linked disk cop{'y' if hardlink_copies == 1 else 'ies'} will also be removed."
+        )
+    if shared_folder_found:
+        warnings.append(
+            "The containing folder has other video files, so only this title and its matching sidecars will be removed."
+        )
+    if torrents:
+        warnings.append(
+            "qBittorrent still tracks this download and may restore missing files after a forced recheck."
+        )
+    if incomplete:
+        warnings.append("The download is still active in qBittorrent. Wait for it to finish or stop it first.")
+    if unwritable:
+        warnings.append(
+            "The server account cannot write one or more containing folders, so disk deletion is blocked."
+        )
+    block_reason = ""
+    if incomplete:
+        block_reason = "The download is still active in qBittorrent. Stop it or wait for it to finish."
+    elif unwritable:
+        block_reason = "The server account cannot write the containing media folder."
+
+    return {
+        "enabled": True,
+        "canDelete": not incomplete and not unwritable,
+        "blockReason": block_reason or None,
+        "ratingKey": rating_key,
+        "type": item_type,
+        "title": media_delete_title(elem),
+        "sectionKey": elem.get("librarySectionID"),
+        "fileCount": len(all_files),
+        "folderCount": len(folders),
+        "totalBytes": unique_bytes,
+        "totalSizeText": format_bytes(unique_bytes),
+        "hardLinkCopies": hardlink_copies,
+        "files": [media_delete_display_path(path, roots) for path in files],
+        "folders": [media_delete_display_path(path, roots) for path in folders],
+        "warnings": warnings,
+        "torrents": torrents,
+        "confirmationPhrase": "DELETE",
+        "_files": files,
+        "_folders": folders,
+        "_roots": roots,
+        "_digest": digest,
+        "_element": elem,
+    }
+
+
+def make_media_delete_token(plan: Dict[str, Any]) -> str:
+    now = int(time.time())
+    payload = b64url(
+        json_bytes(
+            {
+                "ratingKey": plan["ratingKey"],
+                "digest": plan["_digest"],
+                "iat": now,
+                "exp": now + max(30, Settings.media_delete_plan_ttl),
+            }
+        )
+    )
+    signature = hmac.new(
+        Settings.app_secret.encode("utf-8"),
+        f"media-delete:{payload}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{payload}.{b64url(signature)}"
+
+
+def verify_media_delete_token(token: str) -> Dict[str, Any]:
+    if not token or "." not in token:
+        raise MediaDeletionError("confirmation_expired", "Open a fresh deletion confirmation.", 409)
+    payload, signature = token.rsplit(".", 1)
+    expected = hmac.new(
+        Settings.app_secret.encode("utf-8"),
+        f"media-delete:{payload}".encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    try:
+        actual = b64url_decode(signature)
+        data = json.loads(b64url_decode(payload).decode("utf-8"))
+    except (ValueError, json.JSONDecodeError):
+        raise MediaDeletionError("confirmation_invalid", "The deletion confirmation is invalid.", 409)
+    if not hmac.compare_digest(actual, expected):
+        raise MediaDeletionError("confirmation_invalid", "The deletion confirmation is invalid.", 409)
+    if int(data.get("exp") or 0) < int(time.time()):
+        raise MediaDeletionError("confirmation_expired", "The deletion preview expired. Review it again.", 409)
+    return data
+
+
+def public_media_delete_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in plan.items()
+        if not key.startswith("_")
+    } | {"confirmationToken": make_media_delete_token(plan)}
+
+
+def append_media_delete_audit(plan: Dict[str, Any], result: Dict[str, Any]) -> None:
+    MEDIA_DELETE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "deletedAt": int(time.time()),
+        "ratingKey": plan["ratingKey"],
+        "type": plan["type"],
+        "title": plan["title"],
+        "fileCount": result["deletedFileCount"],
+        "folderCount": result["deletedFolderCount"],
+        "totalBytes": plan["totalBytes"],
+        "files": plan["files"],
+        "folders": plan["folders"],
+    }
+    with MEDIA_DELETE_LOG_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def execute_media_delete(plan: Dict[str, Any]) -> Dict[str, Any]:
+    item = item_from_xml(plan["_element"])
+    saved_status = delete_saved_playback(item)
+    if saved_status.get("deleteBlocked"):
+        raise MediaDeletionError(
+            "save_in_progress",
+            "A server copy is still being prepared for this item. Stop it and try again.",
+            409,
+        )
+    for path in plan["_files"]:
+        if not os.access(path.parent, os.W_OK | os.X_OK):
+            raise MediaDeletionError("media_not_writable", f"Cannot remove {path.name} from disk.", 403)
+    for folder in plan["_folders"]:
+        if not os.access(folder.parent, os.W_OK | os.X_OK):
+            raise MediaDeletionError("media_not_writable", f"Cannot remove {folder.name} from disk.", 403)
+
+    deleted_file_count = plan["fileCount"]
+    deleted_folder_count = len(plan["_folders"])
+    prune_candidates: Dict[Path, Path] = {}
+    for path in plan["_files"]:
+        root = approved_media_root(path, plan["_roots"])
+        if root is not None:
+            prune_candidates[path.parent] = root
+        path.unlink()
+    for folder in sorted(plan["_folders"], key=lambda path: len(path.parts), reverse=True):
+        shutil.rmtree(folder)
+
+    pruned = 0
+    for directory, root in sorted(prune_candidates.items(), key=lambda entry: len(entry[0].parts), reverse=True):
+        current = directory
+        while current != root:
+            try:
+                current.rmdir()
+                pruned += 1
+            except OSError:
+                break
+            current = current.parent
+
+    warnings = list(plan["warnings"])
+    try:
+        update_my_list(plan["ratingKey"], False)
+    except OSError:
+        warnings.append("The item was deleted, but My List could not be updated.")
+
+    plex_removed = False
+    try:
+        PLEX.open(
+            f"/library/metadata/{urllib.parse.quote(plan['ratingKey'])}",
+            method="DELETE",
+        ).close()
+        plex_removed = True
+    except (urllib.error.HTTPError, OSError, RuntimeError):
+        warnings.append("Plex will remove its stale library entry during the requested scan.")
+
+    scan_started = False
+    section_key = str(plan.get("sectionKey") or "")
+    if re.fullmatch(r"\d+", section_key):
+        try:
+            PLEX.open(f"/library/sections/{urllib.parse.quote(section_key)}/refresh").close()
+            scan_started = True
+        except (urllib.error.HTTPError, OSError, RuntimeError):
+            warnings.append("The files are gone, but Plex could not start a library scan automatically.")
+
+    result = {
+        "ok": True,
+        "ratingKey": plan["ratingKey"],
+        "type": plan["type"],
+        "title": plan["title"],
+        "deletedFileCount": deleted_file_count,
+        "deletedFolderCount": deleted_folder_count,
+        "prunedDirectoryCount": pruned,
+        "deletedBytes": plan["totalBytes"],
+        "deletedSizeText": plan["totalSizeText"],
+        "plexRemoved": plex_removed,
+        "scanStarted": scan_started,
+        "warnings": warnings,
+    }
+    try:
+        append_media_delete_audit(plan, result)
+    except OSError:
+        result["warnings"].append("The deletion completed, but its local audit entry could not be written.")
+    API_CACHE.clear()
+    return result
+
+
 def imdb_numeric(imdb_id: Optional[str]) -> Optional[str]:
     if not imdb_id:
         return None
@@ -2191,6 +2876,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/library-scan":
             self.api_library_scan(method)
             return
+        if path == "/api/media-delete":
+            self.api_media_delete(method, query)
+            return
         if path == "/api/watch-state":
             self.api_watch_state(method)
             return
@@ -2261,6 +2949,7 @@ class AppHandler(BaseHTTPRequestHandler):
             "authenticated": authenticated,
             "authRequired": not Settings.disable_auth,
             "version": APP_VERSION,
+            "mediaDeletionEnabled": Settings.media_delete_enabled,
         }
         if not authenticated:
             self.send_json(payload)
@@ -2407,6 +3096,51 @@ class AppHandler(BaseHTTPRequestHandler):
                 "plexStatus": plex_status,
             }
         )
+
+    def api_media_delete(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method not in {"GET", "HEAD", "POST"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload: Dict[str, Any] = self.read_json() if method == "POST" else {}
+        rating_key = (
+            str(payload.get("ratingKey") or "").strip()
+            if method == "POST"
+            else one(query, "ratingKey", "").strip()
+        )
+        try:
+            if method != "POST":
+                plan = build_media_delete_plan(rating_key)
+                self.send_json(public_media_delete_plan(plan))
+                return
+            if payload.get("confirmation") != "DELETE":
+                raise MediaDeletionError(
+                    "confirmation_required",
+                    "Type DELETE exactly to confirm permanent deletion.",
+                )
+            token_data = verify_media_delete_token(str(payload.get("confirmationToken") or ""))
+            if rating_key != str(token_data.get("ratingKey") or ""):
+                raise MediaDeletionError(
+                    "confirmation_invalid",
+                    "The confirmation does not match this Plex item.",
+                    409,
+                )
+            with MEDIA_DELETE_LOCK:
+                plan = build_media_delete_plan(rating_key)
+                if plan["_digest"] != token_data.get("digest"):
+                    raise MediaDeletionError(
+                        "deletion_plan_changed",
+                        "The files changed after the preview. Review the deletion again.",
+                        409,
+                    )
+                if not plan["canDelete"]:
+                    raise MediaDeletionError(
+                        "media_delete_blocked",
+                        plan.get("blockReason") or "Disk deletion is currently blocked.",
+                        409,
+                    )
+                self.send_json(execute_media_delete(plan))
+        except MediaDeletionError as exc:
+            self.send_json({"error": exc.code, "message": str(exc)}, status=exc.status)
 
     def api_watch_state(self, method: str) -> None:
         if method != "POST":

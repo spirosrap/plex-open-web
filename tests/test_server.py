@@ -1,6 +1,7 @@
 import gzip
 import io
 import json
+import os
 import threading
 import time
 import unittest
@@ -276,7 +277,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.14.0", responses[0][1]["version"])
+        self.assertEqual("0.15.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -291,7 +292,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.14.0", responses[0][1]["version"])
+        self.assertEqual("0.15.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -697,6 +698,202 @@ class EpisodeNeighborTests(unittest.TestCase):
         self.assertEqual(400, responses[0][0])
         self.assertEqual("invalid_rating_key", responses[0][1]["error"])
         self.assertEqual([], plex.xml_calls)
+
+
+class MediaDeletionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp_dir.name)
+        self.movies = self.base / "movies"
+        self.tv = self.base / "tv"
+        self.movies.mkdir()
+        self.tv.mkdir()
+        self.settings_patch = mock.patch.multiple(
+            server.Settings,
+            media_delete_enabled=True,
+            media_delete_roots=os.pathsep.join([str(self.movies), str(self.tv)]),
+            media_delete_plan_ttl=300,
+            qbittorrent_backup_dir="",
+            saved_media_dir=str(self.base / "saved"),
+        )
+        self.settings_patch.start()
+        self.audit_patch = mock.patch.object(
+            server,
+            "MEDIA_DELETE_LOG_FILE",
+            self.base / "data" / "media-delete-log.jsonl",
+        )
+        self.list_patch = mock.patch.object(
+            server,
+            "MY_LIST_FILE",
+            self.base / "data" / "my-list.json",
+        )
+        self.audit_patch.start()
+        self.list_patch.start()
+
+    def tearDown(self):
+        self.list_patch.stop()
+        self.audit_patch.stop()
+        self.settings_patch.stop()
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def element(path, item_type="movie", rating_key="501"):
+        episode_attrs = (
+            ' grandparentTitle="Test Show" parentIndex="1" index="3"'
+            if item_type == "episode"
+            else ""
+        )
+        escaped = str(path).replace("&", "&amp;").replace('"', "&quot;")
+        return ET.fromstring(
+            f'<Video ratingKey="{rating_key}" type="{item_type}" title="Test title" '
+            f'librarySectionID="7"{episode_attrs}>'
+            f'<Media videoCodec="h264" audioCodec="aac"><Part id="1" '
+            f'key="/library/parts/1/file.mkv" file="{escaped}" /></Media></Video>'
+        )
+
+    def test_movie_deletes_its_complete_folder_and_audits_the_action(self):
+        folder = self.movies / "Test Movie (2026)"
+        folder.mkdir()
+        video = folder / "Test.Movie.2026.mkv"
+        subtitle = folder / "Test.Movie.2026.en.srt"
+        note = folder / "README.txt"
+        video.write_bytes(b"video")
+        subtitle.write_text("subtitle")
+        note.write_text("release notes")
+        plex = FakePlex()
+
+        with mock.patch.object(server, "metadata_item_element", return_value=self.element(video)), mock.patch.object(server, "PLEX", plex):
+            plan = server.build_media_delete_plan("501")
+            public = server.public_media_delete_plan(plan)
+            token = server.verify_media_delete_token(public["confirmationToken"])
+            result = server.execute_media_delete(plan)
+
+        self.assertEqual(plan["_digest"], token["digest"])
+        self.assertEqual(1, public["folderCount"])
+        self.assertEqual(3, public["fileCount"])
+        self.assertFalse(folder.exists())
+        self.assertTrue(result["ok"])
+        self.assertTrue(server.MEDIA_DELETE_LOG_FILE.is_file())
+        self.assertIn(("/library/metadata/501", {}, {"method": "DELETE"}), plex.open_calls)
+
+    def test_episode_removes_all_approved_hardlinks_but_keeps_sibling_episode(self):
+        source = self.movies / "Test.Show.S01E03.mkv"
+        source.write_bytes(b"episode")
+        source.with_suffix(".en.srt").write_text("source subtitle")
+        season = self.tv / "Test Show" / "Season 01"
+        season.mkdir(parents=True)
+        episode = season / "Test Show - S01E03.mkv"
+        os.link(source, episode)
+        episode.with_suffix(".srt").write_text("tv subtitle")
+        sibling = season / "Test Show - S01E04.mkv"
+        sibling.write_bytes(b"next")
+
+        with mock.patch.object(
+            server,
+            "metadata_item_element",
+            return_value=self.element(episode, item_type="episode"),
+        ), mock.patch.object(server, "PLEX", FakePlex()):
+            plan = server.build_media_delete_plan("501")
+            result = server.execute_media_delete(plan)
+
+        self.assertEqual(1, plan["hardLinkCopies"])
+        self.assertEqual(0, plan["folderCount"])
+        self.assertFalse(source.exists())
+        self.assertFalse(episode.exists())
+        self.assertFalse(source.with_suffix(".en.srt").exists())
+        self.assertFalse(episode.with_suffix(".srt").exists())
+        self.assertTrue(sibling.is_file())
+        self.assertTrue(season.is_dir())
+        self.assertEqual(4, result["deletedFileCount"])
+
+    def test_movie_in_shared_folder_only_deletes_matching_files(self):
+        folder = self.movies / "Shared"
+        folder.mkdir()
+        video = folder / "Wanted.mkv"
+        subtitle = folder / "Wanted.en.srt"
+        other = folder / "Keep.mkv"
+        video.write_bytes(b"wanted")
+        subtitle.write_text("subtitle")
+        other.write_bytes(b"keep")
+
+        with mock.patch.object(server, "metadata_item_element", return_value=self.element(video)), mock.patch.object(server, "PLEX", FakePlex()):
+            plan = server.build_media_delete_plan("501")
+            server.execute_media_delete(plan)
+
+        self.assertEqual(0, plan["folderCount"])
+        self.assertTrue(any("other video files" in warning for warning in plan["warnings"]))
+        self.assertFalse(video.exists())
+        self.assertFalse(subtitle.exists())
+        self.assertTrue(other.is_file())
+
+    def test_preview_blocks_a_media_folder_the_service_cannot_write(self):
+        folder = self.movies / "Read Only Movie"
+        folder.mkdir()
+        video = folder / "Read.Only.Movie.mkv"
+        video.write_bytes(b"video")
+
+        with mock.patch.object(server, "metadata_item_element", return_value=self.element(video)), mock.patch.object(server.os, "access", return_value=False):
+            plan = server.build_media_delete_plan("501")
+
+        self.assertFalse(plan["canDelete"])
+        self.assertIn("cannot write", plan["blockReason"])
+        self.assertTrue(video.is_file())
+
+    def test_refuses_media_with_an_unapproved_hardlink(self):
+        video = self.movies / "Linked.mkv"
+        video.write_bytes(b"linked")
+        outside = self.base / "outside"
+        outside.mkdir()
+        os.link(video, outside / "Linked.mkv")
+
+        with mock.patch.object(server, "metadata_item_element", return_value=self.element(video)):
+            with self.assertRaises(server.MediaDeletionError) as raised:
+                server.build_media_delete_plan("501")
+
+        self.assertEqual("hardlinks_outside_approved_roots", raised.exception.code)
+
+    def test_endpoint_requires_the_exact_confirmation_phrase(self):
+        folder = self.movies / "Confirmed Movie"
+        folder.mkdir()
+        video = folder / "Confirmed.Movie.mkv"
+        video.write_bytes(b"video")
+        elem = self.element(video)
+        with mock.patch.object(server, "metadata_item_element", return_value=elem):
+            plan = server.public_media_delete_plan(server.build_media_delete_plan("501"))
+            handler, responses = handler_with_payload(
+                {
+                    "ratingKey": "501",
+                    "confirmationToken": plan["confirmationToken"],
+                    "confirmation": "delete",
+                }
+            )
+            handler.api_media_delete("POST", {})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("confirmation_required", responses[0][1]["error"])
+        self.assertTrue(video.is_file())
+
+    def test_endpoint_rejects_a_plan_when_folder_contents_change(self):
+        folder = self.movies / "Changing Movie"
+        folder.mkdir()
+        video = folder / "Changing.Movie.mkv"
+        video.write_bytes(b"video")
+        elem = self.element(video)
+        with mock.patch.object(server, "metadata_item_element", return_value=elem):
+            plan = server.public_media_delete_plan(server.build_media_delete_plan("501"))
+            (folder / "new-file.txt").write_text("arrived after preview")
+            handler, responses = handler_with_payload(
+                {
+                    "ratingKey": "501",
+                    "confirmationToken": plan["confirmationToken"],
+                    "confirmation": "DELETE",
+                }
+            )
+            handler.api_media_delete("POST", {})
+
+        self.assertEqual(409, responses[0][0])
+        self.assertEqual("deletion_plan_changed", responses[0][1]["error"])
+        self.assertTrue(video.is_file())
 
 
 class MyListTests(unittest.TestCase):
