@@ -25,6 +25,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Browser subtitle selection from Plex subtitle streams and sidecar subtitle files.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
+- Seekable Plex VOD playback for Safari and Apple-device browsers when video or audio conversion is required.
 - Codec-aware FFmpeg fallback that converts unsupported video such as HEVC to H.264 and unsupported audio such as AC3 to AAC.
 - Poster/artwork proxy so the browser only needs this app URL.
 - Compressed API responses, right-sized artwork, and coalesced Plex reads for fast browsing over a tailnet.
@@ -34,6 +35,27 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.17.0
+
+**Added**
+
+- Added an authenticated proxy for Plex's on-demand HLS transcoder, providing complete movie and episode durations before every segment has been generated.
+- Added explicit VOD playlist signaling and safe on-demand segment routing for native Safari playback.
+
+**Improved**
+
+- Compatible playback can start immediately while retaining the normal duration, seek bar, elapsed time, and remaining-time controls.
+- Seeking can jump directly to any point in a movie; Plex generates the requested segment on demand instead of waiting for a full-file conversion.
+- Repeated playlist requests reuse one transcode session, and sessions are stopped when the player closes, changes source, or leaves the page.
+- Expected browser disconnects from cancelled seek segments are handled quietly without noisy server tracebacks.
+- Existing bounded FFmpeg HLS generation remains available as a fallback for older clients without an item identity.
+
+**Fixed**
+
+- Fixed some AC3, EAC3, DTS, and other compatibility streams appearing as `Live Broadcast` in Safari.
+- Fixed Safari temporarily hiding the movie timeline and normal playback controls while a growing event playlist was being prepared.
+- Plex authentication tokens remain server-side while manifests and segments pass through the app's existing signed-session boundary.
 
 ### 0.16.0
 
@@ -443,10 +465,10 @@ Optional compatible-playback settings:
 
 - `FFMPEG_PATH`: FFmpeg executable used for audio conversion, saved copies, embedded subtitles, and HLS playback.
 - `SAVED_MEDIA_DIR`: storage for prepared MP4 files and temporary HLS sessions; defaults outside the source directory.
-- `HLS_CACHE_TTL`: inactive HLS session lifetime in seconds; defaults to four hours.
-- `HLS_CACHE_MAX_BYTES`: target maximum for completed inactive HLS sessions; defaults to 6 GiB, while an active playback session is always preserved.
-- `HLS_STARTUP_TIMEOUT`: maximum wait for the first HLS segment; defaults to 15 seconds.
-- `HLS_TRANSCODE_TIMEOUT`: maximum HLS generation time; defaults to four hours.
+- `HLS_CACHE_TTL`: inactive Plex VOD session and fallback HLS cache lifetime; defaults to four hours.
+- `HLS_CACHE_MAX_BYTES`: target maximum for completed inactive fallback HLS sessions; defaults to 6 GiB, while an active playback session is always preserved.
+- `HLS_STARTUP_TIMEOUT`: maximum wait for Plex VOD setup or the first fallback HLS segment; defaults to 15 seconds.
+- `HLS_TRANSCODE_TIMEOUT`: maximum fallback HLS generation time; defaults to four hours.
 
 Optional permanent media deletion settings:
 
@@ -500,7 +522,7 @@ For public internet access, use a separate HTTPS reverse proxy or Tailscale Funn
 
 ## Notes
 
-- Direct browser playback depends on the source file codec/container being supported by the browser. MP4/H.264/AAC is the safest. Unsupported audio can be converted to AAC with FFmpeg when `ffmpeg` is installed.
+- Direct browser playback depends on the source file codec/container being supported by the browser. MP4/H.264/AAC is the safest. Safari-compatible conversion uses Plex's on-demand VOD transcoder, with FFmpeg retained for saved copies and fallback playback.
 - OpenSubtitles downloads require the app user to have write access to the media folder so it can save the sidecar subtitle file.
 
 ## Security

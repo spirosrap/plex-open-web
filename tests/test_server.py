@@ -22,6 +22,22 @@ class FakeResponse:
         return None
 
 
+class FakeBytesResponse(FakeResponse):
+    def __init__(self, body=b"", status=200, headers=None):
+        self.body = body
+        self.status = status
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self, _size=-1):
+        return self.body
+
+
 class FakePlex:
     def __init__(self):
         self.xml_calls = []
@@ -339,7 +355,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.16.0", responses[0][1]["version"])
+        self.assertEqual("0.17.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -354,11 +370,15 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.16.0", responses[0][1]["version"])
+        self.assertEqual("0.17.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
 class PlaybackCompatibilityTests(unittest.TestCase):
+    def tearDown(self):
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS.clear()
+
     def test_hevc_video_and_eac3_audio_use_the_full_compatibility_stream(self):
         playback = server.playback_info(
             "/library/parts/42/file.mkv",
@@ -380,6 +400,18 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertTrue(playback["videoTranscodeRequired"])
         self.assertFalse(playback["audioTranscodeRequired"])
         self.assertIn("video=h264", playback["compatibleStreamUrl"])
+
+    def test_compatibility_stream_carries_rating_key_for_seekable_vod(self):
+        playback = server.playback_info(
+            "/library/parts/42/file.mkv",
+            {"videoCodec": "h264", "audioCodec": "ac3"},
+            "701",
+        )
+
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(playback["compatibleStreamUrl"]).query
+        )
+        self.assertEqual(["701"], query["ratingKey"])
 
     def test_live_audio_transcode_uses_a_safari_compatible_mp4_header(self):
         with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
@@ -444,6 +476,107 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertIn("name=segment-00000.ts", manifest)
         with self.assertRaises(ValueError):
             server.hls_manifest_text("a" * 24, "#EXTM3U\n../outside.ts\n")
+
+    def test_plex_hls_profile_requests_seekable_aac_vod(self):
+        params = server.plex_hls_transcode_params(
+            "701",
+            "a" * 32,
+            media_index=2,
+            part_index=1,
+        )
+
+        self.assertEqual("/library/metadata/701", params["path"])
+        self.assertEqual("2", params["mediaIndex"])
+        self.assertEqual("1", params["partIndex"])
+        self.assertEqual("hls", params["protocol"])
+        self.assertEqual("1", params["fastSeek"])
+        self.assertEqual("1", params["directStream"])
+        self.assertEqual("0", params["directStreamAudio"])
+        self.assertEqual("aac", params["audioCodec"])
+        self.assertEqual("none", params["subtitles"])
+
+    def test_media_part_indices_follow_the_selected_part(self):
+        item = ET.fromstring(
+            '<Video ratingKey="701">'
+            '<Media><Part key="/library/parts/1/first.mkv" /></Media>'
+            '<Media><Part key="/library/parts/2/second.mkv" /></Media>'
+            '</Video>'
+        )
+
+        self.assertEqual(
+            (1, 0),
+            server.media_part_indices(item, "/library/parts/2/second.mkv"),
+        )
+
+    def test_plex_hls_manifests_are_rewritten_as_complete_vod(self):
+        session_id = "a" * 32
+        master, variants = server.plex_hls_master_text(
+            session_id,
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n"
+            f"session/{session_id}/base/index.m3u8?X-Plex-Incomplete-Segments=1\n",
+        )
+        playlist = server.plex_hls_playlist_text(
+            session_id,
+            "base",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10, nodesc\n"
+            "00000.ts\n#EXT-X-ENDLIST\n",
+        )
+
+        self.assertEqual({"base"}, variants)
+        self.assertIn("/api/plex-hls-playlist?id=", master)
+        self.assertIn("#EXT-X-PLAYLIST-TYPE:VOD", playlist)
+        self.assertIn("/api/plex-hls-segment?id=", playlist)
+        self.assertIn("name=00000.ts", playlist)
+        self.assertIn("#EXT-X-ENDLIST", playlist)
+        with self.assertRaises(RuntimeError):
+            server.plex_hls_playlist_text(
+                session_id,
+                "base",
+                "#EXTM3U\n#EXTINF:10,\n00000.ts\n",
+            )
+        with self.assertRaises(ValueError):
+            server.plex_hls_playlist_text(
+                session_id,
+                "base",
+                "#EXTM3U\n#EXTINF:10,\n../outside.ts\n#EXT-X-ENDLIST\n",
+            )
+
+    def test_plex_hls_session_runs_decision_before_start_and_reuses_result(self):
+        class FakePlexHls:
+            def __init__(self):
+                self.calls = []
+
+            def open(self, path, params=None, **kwargs):
+                self.calls.append((path, dict(params or {}), dict(kwargs)))
+                if path.endswith("/decision"):
+                    return FakeBytesResponse(b'<MediaContainer transcodeDecisionCode="1001" />')
+                if path.endswith("/start.m3u8"):
+                    session_id = params["session"]
+                    return FakeBytesResponse(
+                        (
+                            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n"
+                            f"session/{session_id}/base/index.m3u8\n"
+                        ).encode()
+                    )
+                return FakeBytesResponse()
+
+        plex = FakePlexHls()
+        session_id = "b" * 32
+        with mock.patch.object(server, "PLEX", plex):
+            first = server.ensure_plex_hls_session(session_id, "701")
+            second = server.ensure_plex_hls_session(session_id, "701")
+            stopped = server.stop_plex_hls_session(session_id)
+
+        self.assertIs(first, second)
+        self.assertTrue(stopped)
+        self.assertEqual(
+            [
+                "/video/:/transcode/universal/decision",
+                "/video/:/transcode/universal/start.m3u8",
+                "/video/:/transcode/universal/stop",
+            ],
+            [call[0] for call in plex.calls],
+        )
 
 
 class MediaMatchTests(unittest.TestCase):

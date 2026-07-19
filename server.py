@@ -41,13 +41,16 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.16.0"
+APP_VERSION = "0.17.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
 HLS_SEGMENT_PATTERN = re.compile(r"segment-\d{5}\.ts")
+PLEX_HLS_SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
+PLEX_HLS_VARIANT_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+PLEX_HLS_SEGMENT_PATTERN = re.compile(r"^\d{5}\.ts$")
 MATCH_GUID_PATTERN = re.compile(r"^plex://(movie|show)/[A-Za-z0-9._-]{1,160}$")
 MATCH_LANGUAGE_PATTERN = re.compile(r"^[a-z]{2}(?:-[A-Z]{2})?$")
 JSON_COMPRESSION_MIN_BYTES = 1024
@@ -541,6 +544,8 @@ SAVE_JOBS: Dict[str, Dict[str, Any]] = {}
 SAVE_JOBS_LOCK = threading.Lock()
 HLS_JOBS: Dict[str, Dict[str, Any]] = {}
 HLS_JOBS_LOCK = threading.Lock()
+PLEX_HLS_SESSIONS: Dict[str, Dict[str, Any]] = {}
+PLEX_HLS_SESSIONS_LOCK = threading.Lock()
 
 
 def subtitle_codec_aliases(codec: Optional[str]) -> set:
@@ -566,10 +571,13 @@ def part_stream_url(part_key: Optional[str]) -> Optional[str]:
 def compatible_stream_url(
     part_key: Optional[str],
     transcode_video: bool = False,
+    rating_key: Optional[str] = None,
 ) -> Optional[str]:
     if not part_key:
         return None
     params = {"partKey": part_key}
+    if rating_key:
+        params["ratingKey"] = rating_key
     if transcode_video:
         params["video"] = "h264"
     return "/api/stream-compatible?" + urllib.parse.urlencode(params)
@@ -838,7 +846,20 @@ def first_part(elem: ET.Element) -> Tuple[Optional[str], Dict[str, Any], List[Di
     return selected_part.get("key"), media_details(selected_media, selected_part), selected_subtitles
 
 
-def playback_info(part_key: Optional[str], media: Dict[str, Any]) -> Dict[str, Any]:
+def media_part_indices(elem: ET.Element, part_key: str) -> Optional[Tuple[int, int]]:
+    for media_index, media in enumerate(elem.findall("Media")):
+        for part_index, part in enumerate(media.findall("Part")):
+            candidate = safe_plex_path(part.get("key") or "", prefix="/library/parts/")
+            if candidate == part_key:
+                return media_index, part_index
+    return None
+
+
+def playback_info(
+    part_key: Optional[str],
+    media: Dict[str, Any],
+    rating_key: Optional[str] = None,
+) -> Dict[str, Any]:
     audio_codec = (media.get("audioCodec") or "").lower()
     video_codec = (media.get("videoCodec") or "").lower()
     needs_audio_transcode = audio_codec in TRANSCODE_AUDIO_CODECS or (
@@ -851,7 +872,7 @@ def playback_info(part_key: Optional[str], media: Dict[str, Any]) -> Dict[str, A
         "videoCodec": video_codec or None,
         "directStreamUrl": part_stream_url(part_key),
         "compatibleStreamUrl": (
-            compatible_stream_url(part_key, needs_video_transcode)
+            compatible_stream_url(part_key, needs_video_transcode, rating_key)
             if needs_compatible_stream
             else part_stream_url(part_key)
         ),
@@ -1371,6 +1392,247 @@ def ensure_hls_stream(
     raise TimeoutError("HLS stream did not start in time")
 
 
+def plex_hls_headers(session_id: str) -> Dict[str, str]:
+    return {
+        "Accept": "application/vnd.apple.mpegurl, application/xml;q=0.9, */*;q=0.8",
+        "X-Plex-Product": "Plex Web",
+        "X-Plex-Version": APP_VERSION,
+        "X-Plex-Platform": "Safari",
+        "X-Plex-Platform-Version": "26.0",
+        "X-Plex-Device": "OS X",
+        "X-Plex-Device-Name": "Plex Open Web",
+        "X-Plex-Model": "hosted",
+        "X-Plex-Client-Identifier": "plex-open-web",
+        "X-Plex-Session-Identifier": session_id,
+    }
+
+
+def plex_hls_transcode_params(
+    rating_key: str,
+    session_id: str,
+    remote_quality: bool = False,
+    media_index: int = 0,
+    part_index: int = 0,
+) -> Dict[str, Any]:
+    return {
+        "hasMDE": "1",
+        "path": f"/library/metadata/{rating_key}",
+        "mediaIndex": str(media_index),
+        "partIndex": str(part_index),
+        "protocol": "hls",
+        "fastSeek": "1",
+        "directPlay": "0",
+        "directStream": "1",
+        "directStreamAudio": "0",
+        "videoCodec": "h264",
+        "audioCodec": "aac",
+        "subtitles": "none",
+        "subtitleSize": "100",
+        "audioBoost": "100",
+        "videoQuality": "60" if remote_quality else "100",
+        "videoResolution": "720x480" if remote_quality else "1920x1080",
+        "maxVideoBitrate": "2000" if remote_quality else "20000",
+        "location": "wan" if remote_quality else "lan",
+        "session": session_id,
+        "X-Plex-Session-Identifier": session_id,
+        "X-Plex-Incomplete-Segments": "1",
+    }
+
+
+def plex_hls_master_text(session_id: str, raw_manifest: str) -> Tuple[str, set]:
+    lines: List[str] = []
+    variants = set()
+    pattern = re.compile(
+        rf"(?:^|/)session/{re.escape(session_id)}/([A-Za-z0-9_-]+)/(?:index\.m3u8)$"
+    )
+    for raw_line in raw_manifest.splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#"):
+            match = pattern.search(urllib.parse.urlsplit(line).path)
+            if not match or not PLEX_HLS_VARIANT_PATTERN.fullmatch(match.group(1)):
+                raise ValueError("invalid_plex_hls_variant")
+            variant = match.group(1)
+            variants.add(variant)
+            line = "/api/plex-hls-playlist?" + urllib.parse.urlencode(
+                {"id": session_id, "variant": variant}
+            )
+        lines.append(line)
+    if not variants:
+        raise ValueError("empty_plex_hls_master")
+    return "\n".join(lines) + "\n", variants
+
+
+def plex_hls_playlist_text(
+    session_id: str,
+    variant: str,
+    raw_manifest: str,
+) -> str:
+    raw_lines = [line.strip() for line in raw_manifest.splitlines()]
+    if "#EXT-X-ENDLIST" not in raw_lines:
+        raise RuntimeError("Plex returned an incomplete VOD playlist")
+    has_playlist_type = any(line.startswith("#EXT-X-PLAYLIST-TYPE:") for line in raw_lines)
+    lines: List[str] = []
+    for line in raw_lines:
+        if line and not line.startswith("#"):
+            name = Path(urllib.parse.urlsplit(line).path).name
+            if not PLEX_HLS_SEGMENT_PATTERN.fullmatch(name):
+                raise ValueError("invalid_plex_hls_segment")
+            line = "/api/plex-hls-segment?" + urllib.parse.urlencode(
+                {"id": session_id, "variant": variant, "name": name}
+            )
+        lines.append(line)
+        if line == "#EXTM3U" and not has_playlist_type:
+            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+    return "\n".join(lines) + "\n"
+
+
+def stop_plex_hls_upstream(session_id: str) -> None:
+    try:
+        PLEX.open(
+            "/video/:/transcode/universal/stop",
+            params={"session": session_id},
+            headers=plex_hls_headers(session_id),
+            timeout=Settings.request_timeout,
+        ).close()
+    except Exception:
+        pass
+
+
+def stop_plex_hls_session(session_id: str) -> bool:
+    with PLEX_HLS_SESSIONS_LOCK:
+        session = PLEX_HLS_SESSIONS.pop(session_id, None)
+    if session:
+        session["stopped"] = True
+        session["event"].set()
+    stop_plex_hls_upstream(session_id)
+    return session is not None
+
+
+def prune_plex_hls_sessions() -> None:
+    cutoff = time.monotonic() - max(300, Settings.hls_cache_ttl)
+    with PLEX_HLS_SESSIONS_LOCK:
+        expired = [
+            session_id
+            for session_id, session in PLEX_HLS_SESSIONS.items()
+            if session.get("lastAccess", 0) < cutoff
+        ]
+        for session_id in expired:
+            PLEX_HLS_SESSIONS.pop(session_id, None)
+    for session_id in expired:
+        stop_plex_hls_upstream(session_id)
+
+
+def ensure_plex_hls_session(
+    session_id: str,
+    rating_key: str,
+    remote_quality: bool = False,
+    media_index: int = 0,
+    part_index: int = 0,
+) -> Dict[str, Any]:
+    prune_plex_hls_sessions()
+    now = time.monotonic()
+    with PLEX_HLS_SESSIONS_LOCK:
+        session = PLEX_HLS_SESSIONS.get(session_id)
+        if session and (
+            session.get("ratingKey") != rating_key
+            or bool(session.get("remoteQuality")) != remote_quality
+            or session.get("mediaIndex") != media_index
+            or session.get("partIndex") != part_index
+        ):
+            raise ValueError("plex_hls_session_conflict")
+        owner = session is None
+        if owner:
+            session = {
+                "state": "starting",
+                "ratingKey": rating_key,
+                "remoteQuality": remote_quality,
+                "mediaIndex": media_index,
+                "partIndex": part_index,
+                "lastAccess": now,
+                "event": threading.Event(),
+                "stopped": False,
+            }
+            PLEX_HLS_SESSIONS[session_id] = session
+        elif session.get("state") == "ready":
+            session["lastAccess"] = now
+            return session
+        elif session.get("state") == "error":
+            raise RuntimeError(session.get("message") or "Plex HLS session failed")
+
+    if not owner:
+        session["event"].wait(max(2, Settings.hls_startup_timeout))
+        if session.get("state") == "ready":
+            session["lastAccess"] = time.monotonic()
+            return session
+        raise RuntimeError(session.get("message") or "Plex HLS session did not start")
+
+    try:
+        params = plex_hls_transcode_params(
+            rating_key,
+            session_id,
+            remote_quality,
+            media_index,
+            part_index,
+        )
+        headers = plex_hls_headers(session_id)
+        with PLEX.open(
+            "/video/:/transcode/universal/decision",
+            params=params,
+            headers=headers,
+            timeout=Settings.hls_startup_timeout,
+        ) as response:
+            ET.fromstring(response.read())
+        with PLEX.open(
+            "/video/:/transcode/universal/start.m3u8",
+            params=params,
+            headers=headers,
+            timeout=Settings.hls_startup_timeout,
+        ) as response:
+            raw_master = response.read().decode("utf-8")
+        master, variants = plex_hls_master_text(session_id, raw_master)
+        with PLEX_HLS_SESSIONS_LOCK:
+            current = PLEX_HLS_SESSIONS.get(session_id)
+            if current is not session or session.get("stopped"):
+                stopped = True
+            else:
+                stopped = False
+                session.update(
+                    {
+                        "state": "ready",
+                        "master": master,
+                        "variants": variants,
+                        "lastAccess": time.monotonic(),
+                    }
+                )
+                session["event"].set()
+        if stopped:
+            stop_plex_hls_upstream(session_id)
+            raise RuntimeError("Plex HLS session was stopped")
+        return session
+    except Exception as exc:
+        with PLEX_HLS_SESSIONS_LOCK:
+            current = PLEX_HLS_SESSIONS.get(session_id)
+            if current is session:
+                session.update({"state": "error", "message": str(exc)[:500]})
+                session["event"].set()
+        raise
+
+
+def active_plex_hls_session(session_id: str, variant: str) -> Optional[Dict[str, Any]]:
+    if not PLEX_HLS_SESSION_PATTERN.fullmatch(session_id):
+        return None
+    if not PLEX_HLS_VARIANT_PATTERN.fullmatch(variant):
+        return None
+    with PLEX_HLS_SESSIONS_LOCK:
+        session = PLEX_HLS_SESSIONS.get(session_id)
+        if not session or session.get("state") != "ready":
+            return None
+        if variant not in session.get("variants", set()):
+            return None
+        session["lastAccess"] = time.monotonic()
+        return session
+
+
 def metadata_item_for_rating_key(rating_key: str) -> Optional[Dict[str, Any]]:
     elem = metadata_item_element(rating_key)
     return item_from_xml(elem) if elem is not None else None
@@ -1652,7 +1914,7 @@ def item_from_xml(
     title = elem.get("title") or elem.get("parentTitle") or elem.get("grandparentTitle") or "Untitled"
     item_type = elem.get("type") or elem.tag.lower()
     guids, external_ids = external_ids_from_xml(elem) if include_guids else ([], {})
-    playback = playback_info(part_key, media)
+    playback = playback_info(part_key, media, elem.get("ratingKey"))
     item = {
         "ratingKey": elem.get("ratingKey"),
         "key": elem.get("key"),
@@ -3358,7 +3620,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_json({"authenticated": False}, headers={"Set-Cookie": cookie.output(header="").strip()})
 
     def handle_api(self, method: str, path: str, query: Dict[str, List[str]]) -> None:
-        if method == "POST":
+        if method == "POST" and path != "/api/plex-hls-stop":
             API_CACHE.clear()
         if path == "/api/my-list":
             self.api_my_list(method, query)
@@ -3389,6 +3651,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/playback-progress":
             self.api_playback_progress(method)
+            return
+        if path == "/api/plex-hls-stop":
+            self.api_plex_hls_stop(method)
             return
         if method not in {"GET", "HEAD"}:
             self.send_json({"error": "method_not_allowed"}, status=405)
@@ -3423,6 +3688,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self.handle_stream_compatible(method, query)
         elif path == "/api/hls-segment":
             self.handle_hls_segment(method, query)
+        elif path == "/api/plex-hls-playlist":
+            self.handle_plex_hls_playlist(method, query)
+        elif path == "/api/plex-hls-segment":
+            self.handle_plex_hls_segment(method, query)
         elif path == "/api/saved-stream":
             self.handle_saved_stream(method, query)
         elif path == "/api/download-original":
@@ -4338,6 +4607,45 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         quality = one(query, "quality", "").strip().lower()
         remote_quality = quality in {"remote", "low", "480p"}
+        rating_key = one(query, "ratingKey", "").strip()
+        if re.fullmatch(r"\d+", rating_key):
+            item_elem = metadata_item_element(rating_key)
+            indices = media_part_indices(item_elem, part_key) if item_elem is not None else None
+            if item_elem is None or indices is None:
+                self.send_json({"error": "invalid_hls_item"}, status=409)
+                return
+            session_id = one(query, "session", "").strip().lower() or secrets.token_hex(16)
+            if not PLEX_HLS_SESSION_PATTERN.fullmatch(session_id):
+                self.send_json({"error": "invalid_hls_session"}, status=400)
+                return
+            try:
+                session = ensure_plex_hls_session(
+                    session_id,
+                    rating_key,
+                    remote_quality,
+                    *indices,
+                )
+                body = session["master"].encode("utf-8")
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, status=409)
+                return
+            except (ET.ParseError, UnicodeDecodeError, RuntimeError, urllib.error.URLError) as exc:
+                self.send_json(
+                    {"error": "plex_hls_start_failed", "message": str(exc)},
+                    status=502,
+                )
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "X-Playback-Mode",
+                "plex-vod-480p-h264-aac" if remote_quality else "plex-vod-h264-aac",
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         video_mode = one(query, "video", "").strip().lower()
         transcode_video = video_mode in {"h264", "transcode"}
         try:
@@ -4369,6 +4677,112 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def handle_plex_hls_playlist(
+        self,
+        method: str,
+        query: Dict[str, List[str]],
+    ) -> None:
+        if method not in {"GET", "HEAD"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        self.require_auth()
+        session_id = one(query, "id", "").strip().lower()
+        variant = one(query, "variant", "").strip()
+        session = active_plex_hls_session(session_id, variant)
+        if not session:
+            self.send_json({"error": "plex_hls_session_not_found"}, status=404)
+            return
+        if method == "HEAD":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        path = f"/video/:/transcode/universal/session/{session_id}/{variant}/index.m3u8"
+        try:
+            with PLEX.open(
+                path,
+                params={"X-Plex-Incomplete-Segments": "1"},
+                headers=plex_hls_headers(session_id),
+                timeout=Settings.hls_startup_timeout,
+            ) as response:
+                raw_manifest = response.read().decode("utf-8")
+            body = plex_hls_playlist_text(session_id, variant, raw_manifest).encode("utf-8")
+        except (UnicodeDecodeError, ValueError, RuntimeError, urllib.error.URLError) as exc:
+            self.send_json(
+                {"error": "plex_hls_playlist_failed", "message": str(exc)},
+                status=502,
+            )
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_plex_hls_segment(
+        self,
+        method: str,
+        query: Dict[str, List[str]],
+    ) -> None:
+        if method not in {"GET", "HEAD"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        self.require_auth()
+        session_id = one(query, "id", "").strip().lower()
+        variant = one(query, "variant", "").strip()
+        name = one(query, "name", "").strip()
+        session = active_plex_hls_session(session_id, variant)
+        if not session or not PLEX_HLS_SEGMENT_PATTERN.fullmatch(name):
+            self.send_json({"error": "plex_hls_segment_not_found"}, status=404)
+            return
+        path = f"/video/:/transcode/universal/session/{session_id}/{variant}/{name}"
+        headers = plex_hls_headers(session_id)
+        if self.headers.get("Range"):
+            headers["Range"] = self.headers["Range"]
+        try:
+            with PLEX.open(
+                path,
+                headers=headers,
+                timeout=Settings.stream_timeout,
+                method=method,
+            ) as response:
+                self.send_response(response.status)
+                self.send_header("Content-Type", response.headers.get("Content-Type", "video/mp2t"))
+                for header in ["Content-Length", "Content-Range", "Accept-Ranges", "ETag"]:
+                    value = response.headers.get(header)
+                    if value:
+                        self.send_header(header, value)
+                self.send_header("Cache-Control", "private, max-age=14400, immutable")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                if method == "GET":
+                    try:
+                        copy_stream(response, self.wfile)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+        except urllib.error.HTTPError as exc:
+            self.send_json({"error": "plex_hls_segment_failed"}, status=exc.code)
+        except urllib.error.URLError as exc:
+            self.send_json(
+                {"error": "plex_hls_segment_failed", "message": str(exc)},
+                status=502,
+            )
+
+    def api_plex_hls_stop(self, method: str) -> None:
+        if method != "POST":
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        self.require_auth()
+        session_id = str(self.read_json().get("id") or "").strip().lower()
+        if not PLEX_HLS_SESSION_PATTERN.fullmatch(session_id):
+            self.send_json({"error": "invalid_hls_session"}, status=400)
+            return
+        stopped = stop_plex_hls_session(session_id)
+        self.send_json({"ok": True, "stopped": stopped})
 
     def handle_hls_segment(self, method: str, query: Dict[str, List[str]]) -> None:
         if method not in {"GET", "HEAD"}:
@@ -4769,6 +5183,11 @@ class ResponsiveThreadingHTTPServer(ThreadingHTTPServer):
     block_on_close = False
     request_queue_size = 128
     allow_reuse_address = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def one(query: Dict[str, List[str]], key: str, default: str = "") -> str:

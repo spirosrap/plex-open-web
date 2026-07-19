@@ -52,6 +52,7 @@ const state = {
   lastReportedTimeMs: 0,
   usingSavedPlayback: false,
   usingDevicePlayback: false,
+  activeHlsSessionId: null,
   deviceSaveInProgress: false,
   deviceObjectUrls: [],
   subtitleItem: null,
@@ -2292,7 +2293,7 @@ function setPlaybackMode(item, mode) {
     } else if (videoTranscode) {
       el.playbackMode.textContent = "H.264 video";
     } else {
-      el.playbackMode.textContent = nativeHls ? "HLS + AAC" : "AAC audio";
+      el.playbackMode.textContent = nativeHls ? "VOD + AAC" : "AAC audio";
     }
     el.playbackMode.title = [
       item.playback?.videoTranscodeReason,
@@ -2350,11 +2351,49 @@ function downloadOriginalFiles(item = state.playerItem) {
   link.remove();
 }
 
+function newHlsSessionId() {
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function stopActiveHlsSession({ keepalive = false } = {}) {
+  const id = state.activeHlsSessionId;
+  state.activeHlsSessionId = null;
+  if (!id) return;
+  fetch("/api/plex-hls-stop", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+    keepalive,
+  }).catch(() => {});
+}
+
+function playerStreamUrl(streamUrl) {
+  const url = new URL(streamUrl, window.location.origin);
+  if (url.searchParams.get("format") !== "hls") {
+    stopActiveHlsSession();
+    return streamUrl;
+  }
+  let sessionId = url.searchParams.get("session") || "";
+  if (!/^[a-f0-9]{32}$/.test(sessionId)) {
+    sessionId = newHlsSessionId();
+    url.searchParams.set("session", sessionId);
+  }
+  if (state.activeHlsSessionId && state.activeHlsSessionId !== sessionId) {
+    stopActiveHlsSession();
+  }
+  state.activeHlsSessionId = sessionId;
+  return url.origin === window.location.origin ? `${url.pathname}${url.search}` : url.href;
+}
+
 function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } = {}) {
   el.playerError.hidden = true;
   el.playerError.textContent = "";
   clearSubtitleTracks();
-  const isHlsStream = new URL(streamUrl, window.location.origin).searchParams.get("format") === "hls";
+  const preparedStreamUrl = playerStreamUrl(streamUrl);
+  const isHlsStream = new URL(preparedStreamUrl, window.location.origin).searchParams.get("format") === "hls";
   const applyResume = () => {
     reapplyActiveSubtitle();
     if ((isHlsStream || resumeTime > 0) && Number.isFinite(resumeTime)) {
@@ -2370,7 +2409,7 @@ function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } =
   };
   el.player.addEventListener("loadedmetadata", applyResume, { once: true });
   el.player.addEventListener("loadeddata", reapplyActiveSubtitle, { once: true });
-  el.player.src = streamUrl;
+  el.player.src = preparedStreamUrl;
   configureSubtitles(item);
   el.player.load();
   if (autoplay) {
@@ -3009,6 +3048,7 @@ el.playerDialog.addEventListener("close", async () => {
   state.playerNeighbors = null;
   stopProgressReporting();
   stopSavePolling();
+  stopActiveHlsSession({ keepalive: true });
   el.player.pause();
   el.player.removeAttribute("src");
   el.playbackMode.hidden = true;
@@ -3078,6 +3118,7 @@ el.player.addEventListener("ended", () => {
 });
 window.addEventListener("pagehide", () => {
   reportPlaybackProgress("stopped", { force: true, keepalive: true }).catch(() => {});
+  stopActiveHlsSession({ keepalive: true });
 });
 el.playerSave.addEventListener("click", async () => {
   try {
