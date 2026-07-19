@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.15.3"
+APP_VERSION = "0.15.4"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -560,10 +560,16 @@ def part_stream_url(part_key: Optional[str]) -> Optional[str]:
     return "/api/stream?" + urllib.parse.urlencode({"partKey": part_key})
 
 
-def compatible_stream_url(part_key: Optional[str]) -> Optional[str]:
+def compatible_stream_url(
+    part_key: Optional[str],
+    transcode_video: bool = False,
+) -> Optional[str]:
     if not part_key:
         return None
-    return "/api/stream-compatible?" + urllib.parse.urlencode({"partKey": part_key})
+    params = {"partKey": part_key}
+    if transcode_video:
+        params["video"] = "h264"
+    return "/api/stream-compatible?" + urllib.parse.urlencode(params)
 
 
 def original_download_url(rating_key: Optional[str]) -> Optional[str]:
@@ -835,15 +841,28 @@ def playback_info(part_key: Optional[str], media: Dict[str, Any]) -> Dict[str, A
     needs_audio_transcode = audio_codec in TRANSCODE_AUDIO_CODECS or (
         audio_codec and audio_codec not in BROWSER_AUDIO_CODECS
     )
+    needs_video_transcode = bool(video_codec and video_codec not in BROWSER_VIDEO_CODECS)
+    needs_compatible_stream = bool(needs_audio_transcode or needs_video_transcode)
     return {
         "audioCodec": audio_codec or None,
         "videoCodec": video_codec or None,
         "directStreamUrl": part_stream_url(part_key),
-        "compatibleStreamUrl": compatible_stream_url(part_key) if needs_audio_transcode else part_stream_url(part_key),
+        "compatibleStreamUrl": (
+            compatible_stream_url(part_key, needs_video_transcode)
+            if needs_compatible_stream
+            else part_stream_url(part_key)
+        ),
+        "compatibilityTranscodeRequired": needs_compatible_stream,
         "audioTranscodeRequired": needs_audio_transcode,
         "audioTranscodeReason": (
             f"{audio_codec.upper()} audio is not reliably supported by browser video playback"
             if needs_audio_transcode and audio_codec
+            else None
+        ),
+        "videoTranscodeRequired": needs_video_transcode,
+        "videoTranscodeReason": (
+            f"{video_codec.upper()} video is not reliably supported by browser streaming"
+            if needs_video_transcode
             else None
         ),
     }
@@ -997,7 +1016,62 @@ def saved_playback_command(part_key: str, media: Dict[str, Any], output_path: Pa
     return command
 
 
-def compatible_stream_command(part_key: str, remote_quality: bool = False) -> List[str]:
+def compatible_video_command_args(
+    remote_quality: bool = False,
+    transcode_video: bool = False,
+) -> List[str]:
+    if remote_quality:
+        return [
+            "-vf",
+            "scale=-2:480",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-profile:v",
+            "main",
+            "-pix_fmt",
+            "yuv420p",
+            "-b:v",
+            "900k",
+            "-maxrate",
+            "1100k",
+            "-bufsize",
+            "1800k",
+            "-g",
+            "48",
+            "-keyint_min",
+            "48",
+            "-sc_threshold",
+            "0",
+        ]
+    if transcode_video:
+        return [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-profile:v",
+            "high",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "48",
+            "-keyint_min",
+            "48",
+            "-sc_threshold",
+            "0",
+        ]
+    return ["-c:v", "copy"]
+
+
+def compatible_stream_command(
+    part_key: str,
+    remote_quality: bool = False,
+    transcode_video: bool = False,
+) -> List[str]:
     plex_path = safe_plex_path(part_key, prefix="/library/parts/")
     if not plex_path:
         raise ValueError("bad_part_key")
@@ -1019,33 +1093,7 @@ def compatible_stream_command(part_key: str, remote_quality: bool = False) -> Li
         "-sn",
         "-dn",
     ]
-    if remote_quality:
-        command.extend(
-            [
-                "-vf",
-                "scale=-2:480",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-profile:v",
-                "main",
-                "-b:v",
-                "900k",
-                "-maxrate",
-                "1100k",
-                "-bufsize",
-                "1800k",
-                "-g",
-                "48",
-                "-keyint_min",
-                "48",
-                "-sc_threshold",
-                "0",
-            ]
-        )
-    else:
-        command.extend(["-c:v", "copy"])
+    command.extend(compatible_video_command_args(remote_quality, transcode_video))
     command.extend(
         [
             "-c:a",
@@ -1064,9 +1112,15 @@ def compatible_stream_command(part_key: str, remote_quality: bool = False) -> Li
     return command
 
 
-def hls_stream_id(part_key: str, remote_quality: bool = False) -> str:
+def hls_stream_id(
+    part_key: str,
+    remote_quality: bool = False,
+    transcode_video: bool = False,
+) -> str:
     quality = "480p" if remote_quality else "original"
-    return hashlib.sha256(f"{quality}:{part_key}".encode("utf-8")).hexdigest()[:24]
+    video_mode = "h264" if remote_quality or transcode_video else "copy"
+    cache_key = f"hls-v2:{quality}:{video_mode}:{part_key}"
+    return hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:24]
 
 
 def hls_cache_dir(create: bool = False) -> Path:
@@ -1083,7 +1137,12 @@ def hls_session_dir(playback_id: str, create: bool = False) -> Path:
     return path
 
 
-def hls_stream_command(part_key: str, output_dir: Path, remote_quality: bool = False) -> List[str]:
+def hls_stream_command(
+    part_key: str,
+    output_dir: Path,
+    remote_quality: bool = False,
+    transcode_video: bool = False,
+) -> List[str]:
     plex_path = safe_plex_path(part_key, prefix="/library/parts/")
     if not plex_path:
         raise ValueError("bad_part_key")
@@ -1106,33 +1165,7 @@ def hls_stream_command(part_key: str, output_dir: Path, remote_quality: bool = F
         "-sn",
         "-dn",
     ]
-    if remote_quality:
-        command.extend(
-            [
-                "-vf",
-                "scale=-2:480",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-profile:v",
-                "main",
-                "-b:v",
-                "900k",
-                "-maxrate",
-                "1100k",
-                "-bufsize",
-                "1800k",
-                "-g",
-                "48",
-                "-keyint_min",
-                "48",
-                "-sc_threshold",
-                "0",
-            ]
-        )
-    else:
-        command.extend(["-c:v", "copy"])
+    command.extend(compatible_video_command_args(remote_quality, transcode_video))
     command.extend(
         [
             "-c:a",
@@ -1262,11 +1295,16 @@ def prune_hls_cache(keep_ids: Optional[set] = None) -> None:
             HLS_JOBS.pop(path.name, None)
 
 
-def run_hls_job(playback_id: str, part_key: str, remote_quality: bool) -> None:
+def run_hls_job(
+    playback_id: str,
+    part_key: str,
+    remote_quality: bool,
+    transcode_video: bool,
+) -> None:
     session_dir = hls_session_dir(playback_id, create=True)
     try:
         process = subprocess.run(
-            hls_stream_command(part_key, session_dir, remote_quality),
+            hls_stream_command(part_key, session_dir, remote_quality, transcode_video),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
@@ -1284,11 +1322,15 @@ def run_hls_job(playback_id: str, part_key: str, remote_quality: bool) -> None:
             HLS_JOBS[playback_id] = {"state": "error", "message": str(exc)[:500]}
 
 
-def ensure_hls_stream(part_key: str, remote_quality: bool = False) -> Tuple[str, Path, str]:
+def ensure_hls_stream(
+    part_key: str,
+    remote_quality: bool = False,
+    transcode_video: bool = False,
+) -> Tuple[str, Path, str]:
     plex_path = safe_plex_path(part_key, prefix="/library/parts/")
     if not plex_path:
         raise ValueError("bad_part_key")
-    playback_id = hls_stream_id(plex_path, remote_quality)
+    playback_id = hls_stream_id(plex_path, remote_quality, transcode_video)
     session_dir = hls_session_dir(playback_id)
     manifest = ready_hls_manifest(session_dir)
     if manifest and "#EXT-X-ENDLIST" in manifest:
@@ -1307,7 +1349,7 @@ def ensure_hls_stream(part_key: str, remote_quality: bool = False) -> Tuple[str,
         session_dir.mkdir(parents=True, exist_ok=True)
         threading.Thread(
             target=run_hls_job,
-            args=(playback_id, plex_path, remote_quality),
+            args=(playback_id, plex_path, remote_quality, transcode_video),
             daemon=True,
             name=f"plex-hls-{playback_id[:8]}",
         ).start()
@@ -1494,6 +1536,7 @@ def item_from_xml(
     title = elem.get("title") or elem.get("parentTitle") or elem.get("grandparentTitle") or "Untitled"
     item_type = elem.get("type") or elem.tag.lower()
     guids, external_ids = external_ids_from_xml(elem) if include_guids else ([], {})
+    playback = playback_info(part_key, media)
     item = {
         "ratingKey": elem.get("ratingKey"),
         "key": elem.get("key"),
@@ -1540,9 +1583,9 @@ def item_from_xml(
         "artUrl": image_url(elem.get("art"), ART_WIDTH, ART_HEIGHT, 86),
         "partKey": part_key,
         "streamUrl": part_stream_url(part_key),
-        "compatibleStreamUrl": compatible_stream_url(part_key),
+        "compatibleStreamUrl": playback["compatibleStreamUrl"],
         "downloadOriginalUrl": original_download_url(elem.get("ratingKey")) if part_key else None,
-        "playback": playback_info(part_key, media),
+        "playback": playback,
         "savedPlayback": saved_playback_status(elem.get("ratingKey"), part_key, media)
         if include_saved_playback
         else {"state": "unknown", "ready": False},
@@ -4000,7 +4043,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
         quality = one(query, "quality", "").strip().lower()
         remote_quality = quality in {"remote", "low", "480p"}
-        command = compatible_stream_command(plex_path, remote_quality)
+        video_mode = one(query, "video", "").strip().lower()
+        transcode_video = video_mode in {"h264", "transcode"}
+        command = compatible_stream_command(plex_path, remote_quality, transcode_video)
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -4021,7 +4066,13 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_header("Transfer-Encoding", "chunked")
             self.send_header(
                 "X-Playback-Mode",
-                "remote-480p-aac" if remote_quality else "audio-transcode-aac",
+                (
+                    "remote-480p-h264-aac"
+                    if remote_quality
+                    else "video-transcode-h264-audio-transcode-aac"
+                    if transcode_video
+                    else "audio-transcode-aac"
+                ),
             )
             self.end_headers()
             write_chunked(self.wfile, first_chunk)
@@ -4052,8 +4103,14 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         quality = one(query, "quality", "").strip().lower()
         remote_quality = quality in {"remote", "low", "480p"}
+        video_mode = one(query, "video", "").strip().lower()
+        transcode_video = video_mode in {"h264", "transcode"}
         try:
-            playback_id, _, raw_manifest = ensure_hls_stream(part_key, remote_quality)
+            playback_id, _, raw_manifest = ensure_hls_stream(
+                part_key,
+                remote_quality,
+                transcode_video,
+            )
             body = hls_manifest_text(playback_id, raw_manifest).encode("utf-8")
         except TimeoutError as exc:
             self.send_json({"error": "hls_startup_timeout", "message": str(exc)}, status=504)
@@ -4064,7 +4121,16 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/vnd.apple.mpegurl")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Playback-Mode", "hls-audio-transcode-aac")
+        self.send_header(
+            "X-Playback-Mode",
+            (
+                "hls-480p-h264-aac"
+                if remote_quality
+                else "hls-video-transcode-h264-aac"
+                if transcode_video
+                else "hls-audio-transcode-aac"
+            ),
+        )
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

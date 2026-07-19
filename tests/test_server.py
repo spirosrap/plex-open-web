@@ -277,7 +277,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.15.3", responses[0][1]["version"])
+        self.assertEqual("0.15.4", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -292,11 +292,33 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.15.3", responses[0][1]["version"])
+        self.assertEqual("0.15.4", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
 class PlaybackCompatibilityTests(unittest.TestCase):
+    def test_hevc_video_and_eac3_audio_use_the_full_compatibility_stream(self):
+        playback = server.playback_info(
+            "/library/parts/42/file.mkv",
+            {"videoCodec": "hevc", "audioCodec": "eac3"},
+        )
+
+        self.assertTrue(playback["compatibilityTranscodeRequired"])
+        self.assertTrue(playback["videoTranscodeRequired"])
+        self.assertTrue(playback["audioTranscodeRequired"])
+        self.assertIn("video=h264", playback["compatibleStreamUrl"])
+
+    def test_hevc_video_with_aac_audio_still_uses_the_compatibility_stream(self):
+        playback = server.playback_info(
+            "/library/parts/42/file.mkv",
+            {"videoCodec": "hevc", "audioCodec": "aac"},
+        )
+
+        self.assertTrue(playback["compatibilityTranscodeRequired"])
+        self.assertTrue(playback["videoTranscodeRequired"])
+        self.assertFalse(playback["audioTranscodeRequired"])
+        self.assertIn("video=h264", playback["compatibleStreamUrl"])
+
     def test_live_audio_transcode_uses_a_safari_compatible_mp4_header(self):
         with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
             command = server.compatible_stream_command("/library/parts/42/file.mkv")
@@ -329,6 +351,27 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertEqual("event", command[command.index("-hls_playlist_type") + 1])
         self.assertEqual("mpegts", command[command.index("-hls_segment_type") + 1])
         self.assertIn("temp_file", command[command.index("-hls_flags") + 1])
+
+    def test_hls_stream_converts_unsupported_video_to_browser_safe_h264(self):
+        with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
+            command = server.hls_stream_command(
+                "/library/parts/42/file.mkv",
+                Path("/tmp/hls-test"),
+                transcode_video=True,
+            )
+
+        self.assertEqual("libx264", command[command.index("-c:v") + 1])
+        self.assertEqual("yuv420p", command[command.index("-pix_fmt") + 1])
+        self.assertEqual("aac", command[command.index("-c:a") + 1])
+
+    def test_hls_cache_separates_copied_and_transcoded_video(self):
+        copied = server.hls_stream_id("/library/parts/42/file.mkv")
+        transcoded = server.hls_stream_id(
+            "/library/parts/42/file.mkv",
+            transcode_video=True,
+        )
+
+        self.assertNotEqual(copied, transcoded)
 
     def test_hls_manifest_rewrites_only_valid_segment_paths(self):
         raw = "#EXTM3U\n#EXTINF:4.0,\nsegment-00000.ts\n#EXT-X-ENDLIST\n"

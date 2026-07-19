@@ -24,7 +24,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Browser subtitle selection from Plex subtitle streams and sidecar subtitle files.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
-- FFmpeg fallback that copies browser-compatible video and converts unsupported audio, such as AC3, to AAC.
+- Codec-aware FFmpeg fallback that converts unsupported video such as HEVC to H.264 and unsupported audio such as AC3 to AAC.
 - Poster/artwork proxy so the browser only needs this app URL.
 - Compressed API responses, right-sized artwork, and coalesced Plex reads for fast browsing over a tailnet.
 - Cancellable library/search requests, stable loading placeholders, and incremental card rendering for responsive interaction.
@@ -33,6 +33,23 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.15.4
+
+**Added**
+
+- Added automatic H.264 conversion for HEVC and other video codecs that browsers cannot reliably render through the authenticated stream.
+- Added distinct player status labels for video conversion, audio conversion, and combined H.264 plus AAC playback.
+
+**Improved**
+
+- Original-resolution H.264 conversion uses browser-safe 8-bit 4:2:0 output and regular keyframes while remaining comfortably faster than real time on the media server.
+- HLS cache identities now include the video conversion mode so copied-video and H.264 streams can never reuse incompatible segments.
+
+**Fixed**
+
+- Fixed HEVC Main 10 television episodes playing sound over a black picture in Safari.
+- Unsupported video now selects the compatibility stream even when its audio track is already browser-compatible.
 
 ### 0.15.3
 

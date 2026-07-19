@@ -2004,15 +2004,24 @@ function configureSubtitles(item) {
   reapplyActiveSubtitle();
 }
 
+function compatibilityTranscodeRequired(item) {
+  return Boolean(
+    item.playback?.compatibilityTranscodeRequired
+    || item.playback?.audioTranscodeRequired
+    || item.playback?.videoTranscodeRequired,
+  );
+}
+
 function liveStreamUrlFor(item) {
-  const url = item.playback?.audioTranscodeRequired && item.playback.compatibleStreamUrl
+  const needsCompatibility = compatibilityTranscodeRequired(item);
+  const url = needsCompatibility && item.playback.compatibleStreamUrl
     ? item.playback.compatibleStreamUrl
     : item.streamUrl;
   if (!url) {
     return url;
   }
   const streamUrl = new URL(url, window.location.origin);
-  if (item.playback?.audioTranscodeRequired && el.player.canPlayType("application/vnd.apple.mpegurl")) {
+  if (needsCompatibility && el.player.canPlayType("application/vnd.apple.mpegurl")) {
     streamUrl.searchParams.set("format", "hls");
   }
   if (window.location.protocol === "http:" && /^100\./.test(window.location.hostname)) {
@@ -2040,12 +2049,21 @@ function setPlaybackMode(item, mode) {
     el.playbackMode.hidden = false;
     return;
   }
-  if (item.playback?.audioTranscodeRequired) {
+  if (compatibilityTranscodeRequired(item)) {
     const nativeHls = Boolean(el.player.canPlayType("application/vnd.apple.mpegurl"));
-    el.playbackMode.textContent = nativeHls ? "HLS + AAC" : "AAC audio";
-    el.playbackMode.title = nativeHls
-      ? "Safari-compatible streaming with AAC audio."
-      : item.playback.audioTranscodeReason || "Audio is being converted for browser playback.";
+    const videoTranscode = Boolean(item.playback?.videoTranscodeRequired);
+    const audioTranscode = Boolean(item.playback?.audioTranscodeRequired);
+    if (videoTranscode && audioTranscode) {
+      el.playbackMode.textContent = "H.264 + AAC";
+    } else if (videoTranscode) {
+      el.playbackMode.textContent = "H.264 video";
+    } else {
+      el.playbackMode.textContent = nativeHls ? "HLS + AAC" : "AAC audio";
+    }
+    el.playbackMode.title = [
+      item.playback?.videoTranscodeReason,
+      item.playback?.audioTranscodeReason,
+    ].filter(Boolean).join("; ") || "Media is being converted for browser playback.";
     el.playbackMode.hidden = false;
   } else {
     el.playbackMode.hidden = true;
