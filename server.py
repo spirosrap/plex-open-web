@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.15.0"
+APP_VERSION = "0.15.1"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -987,6 +987,73 @@ def saved_playback_command(part_key: str, media: Dict[str, Any], output_path: Pa
     else:
         command.extend(["-c:a", "copy"])
     command.extend(["-movflags", "+faststart", "-f", "mp4", str(output_path)])
+    return command
+
+
+def compatible_stream_command(part_key: str, remote_quality: bool = False) -> List[str]:
+    plex_path = safe_plex_path(part_key, prefix="/library/parts/")
+    if not plex_path:
+        raise ValueError("bad_part_key")
+    input_url = PLEX._url(plex_path, {"download": "1"})
+    command = [
+        Settings.ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-fflags",
+        "+genpts",
+        "-i",
+        input_url,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+    ]
+    if remote_quality:
+        command.extend(
+            [
+                "-vf",
+                "scale=-2:480",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-profile:v",
+                "main",
+                "-b:v",
+                "900k",
+                "-maxrate",
+                "1100k",
+                "-bufsize",
+                "1800k",
+                "-g",
+                "48",
+                "-keyint_min",
+                "48",
+                "-sc_threshold",
+                "0",
+            ]
+        )
+    else:
+        command.extend(["-c:v", "copy"])
+    command.extend(
+        [
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k" if remote_quality else "192k",
+            "-ac",
+            "2",
+            "-movflags",
+            "frag_keyframe+delay_moov+default_base_moof",
+            "-f",
+            "mp4",
+            "pipe:1",
+        ]
+    )
     return command
 
 
@@ -3656,73 +3723,9 @@ class AppHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        input_url = PLEX._url(plex_path, {"download": "1"})
         quality = one(query, "quality", "").strip().lower()
         remote_quality = quality in {"remote", "low", "480p"}
-        command = [
-            Settings.ffmpeg_path,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-fflags",
-            "+genpts",
-            "-i",
-            input_url,
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0?",
-            "-sn",
-            "-dn",
-        ]
-        if remote_quality:
-            command.extend(
-                [
-                    "-vf",
-                    "scale=-2:480",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-profile:v",
-                    "main",
-                    "-b:v",
-                    "900k",
-                    "-maxrate",
-                    "1100k",
-                    "-bufsize",
-                    "1800k",
-                    "-g",
-                    "48",
-                    "-keyint_min",
-                    "48",
-                    "-sc_threshold",
-                    "0",
-                ]
-            )
-        else:
-            command.extend(
-                [
-                    "-c:v",
-                    "copy",
-                ]
-            )
-        command.extend(
-            [
-                "-c:a",
-                "aac",
-                "-b:a",
-                "96k" if remote_quality else "192k",
-                "-ac",
-                "2",
-                "-movflags",
-                "frag_keyframe+empty_moov+default_base_moof",
-                "-f",
-                "mp4",
-                "pipe:1",
-            ]
-        )
+        command = compatible_stream_command(plex_path, remote_quality)
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,

@@ -34,6 +34,18 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.15.1
+
+**Improved**
+
+- Live audio conversion now sends a populated delayed MP4 initialization header, preserving immediate playback while remaining compatible with Safari's media stack.
+- Playback failures now show a clear in-player message with the existing saved-copy recovery path instead of leaving an unexplained black frame.
+
+**Fixed**
+
+- Fixed Safari rejecting MKV television episodes that use browser-incompatible E-AC-3, AC-3, DTS, TrueHD, or FLAC audio with a `FormatError` before playback began.
+- Kept direct movie playback and low-bandwidth 480p conversion behavior unchanged while applying the compatibility fix to the shared live remux path.
+
 ### 0.15.0
 
 **Added**

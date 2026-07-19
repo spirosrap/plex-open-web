@@ -277,7 +277,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.15.0", responses[0][1]["version"])
+        self.assertEqual("0.15.1", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -292,8 +292,29 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.15.0", responses[0][1]["version"])
+        self.assertEqual("0.15.1", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
+
+
+class PlaybackCompatibilityTests(unittest.TestCase):
+    def test_live_audio_transcode_uses_a_safari_compatible_mp4_header(self):
+        with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
+            command = server.compatible_stream_command("/library/parts/42/file.mkv")
+
+        movflags = command[command.index("-movflags") + 1]
+        self.assertIn("delay_moov", movflags)
+        self.assertNotIn("empty_moov", movflags)
+        self.assertEqual("copy", command[command.index("-c:v") + 1])
+        self.assertEqual("aac", command[command.index("-c:a") + 1])
+        self.assertEqual("pipe:1", command[-1])
+
+    def test_remote_compatible_stream_still_transcodes_video_to_480p(self):
+        with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
+            command = server.compatible_stream_command("/library/parts/42/file.mkv", True)
+
+        self.assertEqual("scale=-2:480", command[command.index("-vf") + 1])
+        self.assertEqual("libx264", command[command.index("-c:v") + 1])
+        self.assertEqual("96k", command[command.index("-b:a") + 1])
 
 
 class LibraryViewTests(unittest.TestCase):

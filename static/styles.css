@@ -1108,6 +1108,19 @@ select:focus-visible {
   background: #000;
 }
 
+.player-error {
+  padding: 10px 16px;
+  border-top: 1px solid color-mix(in srgb, var(--danger) 45%, var(--line));
+  background: color-mix(in srgb, var(--danger) 12%, var(--panel-2));
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.player-error[hidden] {
+  display: none;
+}
+
 .up-next-banner {
   display: flex;
   align-items: center;

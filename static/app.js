@@ -145,6 +145,7 @@ const el = {
   playerDialog: document.querySelector("#player-dialog"),
   playerTitle: document.querySelector("#player-title"),
   playbackMode: document.querySelector("#playback-mode"),
+  playerError: document.querySelector("#player-error"),
   playerClose: document.querySelector("#player-close"),
   subtitleLabel: document.querySelector("#subtitle-select-label"),
   subtitleSelect: document.querySelector("#subtitle-select"),
@@ -2092,6 +2093,8 @@ function downloadOriginalFiles(item = state.playerItem) {
 }
 
 function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } = {}) {
+  el.playerError.hidden = true;
+  el.playerError.textContent = "";
   clearSubtitleTracks();
   const applyResume = () => {
     reapplyActiveSubtitle();
@@ -2731,6 +2734,8 @@ el.playerDialog.addEventListener("close", async () => {
   el.player.pause();
   el.player.removeAttribute("src");
   el.playbackMode.hidden = true;
+  el.playerError.hidden = true;
+  el.playerError.textContent = "";
   el.playerSubtitleSearch.hidden = true;
   el.playerSave.hidden = true;
   el.playerDeleteSave.hidden = true;
@@ -2757,6 +2762,26 @@ el.subtitleSelect.addEventListener("change", () => {
 });
 el.player.addEventListener("play", () => {
   startProgressReporting();
+});
+el.player.addEventListener("playing", () => {
+  el.playerError.hidden = true;
+  el.playerError.textContent = "";
+  if (state.playerItem) {
+    const mode = state.usingDevicePlayback ? "device" : state.usingSavedPlayback ? "saved" : "live";
+    setPlaybackMode(state.playerItem, mode);
+  }
+});
+el.player.addEventListener("error", () => {
+  if (!state.playerItem || !el.player.currentSrc) return;
+  const message = state.playerItem.savedPlayback?.ready
+    ? "Playback failed. Select Play saved to retry with the prepared copy."
+    : "Playback failed. Select Save to prepare a browser-compatible copy and retry.";
+  el.playbackMode.textContent = "Playback failed";
+  el.playbackMode.title = message;
+  el.playbackMode.hidden = false;
+  el.playerError.textContent = message;
+  el.playerError.hidden = false;
+  setStatus(`Could not play ${displayTitle(state.playerItem)}.`, "error");
 });
 el.player.addEventListener("pause", () => {
   if (!el.player.ended) {
