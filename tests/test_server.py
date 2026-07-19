@@ -370,7 +370,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.18.0", responses[0][1]["version"])
+        self.assertEqual("0.19.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -385,7 +385,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.18.0", responses[0][1]["version"])
+        self.assertEqual("0.19.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -492,7 +492,7 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.hls_manifest_text("a" * 24, "#EXTM3U\n../outside.ts\n")
 
-    def test_plex_hls_profile_requests_seekable_aac_vod(self):
+    def test_plex_hls_profile_requests_timestamp_aligned_h264_aac_vod(self):
         params = server.plex_hls_transcode_params(
             "701",
             "a" * 32,
@@ -505,7 +505,7 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertEqual("1", params["partIndex"])
         self.assertEqual("hls", params["protocol"])
         self.assertEqual("1", params["fastSeek"])
-        self.assertEqual("1", params["directStream"])
+        self.assertEqual("0", params["directStream"])
         self.assertEqual("0", params["directStreamAudio"])
         self.assertEqual("aac", params["audioCodec"])
         self.assertEqual("none", params["subtitles"])

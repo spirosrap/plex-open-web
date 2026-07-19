@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.18.0"
+APP_VERSION = "0.19.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -1414,6 +1414,8 @@ def plex_hls_transcode_params(
     media_index: int = 0,
     part_index: int = 0,
 ) -> Dict[str, Any]:
+    # Copied H.264 can start on a sparse source keyframe while Plex still advertises
+    # fixed segment lengths, shifting external subtitle cues after seeks.
     return {
         "hasMDE": "1",
         "path": f"/library/metadata/{rating_key}",
@@ -1422,7 +1424,7 @@ def plex_hls_transcode_params(
         "protocol": "hls",
         "fastSeek": "1",
         "directPlay": "0",
-        "directStream": "1",
+        "directStream": "0",
         "directStreamAudio": "0",
         "videoCodec": "h264",
         "audioCodec": "aac",

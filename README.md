@@ -25,7 +25,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Persistent per-item subtitle selection from Plex subtitle streams and sidecar subtitle files, including an explicit remembered Off choice.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
-- Seekable Plex VOD playback for Safari and Apple-device browsers when video or audio conversion is required.
+- Seekable, subtitle-synchronized Plex VOD playback for Safari and Apple-device browsers when video or audio conversion is required.
 - Codec-aware FFmpeg fallback that converts unsupported video such as HEVC to H.264 and unsupported audio such as AC3 to AAC.
 - Poster/artwork proxy so the browser only needs this app URL.
 - Compressed API responses, right-sized artwork, and coalesced Plex reads for fast browsing over a tailnet.
@@ -35,6 +35,21 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.19.0
+
+**Improved**
+
+- Safari-compatible VOD playback now uses timestamp-aligned H.264 and AAC segments generated on demand by Plex.
+- Accurate one-second segment boundaries preserve the full duration, normal timeline controls, and direct seeking without preparing the whole movie first.
+- The player now labels this path `VOD H.264 + AAC` and explains that its video segments are aligned for subtitle synchronization.
+- Browser-native media that does not require compatibility conversion continues using the original direct stream.
+
+**Fixed**
+
+- Fixed external and embedded text subtitles drifting several seconds away from dialogue on videos with sparse source keyframes.
+- Fixed the subtitle offset changing after seeking or starting a new playback session.
+- Fixed copied-video HLS segments containing more media time than their advertised playlist duration, which made the browser clock disagree with the source clock.
 
 ### 0.18.0
 

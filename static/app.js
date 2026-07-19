@@ -2383,17 +2383,23 @@ function setPlaybackMode(item, mode) {
     const nativeHls = Boolean(el.player.canPlayType("application/vnd.apple.mpegurl"));
     const videoTranscode = Boolean(item.playback?.videoTranscodeRequired);
     const audioTranscode = Boolean(item.playback?.audioTranscodeRequired);
-    if (videoTranscode && audioTranscode) {
+    if (nativeHls) {
+      el.playbackMode.textContent = "VOD H.264 + AAC";
+    } else if (videoTranscode && audioTranscode) {
       el.playbackMode.textContent = "H.264 + AAC";
     } else if (videoTranscode) {
       el.playbackMode.textContent = "H.264 video";
     } else {
       el.playbackMode.textContent = nativeHls ? "VOD + AAC" : "AAC audio";
     }
-    el.playbackMode.title = [
+    const reasons = [
       item.playback?.videoTranscodeReason,
       item.playback?.audioTranscodeReason,
-    ].filter(Boolean).join("; ") || "Media is being converted for browser playback.";
+    ].filter(Boolean);
+    if (nativeHls) {
+      reasons.push("Timestamp-aligned video segments keep subtitles synchronized.");
+    }
+    el.playbackMode.title = reasons.join("; ") || "Media is being converted for browser playback.";
     el.playbackMode.hidden = false;
   } else {
     el.playbackMode.hidden = true;
