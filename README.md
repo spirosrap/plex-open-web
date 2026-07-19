@@ -11,6 +11,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
 - Movie collection membership management with searchable, immediate add/remove controls.
 - Manual collection creation, rename, and confirmed deletion without removing library movies.
+- Plex Fix Match for movies and TV shows, with title/year/language search, ranked poster-backed candidates, and confirmed metadata replacement.
 - Permanent movie and episode deletion with an exact disk preview, typed confirmation, hardlink cleanup, and safe folder pruning.
 - Server-backed My List shared with the Android app, with per-library browsing and poster badges.
 - Surprise Me selection for opening a random item from the active genre and Unwatched filters.
@@ -33,6 +34,26 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.16.0
+
+**Added**
+
+- Added Fix Match to movie and TV show details, using the active Plex library's own metadata agent and language.
+- Added automatic candidate search by title and year, plus manual searches by title, IMDb ID, TMDB ID, or TVDB ID.
+- Added Plex-ranked results with posters, summaries, release years, Best match and Current labels, and an explicit confirmation before applying a match.
+- Added Refresh match for downloading fresh metadata again when the existing Plex GUID is already correct but its poster or description is stale.
+
+**Improved**
+
+- Match changes refresh the visible title, poster, description, breadcrumbs, and media grid without requiring a page reload.
+- In-flight searches are cancelled when a newer search starts or the dialog closes, and controls remain stable while Plex applies a match.
+- Match result images are restricted to local Plex artwork or Plex's official image service.
+
+**Fixed**
+
+- Fresh post-match metadata bypasses the normal short-lived details cache, preventing the old title or poster from immediately reappearing.
+- Fix Match is limited to movie and show records, matching Plex's show-level behavior and preventing episode-level or cross-type matches.
 
 ### 0.15.4
 

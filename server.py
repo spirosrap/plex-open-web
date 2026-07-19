@@ -41,13 +41,15 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.15.4"
+APP_VERSION = "0.16.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
 HLS_SEGMENT_PATTERN = re.compile(r"segment-\d{5}\.ts")
+MATCH_GUID_PATTERN = re.compile(r"^plex://(movie|show)/[A-Za-z0-9._-]{1,160}$")
+MATCH_LANGUAGE_PATTERN = re.compile(r"^[a-z]{2}(?:-[A-Z]{2})?$")
 JSON_COMPRESSION_MIN_BYTES = 1024
 BROWSE_CACHE_CONTROL = "private, max-age=3, stale-if-error=86400"
 POSTER_WIDTH = 480
@@ -443,6 +445,7 @@ def library_from_xml(elem: ET.Element) -> Dict[str, Any]:
         "type": elem.get("type"),
         "agent": elem.get("agent"),
         "scanner": elem.get("scanner"),
+        "language": elem.get("language"),
         "updatedAt": to_int(elem.get("updatedAt")),
         "createdAt": to_int(elem.get("createdAt")),
     }
@@ -1373,6 +1376,119 @@ def metadata_item_for_rating_key(rating_key: str) -> Optional[Dict[str, Any]]:
     return item_from_xml(elem) if elem is not None else None
 
 
+def normalize_match_language(value: Any) -> Optional[str]:
+    raw = str(value or "").strip().replace("_", "-")
+    if not raw:
+        return None
+    parts = raw.split("-", 1)
+    normalized = parts[0].lower()
+    if len(parts) == 2:
+        normalized += f"-{parts[1].upper()}"
+    if not MATCH_LANGUAGE_PATTERN.fullmatch(normalized):
+        raise ValueError("invalid_language")
+    return normalized
+
+
+def normalize_match_year(value: Any) -> Optional[int]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if not re.fullmatch(r"\d{4}", raw):
+        raise ValueError("invalid_year")
+    year = int(raw)
+    if year < 1800 or year > 2200:
+        raise ValueError("invalid_year")
+    return year
+
+
+def matching_library_for_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    section_id = str(item.get("librarySectionID") or "")
+    return next(
+        (library for library in cached_libraries() if str(library.get("key") or "") == section_id),
+        {},
+    )
+
+
+def match_poster_url(value: Optional[str]) -> Optional[str]:
+    raw = str(value or "").strip()
+    if raw.startswith("/"):
+        return image_url(raw)
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme == "https" and parsed.hostname == "images.plex.tv":
+        return raw
+    return None
+
+
+def match_candidate_from_xml(
+    elem: ET.Element,
+    expected_type: str,
+    current_guid: Optional[str],
+    rank: int,
+) -> Optional[Dict[str, Any]]:
+    guid = str(elem.get("guid") or "").strip()
+    match = MATCH_GUID_PATTERN.fullmatch(guid)
+    name = str(elem.get("name") or elem.get("title") or "").strip()
+    candidate_type = str(elem.get("type") or expected_type).strip().lower()
+    if not match or match.group(1) != expected_type or candidate_type != expected_type or not name:
+        return None
+    return {
+        "guid": guid,
+        "name": name[:300],
+        "year": to_int(elem.get("year")),
+        "summary": str(elem.get("summary") or "")[:3000] or None,
+        "posterUrl": match_poster_url(elem.get("thumb")),
+        "type": candidate_type,
+        "rank": rank,
+        "best": rank == 1,
+        "current": guid == current_guid,
+    }
+
+
+def search_plex_matches(
+    item: Dict[str, Any],
+    title: str,
+    year: Optional[int],
+    language: Optional[str],
+) -> Dict[str, Any]:
+    rating_key = str(item.get("ratingKey") or "")
+    item_type = str(item.get("type") or "")
+    library = matching_library_for_item(item)
+    selected_language = language or normalize_match_language(library.get("language"))
+    params: Dict[str, Any] = {"manual": 1, "title": title}
+    if year is not None:
+        params["year"] = year
+    if library.get("agent"):
+        params["agent"] = library["agent"]
+    if selected_language:
+        params["language"] = selected_language
+    root = PLEX.xml(
+        f"/library/metadata/{urllib.parse.quote(rating_key)}/matches",
+        params=params,
+    )
+    results: List[Dict[str, Any]] = []
+    for elem in root.findall("SearchResult"):
+        candidate = match_candidate_from_xml(
+            elem,
+            item_type,
+            item.get("guid"),
+            len(results) + 1,
+        )
+        if candidate is not None:
+            results.append(candidate)
+        if len(results) >= 25:
+            break
+    return {
+        "ratingKey": rating_key,
+        "type": item_type,
+        "currentGuid": item.get("guid"),
+        "title": title,
+        "year": year,
+        "language": selected_language,
+        "agent": library.get("agent"),
+        "results": results,
+    }
+
+
 def run_saved_playback_job(
     playback_id: str,
     rating_key: str,
@@ -1540,6 +1656,7 @@ def item_from_xml(
     item = {
         "ratingKey": elem.get("ratingKey"),
         "key": elem.get("key"),
+        "guid": elem.get("guid"),
         "type": item_type,
         "title": title,
         "sortTitle": elem.get("titleSort"),
@@ -3258,6 +3375,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/media-delete":
             self.api_media_delete(method, query)
             return
+        if path == "/api/media-match":
+            self.api_media_match(method, query)
+            return
         if path == "/api/watch-state":
             self.api_watch_state(method)
             return
@@ -3289,7 +3409,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self.api_library(path, query)
         elif path.startswith("/api/metadata/"):
             rating_key = path.rsplit("/", 1)[-1]
-            self.api_metadata(rating_key)
+            self.api_metadata(rating_key, query)
         elif path.startswith("/api/children/"):
             rating_key = path.rsplit("/", 1)[-1]
             self.api_children(rating_key)
@@ -3882,7 +4002,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         self.send_json(payload, cache_control=BROWSE_CACHE_CONTROL)
 
-    def api_metadata(self, rating_key: str) -> None:
+    def api_metadata(
+        self,
+        rating_key: str,
+        query: Optional[Dict[str, List[str]]] = None,
+    ) -> None:
         def load() -> Dict[str, Any]:
             root = PLEX.xml(
                 f"/library/metadata/{urllib.parse.quote(rating_key)}",
@@ -3891,8 +4015,119 @@ class AppHandler(BaseHTTPRequestHandler):
             items = items_from_container(root, detailed=True)
             return {"item": items[0] if items else None}
 
-        payload = API_CACHE.get_or_load(f"metadata:{id(PLEX)}:{rating_key}", 10.0, load)
+        refresh = one(query or {}, "refresh", "").strip().lower() in {"1", "true", "yes"}
+        payload = load() if refresh else API_CACHE.get_or_load(
+            f"metadata:{id(PLEX)}:{rating_key}",
+            10.0,
+            load,
+        )
         self.send_json(payload, cache_control=BROWSE_CACHE_CONTROL)
+
+    def api_media_match(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method not in {"GET", "POST"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload = self.read_json() if method == "POST" else {}
+        rating_key = str(
+            payload.get("ratingKey") if method == "POST" else one(query, "ratingKey", "")
+        ).strip()
+        if not re.fullmatch(r"\d+", rating_key):
+            self.send_json(
+                {"error": "invalid_rating_key", "message": "Select a valid Plex item."},
+                status=400,
+            )
+            return
+        item = metadata_item_for_rating_key(rating_key)
+        if item is None:
+            self.send_json({"error": "not_found", "message": "Plex item was not found."}, status=404)
+            return
+        if item.get("type") not in {"movie", "show"}:
+            self.send_json(
+                {
+                    "error": "unsupported_media_type",
+                    "message": "Fix Match is available for movies and TV shows.",
+                },
+                status=400,
+            )
+            return
+
+        if method == "GET":
+            title = one(query, "title", str(item.get("title") or "")).strip()
+            if not title or len(title) > 200 or any(ord(char) < 32 for char in title):
+                self.send_json(
+                    {
+                        "error": "invalid_title",
+                        "message": "Enter a title or external ID up to 200 characters.",
+                    },
+                    status=400,
+                )
+                return
+            try:
+                year = normalize_match_year(one(query, "year", str(item.get("year") or "")))
+                language = normalize_match_language(one(query, "language", ""))
+            except ValueError as exc:
+                message = (
+                    "Enter a valid four-digit year."
+                    if str(exc) == "invalid_year"
+                    else "Select a valid metadata language."
+                )
+                self.send_json({"error": str(exc), "message": message}, status=400)
+                return
+            self.send_json(search_plex_matches(item, title, year, language))
+            return
+
+        guid = str(payload.get("guid") or "").strip()
+        name = str(payload.get("name") or "").strip()
+        guid_match = MATCH_GUID_PATTERN.fullmatch(guid)
+        if not guid_match or guid_match.group(1) != item.get("type"):
+            self.send_json(
+                {"error": "invalid_match", "message": "Select a valid Plex match result."},
+                status=400,
+            )
+            return
+        if not name or len(name) > 300 or any(ord(char) < 32 for char in name):
+            self.send_json(
+                {"error": "invalid_match_name", "message": "The selected match has no valid title."},
+                status=400,
+            )
+            return
+        try:
+            year = normalize_match_year(payload.get("year"))
+        except ValueError:
+            self.send_json(
+                {"error": "invalid_year", "message": "The selected match has an invalid year."},
+                status=400,
+            )
+            return
+
+        params: Dict[str, Any] = {"guid": guid, "name": name}
+        if year is not None:
+            params["year"] = year
+        response = PLEX.open(
+            f"/library/metadata/{urllib.parse.quote(rating_key)}/match",
+            params=params,
+            method="PUT",
+        )
+        response.close()
+        API_CACHE.clear()
+
+        refreshed: Optional[Dict[str, Any]] = None
+        deadline = time.monotonic() + (3.0 if item.get("guid") != guid else 0.0)
+        while True:
+            refreshed = metadata_item_for_rating_key(rating_key)
+            if refreshed is None or refreshed.get("guid") == guid or time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+        pending = refreshed is None or refreshed.get("guid") != guid
+        self.send_json(
+            {
+                "ok": True,
+                "ratingKey": rating_key,
+                "guid": guid,
+                "pending": pending,
+                "item": refreshed or item,
+            }
+        )
 
     def api_children(self, rating_key: str) -> None:
         def load() -> Dict[str, Any]:

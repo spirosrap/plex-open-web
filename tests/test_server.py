@@ -185,6 +185,68 @@ class FakeCollectionPlex(FakePlex):
         return response
 
 
+class FakeMatchPlex(FakePlex):
+    def __init__(self):
+        super().__init__()
+        self.current_guid = "plex://movie/current123"
+        self.current_title = "Wrong Movie"
+        self.current_year = "1999"
+
+    def xml(self, path, params=None):
+        self.xml_calls.append((path, dict(params or {})))
+        if path == "/library/sections":
+            return ET.fromstring(
+                '<MediaContainer size="2"><Directory key="7" title="Movies" type="movie" '
+                'agent="tv.plex.agents.movie" scanner="Plex Movie" language="en-US" />'
+                '<Directory key="8" title="Shows" type="show" agent="tv.plex.agents.series" '
+                'scanner="Plex TV Series" language="en-US" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/701":
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                f'<Video ratingKey="701" librarySectionID="7" type="movie" guid="{self.current_guid}" '
+                f'title="{self.current_title}" year="{self.current_year}" summary="Current summary">'
+                '<Media videoCodec="h264" audioCodec="aac"><Part key="/library/parts/701/file.mp4" /></Media>'
+                '</Video></MediaContainer>'
+            )
+        if path == "/library/metadata/702":
+            return ET.fromstring(
+                '<MediaContainer size="1"><Video ratingKey="702" librarySectionID="7" '
+                'type="episode" title="Episode" /></MediaContainer>'
+            )
+        if path == "/library/metadata/703":
+            return ET.fromstring(
+                '<MediaContainer size="1"><Directory ratingKey="703" librarySectionID="8" '
+                'type="show" guid="plex://show/current789" title="Wrong Show" year="2010" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/701/matches":
+            return ET.fromstring(
+                '<MediaContainer size="2">'
+                '<SearchResult guid="plex://movie/correct456" name="Correct Movie" year="2024" '
+                'type="movie" summary="Correct summary" thumb="https://images.plex.tv/poster.jpg" />'
+                '<SearchResult guid="plex://movie/current123" name="Wrong Movie" year="1999" '
+                'type="movie" summary="Current summary" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/703/matches":
+            return ET.fromstring(
+                '<MediaContainer size="1"><SearchResult guid="plex://show/correct987" '
+                'name="Correct Show" year="2011" type="show" summary="Correct show summary" />'
+                '</MediaContainer>'
+            )
+        return ET.fromstring('<MediaContainer size="0" />')
+
+    def open(self, path, params=None, **kwargs):
+        self.open_calls.append((path, dict(params or {}), dict(kwargs)))
+        if path == "/library/metadata/701/match" and kwargs.get("method") == "PUT":
+            self.current_guid = params["guid"]
+            self.current_title = params["name"]
+            self.current_year = str(params.get("year") or "")
+        return FakeResponse()
+
+
 def handler_with_payload(payload):
     server.API_CACHE.clear()
     handler = object.__new__(server.AppHandler)
@@ -277,7 +339,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.15.4", responses[0][1]["version"])
+        self.assertEqual("0.16.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -292,7 +354,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.15.4", responses[0][1]["version"])
+        self.assertEqual("0.16.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -382,6 +444,107 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertIn("name=segment-00000.ts", manifest)
         with self.assertRaises(ValueError):
             server.hls_manifest_text("a" * 24, "#EXTM3U\n../outside.ts\n")
+
+
+class MediaMatchTests(unittest.TestCase):
+    def setUp(self):
+        server.API_CACHE.clear()
+
+    def test_search_returns_ranked_plex_candidates_with_current_match(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match(
+                "GET",
+                {
+                    "ratingKey": ["701"],
+                    "title": ["Correct Movie"],
+                    "year": ["2024"],
+                    "language": ["en-US"],
+                },
+            )
+
+        self.assertEqual(200, responses[0][0])
+        payload = responses[0][1]
+        self.assertEqual("plex://movie/current123", payload["currentGuid"])
+        self.assertEqual(2, len(payload["results"]))
+        self.assertTrue(payload["results"][0]["best"])
+        self.assertFalse(payload["results"][0]["current"])
+        self.assertTrue(payload["results"][1]["current"])
+        self.assertEqual("https://images.plex.tv/poster.jpg", payload["results"][0]["posterUrl"])
+        _, params = next(call for call in plex.xml_calls if call[0].endswith("/matches"))
+        self.assertEqual(1, params["manual"])
+        self.assertEqual("Correct Movie", params["title"])
+        self.assertEqual(2024, params["year"])
+        self.assertEqual("tv.plex.agents.movie", params["agent"])
+        self.assertEqual("en-US", params["language"])
+
+    def test_apply_uses_selected_guid_and_returns_refreshed_metadata(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "701",
+                "guid": "plex://movie/correct456",
+                "name": "Correct Movie",
+                "year": 2024,
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match("POST", {})
+
+        self.assertEqual(200, responses[0][0])
+        payload = responses[0][1]
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["pending"])
+        self.assertEqual("plex://movie/correct456", payload["item"]["guid"])
+        self.assertEqual("Correct Movie", payload["item"]["title"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/metadata/701/match", path)
+        self.assertEqual("plex://movie/correct456", params["guid"])
+        self.assertEqual("Correct Movie", params["name"])
+        self.assertEqual(2024, params["year"])
+        self.assertEqual("PUT", kwargs["method"])
+
+    def test_apply_rejects_a_match_for_the_wrong_media_type(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "701",
+                "guid": "plex://show/wrongtype",
+                "name": "Wrong Type",
+                "year": 2024,
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match("POST", {})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_match", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_episode_matching_is_rejected_at_the_api_boundary(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match("GET", {"ratingKey": ["702"], "title": ["Episode"]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("unsupported_media_type", responses[0][1]["error"])
+
+    def test_tv_show_search_uses_the_series_agent(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match(
+                "GET",
+                {"ratingKey": ["703"], "title": ["Correct Show"], "year": ["2011"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("show", responses[0][1]["type"])
+        self.assertEqual("plex://show/correct987", responses[0][1]["results"][0]["guid"])
+        _, params = next(call for call in plex.xml_calls if call[0].endswith("/matches"))
+        self.assertEqual("tv.plex.agents.series", params["agent"])
 
 
 class LibraryViewTests(unittest.TestCase):

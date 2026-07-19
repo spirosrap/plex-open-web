@@ -24,6 +24,12 @@ const state = {
   surpriseInProgress: false,
   watchStateRatingKey: null,
   detailsItem: null,
+  matchItem: null,
+  matchResults: [],
+  matchRequestId: 0,
+  matchAbortController: null,
+  matchSearching: false,
+  matchApplyingGuid: null,
   mediaDeletionEnabled: false,
   mediaDeleteItem: null,
   mediaDeletePlan: null,
@@ -113,8 +119,19 @@ const el = {
   detailsWatchState: document.querySelector("#details-watch-state"),
   detailsMyList: document.querySelector("#details-my-list"),
   detailsCollections: document.querySelector("#details-collections"),
+  detailsFixMatch: document.querySelector("#details-fix-match"),
   detailsDeleteMedia: document.querySelector("#details-delete-media"),
   detailsClose: document.querySelector("#details-close"),
+  matchDialog: document.querySelector("#match-dialog"),
+  matchTitle: document.querySelector("#match-title"),
+  matchForm: document.querySelector("#match-form"),
+  matchQuery: document.querySelector("#match-query"),
+  matchYear: document.querySelector("#match-year"),
+  matchLanguage: document.querySelector("#match-language"),
+  matchSearch: document.querySelector("#match-search"),
+  matchStatus: document.querySelector("#match-status"),
+  matchResults: document.querySelector("#match-results"),
+  matchClose: document.querySelector("#match-close"),
   mediaDeleteDialog: document.querySelector("#media-delete-dialog"),
   mediaDeleteForm: document.querySelector("#media-delete-form"),
   mediaDeleteTitle: document.querySelector("#media-delete-title"),
@@ -903,6 +920,10 @@ function openDetails(item) {
   el.detailsCollections.hidden = !canManageCollections;
   el.detailsCollections.textContent = collectionCount ? `Collections (${collectionCount})` : "Collections";
   el.detailsCollections.onclick = () => openCollectionMembership(item);
+  const canFixMatch = Boolean(item.ratingKey && ["movie", "show"].includes(item.type));
+  el.detailsFixMatch.hidden = !canFixMatch;
+  el.detailsFixMatch.textContent = item.guid ? "Fix match" : "Match";
+  el.detailsFixMatch.onclick = () => openMatchDialog(item);
   const canDeleteMedia = Boolean(
     state.mediaDeletionEnabled && item.ratingKey && ["movie", "episode"].includes(item.type),
   );
@@ -918,6 +939,219 @@ function openDetails(item) {
         openDetails(item);
       }
     });
+  }
+}
+
+function setMatchStatus(message, kind = "") {
+  el.matchStatus.textContent = message;
+  el.matchStatus.dataset.kind = kind;
+}
+
+function ensureMatchLanguageOption(language) {
+  if (!language || [...el.matchLanguage.options].some((option) => option.value === language)) return;
+  el.matchLanguage.add(new Option(language, language));
+}
+
+function renderMatchResults() {
+  const busy = state.matchSearching || Boolean(state.matchApplyingGuid);
+  el.matchQuery.disabled = busy;
+  el.matchYear.disabled = busy;
+  el.matchLanguage.disabled = busy;
+  el.matchSearch.disabled = busy;
+  el.matchClose.disabled = Boolean(state.matchApplyingGuid);
+  el.matchSearch.textContent = state.matchSearching ? "Searching..." : "Search";
+  el.matchResults.replaceChildren();
+  if (state.matchSearching) {
+    setMatchStatus("Searching Plex metadata...");
+    return;
+  }
+  if (!state.matchResults.length) {
+    setMatchStatus("No matching titles found.", "muted");
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const candidate of state.matchResults) {
+    const row = document.createElement("article");
+    row.className = "match-result";
+
+    const poster = document.createElement("div");
+    poster.className = "match-result-poster";
+    if (candidate.posterUrl) {
+      const image = document.createElement("img");
+      image.src = candidate.posterUrl;
+      image.alt = "";
+      image.loading = "lazy";
+      image.referrerPolicy = "no-referrer";
+      poster.append(image);
+    } else {
+      const placeholder = document.createElement("span");
+      placeholder.textContent = candidate.type === "show" ? "TV" : "Film";
+      poster.append(placeholder);
+    }
+
+    const copy = document.createElement("div");
+    copy.className = "match-result-copy";
+    const heading = document.createElement("div");
+    heading.className = "match-result-heading";
+    const name = document.createElement("strong");
+    name.textContent = candidate.name;
+    heading.append(name);
+    if (candidate.best) {
+      const best = document.createElement("span");
+      best.className = "match-badge";
+      best.textContent = "Best match";
+      heading.append(best);
+    }
+    if (candidate.current) {
+      const current = document.createElement("span");
+      current.className = "match-badge current";
+      current.textContent = "Current";
+      heading.append(current);
+    }
+    const metadata = document.createElement("small");
+    metadata.textContent = [candidate.year, candidate.type === "show" ? "TV show" : "Movie"]
+      .filter(Boolean)
+      .join(" / ");
+    copy.append(heading, metadata);
+    if (candidate.summary) {
+      const summary = document.createElement("p");
+      summary.textContent = candidate.summary;
+      copy.append(summary);
+    }
+
+    const use = document.createElement("button");
+    use.type = "button";
+    use.className = "primary-button match-use";
+    use.textContent = state.matchApplyingGuid === candidate.guid
+      ? "Matching..."
+      : candidate.current
+        ? "Refresh match"
+        : "Use match";
+    use.disabled = Boolean(state.matchApplyingGuid);
+    use.addEventListener("click", () => applyMediaMatch(candidate));
+    row.append(poster, copy, use);
+    fragment.append(row);
+  }
+  el.matchResults.append(fragment);
+  setMatchStatus(`${state.matchResults.length} ${state.matchResults.length === 1 ? "match" : "matches"}`);
+}
+
+async function searchMediaMatches() {
+  const item = state.matchItem;
+  const title = el.matchQuery.value.trim();
+  if (!item?.ratingKey || !title || state.matchApplyingGuid) return;
+  state.matchAbortController?.abort();
+  const controller = new AbortController();
+  state.matchAbortController = controller;
+  const requestId = ++state.matchRequestId;
+  state.matchSearching = true;
+  state.matchResults = [];
+  renderMatchResults();
+  const params = new URLSearchParams({
+    ratingKey: item.ratingKey,
+    title,
+    language: el.matchLanguage.value,
+  });
+  if (el.matchYear.value.trim()) params.set("year", el.matchYear.value.trim());
+  let failure = "";
+  try {
+    const data = await api(`/api/media-match?${params}`, { signal: controller.signal });
+    if (requestId !== state.matchRequestId || state.matchItem !== item) return;
+    state.matchResults = data.results || [];
+    ensureMatchLanguageOption(data.language);
+    if (data.language) el.matchLanguage.value = data.language;
+  } catch (error) {
+    if (error.name !== "AbortError" && requestId === state.matchRequestId) {
+      failure = error.message;
+    }
+  } finally {
+    if (requestId === state.matchRequestId) {
+      state.matchSearching = false;
+      state.matchAbortController = null;
+      renderMatchResults();
+      if (failure) setMatchStatus(failure, "error");
+    }
+  }
+}
+
+async function openMatchDialog(item) {
+  if (!item?.ratingKey || !["movie", "show"].includes(item.type)) return;
+  state.matchAbortController?.abort();
+  state.matchItem = item;
+  state.matchResults = [];
+  state.matchSearching = false;
+  state.matchApplyingGuid = null;
+  el.matchTitle.textContent = `${item.guid ? "Fix match" : "Match"} for ${displayTitle(item)}`;
+  el.matchQuery.value = item.title || "";
+  el.matchYear.value = item.year || "";
+  const library = state.libraries.find(
+    (candidate) => String(candidate.key) === String(item.librarySectionID),
+  );
+  const language = library?.language || "el-GR";
+  ensureMatchLanguageOption(language);
+  el.matchLanguage.value = language;
+  setMatchStatus("");
+  if (!el.matchDialog.open) el.matchDialog.showModal();
+  await searchMediaMatches();
+}
+
+async function applyMediaMatch(candidate) {
+  const item = state.matchItem;
+  if (!item?.ratingKey || state.matchApplyingGuid) return;
+  const year = candidate.year ? ` (${candidate.year})` : "";
+  const action = candidate.current ? "Refresh metadata from" : "Use";
+  const confirmed = window.confirm(
+    `${action} ${candidate.name}${year} for ${displayTitle(item)}? Plex will update its title, poster, description, and related metadata.`,
+  );
+  if (!confirmed) return;
+
+  state.matchApplyingGuid = candidate.guid;
+  renderMatchResults();
+  setMatchStatus("Applying Plex match...");
+  let failure = "";
+  try {
+    const result = await api("/api/media-match", {
+      method: "POST",
+      body: JSON.stringify({
+        ratingKey: item.ratingKey,
+        guid: candidate.guid,
+        name: candidate.name,
+        year: candidate.year,
+      }),
+    });
+    let refreshed = result.item;
+    await sleep(700);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const data = await api(
+        `/api/metadata/${encodeURIComponent(item.ratingKey)}?refresh=1&match=${Date.now()}`,
+      );
+      if (data.item) refreshed = data.item;
+      if (refreshed?.guid === candidate.guid) break;
+      await sleep(500 + attempt * 250);
+    }
+    if (refreshed) {
+      Object.assign(item, refreshed, { _hydrated: true, _metadataFailedAt: 0 });
+    }
+    state.metadataRequests.delete(String(item.ratingKey));
+    for (const entry of state.stack) {
+      if (entry.item?.ratingKey === item.ratingKey) entry.title = item.title;
+    }
+    renderItems([...state.currentItems]);
+    if (el.detailsDialog.open) openDetails(item);
+    el.matchDialog.close();
+    setStatus(
+      candidate.current
+        ? `Plex metadata refreshed for ${displayTitle(item)}.`
+        : `Matched as ${displayTitle(item)}. Plex is refreshing its metadata.`,
+      "success",
+    );
+  } catch (error) {
+    failure = error.message;
+  } finally {
+    state.matchApplyingGuid = null;
+    if (el.matchDialog.open) renderMatchResults();
+    if (failure) setMatchStatus(failure, "error");
   }
 }
 
@@ -2681,6 +2915,25 @@ for (const button of el.viewButtons) {
 el.detailsClose.addEventListener("click", () => el.detailsDialog.close());
 el.detailsDialog.addEventListener("close", () => {
   state.detailsItem = null;
+});
+el.matchForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  searchMediaMatches();
+});
+el.matchClose.addEventListener("click", () => {
+  if (!state.matchApplyingGuid) el.matchDialog.close();
+});
+el.matchDialog.addEventListener("cancel", (event) => {
+  if (state.matchApplyingGuid) event.preventDefault();
+});
+el.matchDialog.addEventListener("close", () => {
+  state.matchAbortController?.abort();
+  state.matchAbortController = null;
+  state.matchRequestId += 1;
+  state.matchItem = null;
+  state.matchResults = [];
+  state.matchSearching = false;
+  state.matchApplyingGuid = null;
 });
 el.mediaDeleteConfirmation.addEventListener("input", updateMediaDeleteSubmit);
 el.mediaDeleteForm.addEventListener("submit", (event) => {
