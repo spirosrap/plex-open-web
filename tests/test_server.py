@@ -222,6 +222,7 @@ class FakeMatchPlex(FakePlex):
         self.current_guid = "plex://movie/current123"
         self.current_title = "Wrong Movie"
         self.current_year = "1999"
+        self.current_thumb = "/library/metadata/701/thumb/1"
 
     def xml(self, path, params=None):
         self.xml_calls.append((path, dict(params or {})))
@@ -237,7 +238,8 @@ class FakeMatchPlex(FakePlex):
             return ET.fromstring(
                 '<MediaContainer size="1">'
                 f'<Video ratingKey="701" librarySectionID="7" type="movie" guid="{self.current_guid}" '
-                f'title="{self.current_title}" year="{self.current_year}" summary="Current summary">'
+                f'title="{self.current_title}" year="{self.current_year}" thumb="{self.current_thumb}" '
+                f'summary="Current summary">'
                 '<Media videoCodec="h264" audioCodec="aac"><Part key="/library/parts/701/file.mp4" /></Media>'
                 '</Video></MediaContainer>'
             )
@@ -275,6 +277,8 @@ class FakeMatchPlex(FakePlex):
             self.current_guid = params["guid"]
             self.current_title = params["name"]
             self.current_year = str(params.get("year") or "")
+        elif path == "/library/metadata/701/posters" and kwargs.get("method") == "POST":
+            self.current_thumb = "/library/metadata/701/thumb/2"
         return FakeResponse()
 
 
@@ -370,7 +374,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.19.0", responses[0][1]["version"])
+        self.assertEqual("0.20.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -385,7 +389,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.19.0", responses[0][1]["version"])
+        self.assertEqual("0.20.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -620,6 +624,7 @@ class MediaMatchTests(unittest.TestCase):
         self.assertFalse(payload["results"][0]["current"])
         self.assertTrue(payload["results"][1]["current"])
         self.assertEqual("https://images.plex.tv/poster.jpg", payload["results"][0]["posterUrl"])
+        self.assertTrue(payload["results"][0]["posterCanApply"])
         _, params = next(call for call in plex.xml_calls if call[0].endswith("/matches"))
         self.assertEqual(1, params["manual"])
         self.assertEqual("Correct Movie", params["title"])
@@ -668,6 +673,44 @@ class MediaMatchTests(unittest.TestCase):
 
         self.assertEqual(400, responses[0][0])
         self.assertEqual("invalid_match", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_apply_poster_changes_only_artwork_from_a_trusted_plex_result(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "701",
+                "posterUrl": "https://images.plex.tv/poster.jpg",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_poster("POST")
+
+        self.assertEqual(200, responses[0][0])
+        payload = responses[0][1]
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["pending"])
+        self.assertEqual("plex://movie/current123", payload["item"]["guid"])
+        self.assertEqual("Wrong Movie", payload["item"]["title"])
+        self.assertIn("thumb%2F2", payload["item"]["posterUrl"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/metadata/701/posters", path)
+        self.assertEqual("https://images.plex.tv/poster.jpg", params["url"])
+        self.assertEqual("POST", kwargs["method"])
+
+    def test_apply_poster_rejects_an_untrusted_artwork_host(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "701",
+                "posterUrl": "https://images.plex.tv.example.com/poster.jpg",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_poster("POST")
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_poster_url", responses[0][1]["error"])
         self.assertEqual([], plex.open_calls)
 
     def test_episode_matching_is_rejected_at_the_api_boundary(self):

@@ -30,6 +30,7 @@ const state = {
   matchAbortController: null,
   matchSearching: false,
   matchApplyingGuid: null,
+  matchApplyingPosterUrl: null,
   mediaDeletionEnabled: false,
   mediaDeleteItem: null,
   mediaDeletePlan: null,
@@ -957,12 +958,13 @@ function ensureMatchLanguageOption(language) {
 }
 
 function renderMatchResults() {
-  const busy = state.matchSearching || Boolean(state.matchApplyingGuid);
+  const applying = Boolean(state.matchApplyingGuid || state.matchApplyingPosterUrl);
+  const busy = state.matchSearching || applying;
   el.matchQuery.disabled = busy;
   el.matchYear.disabled = busy;
   el.matchLanguage.disabled = busy;
   el.matchSearch.disabled = busy;
-  el.matchClose.disabled = Boolean(state.matchApplyingGuid);
+  el.matchClose.disabled = applying;
   el.matchSearch.textContent = state.matchSearching ? "Searching..." : "Search";
   el.matchResults.replaceChildren();
   if (state.matchSearching) {
@@ -1013,6 +1015,12 @@ function renderMatchResults() {
       current.textContent = "Current";
       heading.append(current);
     }
+    if (candidate.posterCanApply) {
+      const artwork = document.createElement("span");
+      artwork.className = "match-badge artwork";
+      artwork.textContent = "Poster available";
+      heading.append(artwork);
+    }
     const metadata = document.createElement("small");
     metadata.textContent = [candidate.year, candidate.type === "show" ? "TV show" : "Movie"]
       .filter(Boolean)
@@ -1032,9 +1040,25 @@ function renderMatchResults() {
       : candidate.current
         ? "Refresh match"
         : "Use match";
-    use.disabled = Boolean(state.matchApplyingGuid);
+    use.disabled = applying;
     use.addEventListener("click", () => applyMediaMatch(candidate));
-    row.append(poster, copy, use);
+
+    const actions = document.createElement("div");
+    actions.className = "match-result-actions";
+    actions.append(use);
+    if (candidate.posterCanApply) {
+      const usePoster = document.createElement("button");
+      usePoster.type = "button";
+      usePoster.className = "secondary-button match-poster-use";
+      usePoster.textContent = state.matchApplyingPosterUrl === candidate.posterUrl
+        ? "Applying..."
+        : "Use poster";
+      usePoster.title = "Change only the poster and keep the current metadata match.";
+      usePoster.disabled = applying;
+      usePoster.addEventListener("click", () => applyMediaPoster(candidate));
+      actions.append(usePoster);
+    }
+    row.append(poster, copy, actions);
     fragment.append(row);
   }
   el.matchResults.append(fragment);
@@ -1044,7 +1068,7 @@ function renderMatchResults() {
 async function searchMediaMatches() {
   const item = state.matchItem;
   const title = el.matchQuery.value.trim();
-  if (!item?.ratingKey || !title || state.matchApplyingGuid) return;
+  if (!item?.ratingKey || !title || state.matchApplyingGuid || state.matchApplyingPosterUrl) return;
   state.matchAbortController?.abort();
   const controller = new AbortController();
   state.matchAbortController = controller;
@@ -1086,6 +1110,7 @@ async function openMatchDialog(item) {
   state.matchResults = [];
   state.matchSearching = false;
   state.matchApplyingGuid = null;
+  state.matchApplyingPosterUrl = null;
   el.matchTitle.textContent = `${item.guid ? "Fix match" : "Match"} for ${displayTitle(item)}`;
   el.matchQuery.value = item.title || "";
   el.matchYear.value = item.year || "";
@@ -1102,7 +1127,7 @@ async function openMatchDialog(item) {
 
 async function applyMediaMatch(candidate) {
   const item = state.matchItem;
-  if (!item?.ratingKey || state.matchApplyingGuid) return;
+  if (!item?.ratingKey || state.matchApplyingGuid || state.matchApplyingPosterUrl) return;
   const year = candidate.year ? ` (${candidate.year})` : "";
   const action = candidate.current ? "Refresh metadata from" : "Use";
   const confirmed = window.confirm(
@@ -1154,6 +1179,59 @@ async function applyMediaMatch(candidate) {
     failure = error.message;
   } finally {
     state.matchApplyingGuid = null;
+    if (el.matchDialog.open) renderMatchResults();
+    if (failure) setMatchStatus(failure, "error");
+  }
+}
+
+async function applyMediaPoster(candidate) {
+  const item = state.matchItem;
+  if (
+    !item?.ratingKey
+    || !candidate.posterCanApply
+    || !candidate.posterUrl
+    || state.matchApplyingGuid
+    || state.matchApplyingPosterUrl
+  ) return;
+  const confirmed = window.confirm(
+    `Use this poster for ${displayTitle(item)}? Only the poster will change; Plex will keep the current title, description, match, and video.`,
+  );
+  if (!confirmed) return;
+
+  const previousPosterUrl = item.posterUrl;
+  state.matchApplyingPosterUrl = candidate.posterUrl;
+  renderMatchResults();
+  setMatchStatus("Applying poster...");
+  let failure = "";
+  try {
+    const result = await api("/api/media-poster", {
+      method: "POST",
+      body: JSON.stringify({
+        ratingKey: item.ratingKey,
+        posterUrl: candidate.posterUrl,
+      }),
+    });
+    let refreshed = result.item;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      if (refreshed?.posterUrl && refreshed.posterUrl !== previousPosterUrl) break;
+      await sleep(400 + attempt * 200);
+      const data = await api(
+        `/api/metadata/${encodeURIComponent(item.ratingKey)}?refresh=1&poster=${Date.now()}`,
+      );
+      if (data.item) refreshed = data.item;
+    }
+    if (refreshed) {
+      Object.assign(item, refreshed, { _hydrated: true, _metadataFailedAt: 0 });
+    }
+    state.metadataRequests.delete(String(item.ratingKey));
+    renderItems([...state.currentItems]);
+    if (el.detailsDialog.open) openDetails(item);
+    el.matchDialog.close();
+    setStatus(`Poster updated for ${displayTitle(item)}.`, "success");
+  } catch (error) {
+    failure = error.message;
+  } finally {
+    state.matchApplyingPosterUrl = null;
     if (el.matchDialog.open) renderMatchResults();
     if (failure) setMatchStatus(failure, "error");
   }
@@ -3061,10 +3139,10 @@ el.matchForm.addEventListener("submit", (event) => {
   searchMediaMatches();
 });
 el.matchClose.addEventListener("click", () => {
-  if (!state.matchApplyingGuid) el.matchDialog.close();
+  if (!state.matchApplyingGuid && !state.matchApplyingPosterUrl) el.matchDialog.close();
 });
 el.matchDialog.addEventListener("cancel", (event) => {
-  if (state.matchApplyingGuid) event.preventDefault();
+  if (state.matchApplyingGuid || state.matchApplyingPosterUrl) event.preventDefault();
 });
 el.matchDialog.addEventListener("close", () => {
   state.matchAbortController?.abort();
@@ -3074,6 +3152,7 @@ el.matchDialog.addEventListener("close", () => {
   state.matchResults = [];
   state.matchSearching = false;
   state.matchApplyingGuid = null;
+  state.matchApplyingPosterUrl = null;
 });
 el.mediaDeleteConfirmation.addEventListener("input", updateMediaDeleteSubmit);
 el.mediaDeleteForm.addEventListener("submit", (event) => {

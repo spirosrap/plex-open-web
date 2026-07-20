@@ -11,7 +11,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
 - Movie collection membership management with searchable, immediate add/remove controls.
 - Manual collection creation, rename, and confirmed deletion without removing library movies.
-- Plex Fix Match for movies and TV shows, with title/year/language search, ranked poster-backed candidates, and confirmed metadata replacement.
+- Plex Fix Match for movies and TV shows, with title/year/language search, ranked poster-backed candidates, metadata replacement, and poster-only artwork repair.
 - Permanent movie and episode deletion with an exact disk preview, typed confirmation, hardlink cleanup, and safe folder pruning.
 - Server-backed My List shared with the Android app, with per-library browsing and poster badges.
 - Surprise Me selection for opening a random item from the active genre and Unwatched filters.
@@ -35,6 +35,24 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.20.0
+
+**Added**
+
+- Fix Match results with Plex-hosted artwork now include a `Use poster` action.
+- Poster-only updates preserve the current title, description, metadata match, watch state, collections, and video file.
+- Match results clearly mark candidates that have selectable artwork.
+
+**Improved**
+
+- Artwork can be borrowed from an alternate localized match without changing the movie to that title or metadata record.
+- Poster imports accept only trusted `images.plex.tv` match-result URLs instead of arbitrary remote addresses.
+
+**Fixed**
+
+- Fixed movies remaining stuck with a generated thumbnail when their current Plex metadata record has no poster but another valid match result has artwork.
+- Fixed the current posterless match looking like the only useful repair choice when Plex has duplicate records for the same release.
 
 ### 0.19.0
 

@@ -1158,6 +1158,11 @@ select:focus-visible {
   color: var(--muted);
 }
 
+.match-badge.artwork {
+  background: var(--playback-background);
+  color: var(--accent-2);
+}
+
 .match-result-copy small {
   display: block;
   margin-top: 4px;
@@ -1176,9 +1181,22 @@ select:focus-visible {
   -webkit-line-clamp: 3;
 }
 
-.match-use {
+.match-result-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.match-use,
+.match-poster-use {
   min-height: 38px;
   white-space: nowrap;
+}
+
+.match-poster-use {
+  border: 1px solid var(--line);
+  background: var(--meta-surface);
 }
 
 .primary-button,
@@ -1557,8 +1575,10 @@ select:focus-visible {
     width: 62px;
   }
 
-  .match-use {
+  .match-result-actions {
     grid-column: 2;
+    flex-direction: row;
+    flex-wrap: wrap;
     justify-self: start;
   }
 

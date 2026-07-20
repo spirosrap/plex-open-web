@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.19.0"
+APP_VERSION = "0.20.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -1678,7 +1678,7 @@ def match_poster_url(value: Optional[str]) -> Optional[str]:
     if raw.startswith("/"):
         return image_url(raw)
     parsed = urllib.parse.urlsplit(raw)
-    if parsed.scheme == "https" and parsed.hostname == "images.plex.tv":
+    if parsed.scheme == "https" and parsed.netloc == "images.plex.tv":
         return raw
     return None
 
@@ -1695,12 +1695,15 @@ def match_candidate_from_xml(
     candidate_type = str(elem.get("type") or expected_type).strip().lower()
     if not match or match.group(1) != expected_type or candidate_type != expected_type or not name:
         return None
+    raw_poster_url = str(elem.get("thumb") or "").strip()
+    poster_url = match_poster_url(raw_poster_url)
     return {
         "guid": guid,
         "name": name[:300],
         "year": to_int(elem.get("year")),
         "summary": str(elem.get("summary") or "")[:3000] or None,
-        "posterUrl": match_poster_url(elem.get("thumb")),
+        "posterUrl": poster_url,
+        "posterCanApply": bool(poster_url and poster_url == raw_poster_url),
         "type": candidate_type,
         "rank": rank,
         "best": rank == 1,
@@ -3642,6 +3645,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/media-match":
             self.api_media_match(method, query)
             return
+        if path == "/api/media-poster":
+            self.api_media_poster(method)
+            return
         if path == "/api/watch-state":
             self.api_watch_state(method)
             return
@@ -4452,6 +4458,73 @@ class AppHandler(BaseHTTPRequestHandler):
                 "ratingKey": rating_key,
                 "guid": guid,
                 "pending": pending,
+                "item": refreshed or item,
+            }
+        )
+
+    def api_media_poster(self, method: str) -> None:
+        if method != "POST":
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload = self.read_json()
+        rating_key = str(payload.get("ratingKey") or "").strip()
+        if not re.fullmatch(r"\d+", rating_key):
+            self.send_json(
+                {"error": "invalid_rating_key", "message": "Select a valid Plex item."},
+                status=400,
+            )
+            return
+        item = metadata_item_for_rating_key(rating_key)
+        if item is None:
+            self.send_json({"error": "not_found", "message": "Plex item was not found."}, status=404)
+            return
+        if item.get("type") not in {"movie", "show"}:
+            self.send_json(
+                {
+                    "error": "unsupported_media_type",
+                    "message": "Poster changes are available for movies and TV shows.",
+                },
+                status=400,
+            )
+            return
+
+        raw_poster_url = str(payload.get("posterUrl") or "").strip()
+        poster_url = match_poster_url(raw_poster_url)
+        if not poster_url or poster_url != raw_poster_url:
+            self.send_json(
+                {
+                    "error": "invalid_poster_url",
+                    "message": "Select artwork supplied by Plex match results.",
+                },
+                status=400,
+            )
+            return
+
+        previous_poster_url = item.get("posterUrl")
+        response = PLEX.open(
+            f"/library/metadata/{urllib.parse.quote(rating_key)}/posters",
+            params={"url": poster_url},
+            method="POST",
+        )
+        response.close()
+        API_CACHE.clear()
+
+        refreshed: Optional[Dict[str, Any]] = None
+        deadline = time.monotonic() + 3.0
+        while True:
+            refreshed = metadata_item_for_rating_key(rating_key)
+            if (
+                refreshed is None
+                or refreshed.get("posterUrl") != previous_poster_url
+                or time.monotonic() >= deadline
+            ):
+                break
+            time.sleep(0.25)
+        self.send_json(
+            {
+                "ok": True,
+                "ratingKey": rating_key,
+                "pending": refreshed is None or refreshed.get("posterUrl") == previous_poster_url,
                 "item": refreshed or item,
             }
         )
