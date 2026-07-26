@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.20.0"
+APP_VERSION = "0.21.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -3645,6 +3645,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/media-match":
             self.api_media_match(method, query)
             return
+        if path == "/api/media-refresh":
+            self.api_media_refresh(method)
+            return
         if path == "/api/media-poster":
             self.api_media_poster(method)
             return
@@ -4525,6 +4528,70 @@ class AppHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "ratingKey": rating_key,
                 "pending": refreshed is None or refreshed.get("posterUrl") == previous_poster_url,
+                "item": refreshed or item,
+            }
+        )
+
+    def api_media_refresh(self, method: str) -> None:
+        if method != "POST":
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        payload = self.read_json()
+        rating_key = str(payload.get("ratingKey") or "").strip()
+        if not re.fullmatch(r"\d+", rating_key):
+            self.send_json(
+                {"error": "invalid_rating_key", "message": "Select a valid Plex item."},
+                status=400,
+            )
+            return
+        item = metadata_item_for_rating_key(rating_key)
+        if item is None:
+            self.send_json({"error": "not_found", "message": "Plex item was not found."}, status=404)
+            return
+        if item.get("type") not in {"movie", "show"}:
+            self.send_json(
+                {
+                    "error": "unsupported_media_type",
+                    "message": "Metadata refresh is available for movies and TV shows.",
+                },
+                status=400,
+            )
+            return
+
+        previous_signature = (
+            item.get("updatedAt"),
+            item.get("title"),
+            item.get("summary"),
+            item.get("posterUrl"),
+        )
+        response = PLEX.open(
+            f"/library/metadata/{urllib.parse.quote(rating_key)}/refresh",
+            method="PUT",
+        )
+        response.close()
+        API_CACHE.clear()
+
+        refreshed: Optional[Dict[str, Any]] = None
+        changed = False
+        deadline = time.monotonic() + 3.0
+        while True:
+            refreshed = metadata_item_for_rating_key(rating_key)
+            if refreshed is None:
+                break
+            changed = (
+                refreshed.get("updatedAt"),
+                refreshed.get("title"),
+                refreshed.get("summary"),
+                refreshed.get("posterUrl"),
+            ) != previous_signature
+            if changed or time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
+        self.send_json(
+            {
+                "ok": True,
+                "ratingKey": rating_key,
+                "pending": not changed,
                 "item": refreshed or item,
             }
         )

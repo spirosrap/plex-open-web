@@ -11,7 +11,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Native Plex collection browsing with composite posters, item counts, paging, and collection-to-movie navigation.
 - Movie collection membership management with searchable, immediate add/remove controls.
 - Manual collection creation, rename, and confirmed deletion without removing library movies.
-- Plex Fix Match for movies and TV shows, with title/year/language search, ranked poster-backed candidates, metadata replacement, and poster-only artwork repair.
+- Plex Fix Match and metadata refresh for movies and TV shows, with title/year/language search, ranked poster-backed candidates, metadata replacement, poster-only artwork repair, and one-command refresh of the current match.
 - Permanent movie and episode deletion with an exact disk preview, typed confirmation, hardlink cleanup, and safe folder pruning.
 - Server-backed My List shared with the Android app, with per-library browsing and poster badges.
 - Surprise Me selection for opening a random item from the active genre and Unwatched filters.
@@ -35,6 +35,26 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.21.0
+
+**Added**
+
+- Added a dedicated `Refresh metadata` action to movie and TV show details.
+- Added an authenticated metadata-refresh API that asks Plex to update the existing match without selecting a different title.
+- Added confirmation, progress, completion, and background-update states for metadata refreshes.
+
+**Improved**
+
+- Refreshed titles, descriptions, ratings, artwork, and related metadata update the open detail view and visible library cards without a page reload.
+- Refresh polling bypasses short-lived metadata caches while Plex finishes asynchronous agent work.
+- The confirmation clearly states that the media file, watch state, and collections remain unchanged.
+
+**Fixed**
+
+- Fixed the current match requiring a full Fix Match search when its metadata was correct but stale.
+- Fixed newly refreshed artwork or descriptions temporarily reverting to cached values in the current browser session.
+- Metadata refresh requests for episodes, seasons, collections, and malformed item IDs are rejected before Plex is changed.
 
 ### 0.20.0
 

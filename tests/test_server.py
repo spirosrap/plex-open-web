@@ -223,6 +223,8 @@ class FakeMatchPlex(FakePlex):
         self.current_title = "Wrong Movie"
         self.current_year = "1999"
         self.current_thumb = "/library/metadata/701/thumb/1"
+        self.current_summary = "Current summary"
+        self.current_updated_at = "100"
 
     def xml(self, path, params=None):
         self.xml_calls.append((path, dict(params or {})))
@@ -239,7 +241,7 @@ class FakeMatchPlex(FakePlex):
                 '<MediaContainer size="1">'
                 f'<Video ratingKey="701" librarySectionID="7" type="movie" guid="{self.current_guid}" '
                 f'title="{self.current_title}" year="{self.current_year}" thumb="{self.current_thumb}" '
-                f'summary="Current summary">'
+                f'summary="{self.current_summary}" updatedAt="{self.current_updated_at}">'
                 '<Media videoCodec="h264" audioCodec="aac"><Part key="/library/parts/701/file.mp4" /></Media>'
                 '</Video></MediaContainer>'
             )
@@ -279,6 +281,9 @@ class FakeMatchPlex(FakePlex):
             self.current_year = str(params.get("year") or "")
         elif path == "/library/metadata/701/posters" and kwargs.get("method") == "POST":
             self.current_thumb = "/library/metadata/701/thumb/2"
+        elif path == "/library/metadata/701/refresh" and kwargs.get("method") == "PUT":
+            self.current_summary = "Refreshed summary"
+            self.current_updated_at = "101"
         return FakeResponse()
 
 
@@ -374,7 +379,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.20.0", responses[0][1]["version"])
+        self.assertEqual("0.21.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -389,7 +394,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.20.0", responses[0][1]["version"])
+        self.assertEqual("0.21.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -711,6 +716,33 @@ class MediaMatchTests(unittest.TestCase):
 
         self.assertEqual(400, responses[0][0])
         self.assertEqual("invalid_poster_url", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_refresh_updates_metadata_without_changing_the_match(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({"ratingKey": "701"})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_refresh("POST")
+
+        self.assertEqual(200, responses[0][0])
+        payload = responses[0][1]
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["pending"])
+        self.assertEqual("plex://movie/current123", payload["item"]["guid"])
+        self.assertEqual("Refreshed summary", payload["item"]["summary"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/metadata/701/refresh", path)
+        self.assertEqual({}, params)
+        self.assertEqual("PUT", kwargs["method"])
+
+    def test_refresh_rejects_episode_metadata(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({"ratingKey": "702"})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_refresh("POST")
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("unsupported_media_type", responses[0][1]["error"])
         self.assertEqual([], plex.open_calls)
 
     def test_episode_matching_is_rejected_at_the_api_boundary(self):

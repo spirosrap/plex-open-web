@@ -31,6 +31,7 @@ const state = {
   matchSearching: false,
   matchApplyingGuid: null,
   matchApplyingPosterUrl: null,
+  mediaRefreshRatingKey: null,
   mediaDeletionEnabled: false,
   mediaDeleteItem: null,
   mediaDeletePlan: null,
@@ -125,6 +126,7 @@ const el = {
   detailsMyList: document.querySelector("#details-my-list"),
   detailsCollections: document.querySelector("#details-collections"),
   detailsFixMatch: document.querySelector("#details-fix-match"),
+  detailsRefreshMetadata: document.querySelector("#details-refresh-metadata"),
   detailsDeleteMedia: document.querySelector("#details-delete-media"),
   detailsClose: document.querySelector("#details-close"),
   matchDialog: document.querySelector("#match-dialog"),
@@ -929,6 +931,12 @@ function openDetails(item) {
   el.detailsFixMatch.hidden = !canFixMatch;
   el.detailsFixMatch.textContent = item.guid ? "Fix match" : "Match";
   el.detailsFixMatch.onclick = () => openMatchDialog(item);
+  el.detailsRefreshMetadata.hidden = !canFixMatch;
+  el.detailsRefreshMetadata.disabled = state.mediaRefreshRatingKey === item.ratingKey;
+  el.detailsRefreshMetadata.textContent = state.mediaRefreshRatingKey === item.ratingKey
+    ? "Refreshing..."
+    : "Refresh metadata";
+  el.detailsRefreshMetadata.onclick = () => refreshMediaMetadata(item);
   const canDeleteMedia = Boolean(
     state.mediaDeletionEnabled && item.ratingKey && ["movie", "episode"].includes(item.type),
   );
@@ -1234,6 +1242,65 @@ async function applyMediaPoster(candidate) {
     state.matchApplyingPosterUrl = null;
     if (el.matchDialog.open) renderMatchResults();
     if (failure) setMatchStatus(failure, "error");
+  }
+}
+
+function mediaMetadataSignature(item) {
+  return JSON.stringify([
+    item?.updatedAt || null,
+    item?.title || null,
+    item?.summary || null,
+    item?.posterUrl || null,
+  ]);
+}
+
+async function refreshMediaMetadata(item) {
+  if (
+    !item?.ratingKey
+    || !["movie", "show"].includes(item.type)
+    || state.mediaRefreshRatingKey
+  ) return;
+  const confirmed = window.confirm(
+    `Refresh metadata for ${displayTitle(item)} from its current Plex match? Plex may update its poster, description, ratings, cast, and other metadata. The video file, watch state, and collections will stay unchanged.`,
+  );
+  if (!confirmed) return;
+
+  const before = mediaMetadataSignature(item);
+  const wasOpen = el.detailsDialog.open;
+  state.mediaRefreshRatingKey = item.ratingKey;
+  if (wasOpen) openDetails(item);
+  setStatus(`Refreshing metadata for ${displayTitle(item)}...`);
+  try {
+    const result = await api("/api/media-refresh", {
+      method: "POST",
+      body: JSON.stringify({ ratingKey: item.ratingKey }),
+    });
+    let refreshed = result.item;
+    let changed = mediaMetadataSignature(refreshed) !== before;
+    for (let attempt = 0; attempt < 5 && !changed; attempt += 1) {
+      await sleep(400 + attempt * 250);
+      const data = await api(
+        `/api/metadata/${encodeURIComponent(item.ratingKey)}?refresh=1&metadata=${Date.now()}`,
+      );
+      if (data.item) refreshed = data.item;
+      changed = mediaMetadataSignature(refreshed) !== before;
+    }
+    if (refreshed) {
+      Object.assign(item, refreshed, { _hydrated: true, _metadataFailedAt: 0 });
+    }
+    state.metadataRequests.delete(String(item.ratingKey));
+    renderItems([...state.currentItems]);
+    setStatus(
+      changed
+        ? `Metadata updated for ${displayTitle(item)}.`
+        : `Plex accepted the metadata refresh for ${displayTitle(item)}. Updates may continue in the background.`,
+      "success",
+    );
+  } catch (error) {
+    setStatus(`Could not refresh metadata: ${error.message}`, "error");
+  } finally {
+    state.mediaRefreshRatingKey = null;
+    if (wasOpen && el.detailsDialog.open && state.detailsItem === item) openDetails(item);
   }
 }
 
