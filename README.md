@@ -29,12 +29,32 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Codec-aware FFmpeg fallback that converts unsupported video such as HEVC to H.264 and unsupported audio such as AC3 to AAC.
 - Poster/artwork proxy so the browser only needs this app URL.
 - Compressed API responses, right-sized artwork, and coalesced Plex reads for fast browsing over a tailnet.
-- Cancellable library/search requests, stable loading placeholders, and incremental card rendering for responsive interaction.
+- Cancellable library/search requests, stable loading placeholders, incremental card rendering, and bounded visible-title metadata warming for responsive interaction.
+- Browser-storage cleanup runs only during idle time and never blocks a video from starting.
 - No runtime dependencies beyond Python 3 standard library.
 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.22.0
+
+**Added**
+
+- Added bounded background metadata warming for the first visible movies and episodes on every library screen.
+- Added idle-time maintenance for saved-on-device browser files.
+
+**Improved**
+
+- Play and Details can reuse already prepared stream, codec, subtitle, resume, and saved-copy metadata before the first tap.
+- Playback now checks only the selected item's device copy while preparing; full browser-storage cleanup happens separately after the interface is idle.
+- First-viewport poster priority is capped so artwork does not crowd out the metadata request needed to start a video.
+- Metadata warming shares the existing in-flight request map and uses two bounded workers, preventing duplicate calls or request bursts.
+
+**Fixed**
+
+- Fixed larger browser device caches delaying every video before the player received its source.
+- Fixed touch devices missing the metadata prefetch benefit that desktop users already received from hover and keyboard focus.
 
 ### 0.21.0
 

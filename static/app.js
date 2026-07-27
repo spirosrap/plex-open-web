@@ -20,6 +20,9 @@ const state = {
   searchRequestId: 0,
   searchAbortController: null,
   metadataRequests: new Map(),
+  metadataPrefetchGeneration: 0,
+  deviceCachePruneScheduled: false,
+  deviceCachePruneCompleted: false,
   scanInProgress: false,
   surpriseInProgress: false,
   watchStateRatingKey: null,
@@ -74,6 +77,8 @@ const THEME_VALUES = new Set(["system", "light", "dark"]);
 const VIEW_VALUES = new Set(["continue", "recent", "all", "unwatched", "collections", "mylist"]);
 const SORT_VALUES = new Set(["addedAt:desc", "titleSort", "year:desc", "lastViewedAt:desc"]);
 const PROGRESS_REPORT_INTERVAL_MS = 15000;
+const METADATA_PREFETCH_LIMIT = 6;
+const METADATA_PREFETCH_CONCURRENCY = 2;
 
 const savedBrowse = readBrowsePreferences();
 state.preferredLibraryKey = typeof savedBrowse.libraryKey === "string" ? savedBrowse.libraryKey : "";
@@ -391,7 +396,7 @@ function subtitleSearchTitle(item) {
 
 function posterMarkup(item, index = Number.MAX_SAFE_INTEGER) {
   if (item.posterUrl) {
-    const firstViewport = index < 6;
+    const firstViewport = index < 4;
     return `<img loading="${firstViewport ? "eager" : "lazy"}" decoding="async" fetchpriority="${firstViewport ? "high" : "low"}" src="${escapeAttr(item.posterUrl)}" alt="">`;
   }
   const letter = (item.title || "?").trim().slice(0, 1).toUpperCase();
@@ -537,6 +542,38 @@ function renderItems(items, { append = false } = {}) {
   }
   el.grid.append(fragment);
   updateLoadMore();
+  scheduleVisibleMetadataPrefetch(items);
+  scheduleDeviceCachePrune();
+}
+
+function scheduleVisibleMetadataPrefetch(items) {
+  const generation = ++state.metadataPrefetchGeneration;
+  const candidates = items
+    .slice(0, METADATA_PREFETCH_LIMIT)
+    .filter((item) => item?.ratingKey && itemIsPlayable(item) && !item._hydrated);
+  if (!candidates.length) return;
+
+  const warm = async () => {
+    if (generation !== state.metadataPrefetchGeneration) return;
+    let index = 0;
+    const worker = async () => {
+      while (generation === state.metadataPrefetchGeneration && index < candidates.length) {
+        const item = candidates[index];
+        index += 1;
+        await hydrateItem(item);
+      }
+    };
+    await Promise.all(Array.from(
+      { length: Math.min(METADATA_PREFETCH_CONCURRENCY, candidates.length) },
+      worker,
+    ));
+  };
+
+  if ("requestIdleCallback" in window) {
+    window.requestIdleCallback(() => warm().catch(() => {}), { timeout: 1200 });
+  } else {
+    window.setTimeout(() => warm().catch(() => {}), 180);
+  }
 }
 
 function statusTextForItems(count) {
@@ -2101,6 +2138,32 @@ async function pruneDeviceCache() {
   }
 }
 
+function scheduleDeviceCachePrune() {
+  if (
+    state.deviceCachePruneScheduled
+    || state.deviceCachePruneCompleted
+    || !deviceStorageSupported()
+  ) {
+    return;
+  }
+  state.deviceCachePruneScheduled = true;
+  const prune = async () => {
+    try {
+      await pruneDeviceCache();
+      state.deviceCachePruneCompleted = true;
+    } catch {
+      // Browser storage is optional; playback must not wait for maintenance.
+    } finally {
+      state.deviceCachePruneScheduled = false;
+    }
+  };
+  if ("requestIdleCallback" in window) {
+    window.requestIdleCallback(() => prune(), { timeout: 5000 });
+  } else {
+    window.setTimeout(() => prune(), 1500);
+  }
+}
+
 async function devicePlaybackStatus(item) {
   if (!deviceStorageSupported()) {
     return { state: "unsupported", ready: false, supported: false };
@@ -2887,10 +2950,7 @@ async function playItem(item) {
   }
   const results = await Promise.allSettled([
     hydrateItem(item),
-    (async () => {
-      await pruneDeviceCache();
-      await refreshDevicePlayback(item);
-    })(),
+    refreshDevicePlayback(item),
   ]);
   if (preparationId !== state.playerPreparationId || !el.playerDialog.open) return;
   if (results[1].status === "rejected") {
