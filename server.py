@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.22.0"
+APP_VERSION = "0.22.1"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -812,6 +812,29 @@ def has_preferred_supported_subtitle(subtitles: List[Dict[str, Any]]) -> bool:
     )
 
 
+def media_is_direct_playable(media_elem: ET.Element) -> bool:
+    audio_codec = (media_elem.get("audioCodec") or "").lower()
+    video_codec = (media_elem.get("videoCodec") or "").lower()
+    needs_audio_transcode = audio_codec in TRANSCODE_AUDIO_CODECS or (
+        audio_codec and audio_codec not in BROWSER_AUDIO_CODECS
+    )
+    needs_video_transcode = bool(video_codec and video_codec not in BROWSER_VIDEO_CODECS)
+    return not needs_audio_transcode and not needs_video_transcode
+
+
+def media_candidate_rank(
+    media_elem: ET.Element,
+    subtitles: List[Dict[str, Any]],
+) -> Tuple[int, int, int, int]:
+    container = (media_elem.get("container") or "").lower()
+    return (
+        int(has_preferred_supported_subtitle(subtitles)),
+        int(media_is_direct_playable(media_elem)),
+        int(media_elem.get("optimizedForStreaming") in {"1", "true", "True"}),
+        int(container in {"mp4", "m4v", "mov"}),
+    )
+
+
 def media_details(media_elem: Optional[ET.Element], part_elem: ET.Element) -> Dict[str, Any]:
     return {
         "partId": part_elem.get("id"),
@@ -836,12 +859,10 @@ def first_part(elem: ET.Element) -> Tuple[Optional[str], Dict[str, Any], List[Di
     if not candidates:
         return None, {}, []
 
-    selected_media, selected_part, selected_subtitles = candidates[0]
-    if not has_preferred_supported_subtitle(selected_subtitles):
-        for media, part, subtitles in candidates[1:]:
-            if has_preferred_supported_subtitle(subtitles):
-                selected_media, selected_part, selected_subtitles = media, part, subtitles
-                break
+    selected_media, selected_part, selected_subtitles = max(
+        candidates,
+        key=lambda candidate: media_candidate_rank(candidate[0], candidate[2]),
+    )
 
     return selected_part.get("key"), media_details(selected_media, selected_part), selected_subtitles
 

@@ -379,7 +379,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.22.0", responses[0][1]["version"])
+        self.assertEqual("0.22.1", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -394,7 +394,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.22.0", responses[0][1]["version"])
+        self.assertEqual("0.22.1", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -436,6 +436,49 @@ class PlaybackCompatibilityTests(unittest.TestCase):
             urllib.parse.urlsplit(playback["compatibleStreamUrl"]).query
         )
         self.assertEqual(["701"], query["ratingKey"])
+
+    def test_direct_play_version_wins_when_subtitle_preference_is_equal(self):
+        item = ET.fromstring(
+            '<Video ratingKey="701">'
+            '<Media container="mkv" videoCodec="h264" audioCodec="dca">'
+            '<Part id="1" key="/library/parts/1/first.mkv">'
+            '<Stream id="11" streamType="3" codec="srt" selected="1" '
+            'key="/library/streams/11" languageCode="ell" />'
+            '</Part></Media>'
+            '<Media container="mp4" videoCodec="h264" audioCodec="aac" optimizedForStreaming="1">'
+            '<Part id="2" key="/library/parts/2/second.mp4">'
+            '<Stream id="12" streamType="3" codec="srt" selected="1" '
+            'key="/library/streams/12" languageCode="ell" />'
+            '</Part></Media>'
+            '</Video>'
+        )
+
+        part_key, media, subtitles = server.first_part(item)
+
+        self.assertEqual("/library/parts/2/second.mp4", part_key)
+        self.assertEqual("aac", media["audioCodec"])
+        self.assertEqual("12", subtitles[0]["id"])
+        self.assertFalse(server.playback_info(part_key, media)["compatibilityTranscodeRequired"])
+
+    def test_preferred_subtitle_still_wins_over_direct_play_version(self):
+        item = ET.fromstring(
+            '<Video ratingKey="701">'
+            '<Media container="mkv" videoCodec="h264" audioCodec="dca">'
+            '<Part id="1" key="/library/parts/1/first.mkv">'
+            '<Stream id="11" streamType="3" codec="srt" selected="1" '
+            'key="/library/streams/11" languageCode="ell" />'
+            '</Part></Media>'
+            '<Media container="mp4" videoCodec="h264" audioCodec="aac" optimizedForStreaming="1">'
+            '<Part id="2" key="/library/parts/2/second.mp4" />'
+            '</Media>'
+            '</Video>'
+        )
+
+        part_key, media, subtitles = server.first_part(item)
+
+        self.assertEqual("/library/parts/1/first.mkv", part_key)
+        self.assertEqual("dca", media["audioCodec"])
+        self.assertEqual("11", subtitles[0]["id"])
 
     def test_live_audio_transcode_uses_a_safari_compatible_mp4_header(self):
         with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):

@@ -37,6 +37,19 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.22.1
+
+**Improved**
+
+- Movies with multiple Plex media versions now prefer an equally subtitle-capable direct-play file over one that needs HLS conversion.
+- Media selection also considers Plex's streaming-optimization flag and browser-friendly MP4-family containers while preserving Plex order for equivalent files.
+
+**Fixed**
+
+- Fixed movies such as Arrival being treated as live streams when Plex listed a DTS/MKV copy before a seekable H.264/AAC MP4 copy.
+- Fixed the resulting missing seek controls, unavailable timeline, and ignored resume position in both the web and Android clients.
+- Preserved the existing preference for a media version with the selected, default, or forced supported subtitle when another version lacks it.
+
 ### 0.22.0
 
 **Added**
