@@ -37,6 +37,17 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.22.2
+
+**Improved**
+
+- A valid Plex playback offset now represents an active replay even when Plex still retains the movie's watched flag.
+
+**Fixed**
+
+- Fixed previously watched movies such as Arrival restarting from the beginning instead of resuming from their current saved position.
+- Fixed this resume mismatch consistently for direct, compatible, saved-browser, and saved-device playback sources.
+
 ### 0.22.1
 
 **Improved**
@@ -47,7 +58,7 @@ Release notes cover user-facing changes and intentionally omit deployment-specif
 **Fixed**
 
 - Fixed movies such as Arrival being treated as live streams when Plex listed a DTS/MKV copy before a seekable H.264/AAC MP4 copy.
-- Fixed the resulting missing seek controls, unavailable timeline, and ignored resume position in both the web and Android clients.
+- Fixed the resulting missing seek controls and unavailable timeline in both the web and Android clients.
 - Preserved the existing preference for a media version with the selected, default, or forced supported subtitle when another version lacks it.
 
 ### 0.22.0

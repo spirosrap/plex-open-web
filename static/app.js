@@ -1939,7 +1939,6 @@ function playbackTimeMs() {
 }
 
 function resumeTimeFor(item) {
-  if (item?.viewCount) return 0;
   const durationMs = item?.duration || item?.media?.duration || 0;
   const plexOffset = Number(item?.viewOffset || 0);
   const local = localProgressFor(item);
