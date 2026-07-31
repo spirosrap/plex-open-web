@@ -55,6 +55,7 @@ const state = {
   progressTimer: null,
   lastProgressReportAt: 0,
   lastReportedTimeMs: 0,
+  progressResettingKey: null,
   usingSavedPlayback: false,
   usingDevicePlayback: false,
   activeHlsSessionId: null,
@@ -123,6 +124,7 @@ const el = {
   detailsSummary: document.querySelector("#details-summary"),
   detailsMeta: document.querySelector("#details-meta"),
   detailsPlay: document.querySelector("#details-play"),
+  detailsStartOver: document.querySelector("#details-start-over"),
   detailsOpen: document.querySelector("#details-open"),
   detailsPreviousEpisode: document.querySelector("#details-previous-episode"),
   detailsNextEpisode: document.querySelector("#details-next-episode"),
@@ -176,6 +178,7 @@ const el = {
   playbackMode: document.querySelector("#playback-mode"),
   playerError: document.querySelector("#player-error"),
   playerClose: document.querySelector("#player-close"),
+  playerStartOver: document.querySelector("#player-start-over"),
   subtitleLabel: document.querySelector("#subtitle-select-label"),
   subtitleSelect: document.querySelector("#subtitle-select"),
   playerSave: document.querySelector("#player-save"),
@@ -348,12 +351,30 @@ function labelFor(item) {
   return [item.year, item.durationText].filter(Boolean).join(" • ");
 }
 
-function progressPercent(item) {
-  if (!item || item.viewCount) return 0;
+function resumeTimeMsFor(item) {
+  if (!item) return 0;
   const durationMs = Number(item.duration || item.media?.duration || 0);
   const localOffset = Number(localProgressFor(item)?.timeMs || 0);
   const offsetMs = Math.max(Number(item.viewOffset || 0), localOffset);
-  if (durationMs <= 0 || offsetMs < 10000) return 0;
+  if (offsetMs < 10000) return 0;
+  if (durationMs > 0 && durationMs - offsetMs < 30000) return 0;
+  return offsetMs;
+}
+
+function formatPlaybackPosition(timeMs) {
+  const totalSeconds = Math.max(0, Math.floor(Number(timeMs || 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function progressPercent(item) {
+  const durationMs = Number(item?.duration || item?.media?.duration || 0);
+  const offsetMs = resumeTimeMsFor(item);
+  if (durationMs <= 0 || offsetMs <= 0) return 0;
   return Math.min(99, Math.max(1, Math.round((offsetMs / durationMs) * 100)));
 }
 
@@ -467,6 +488,7 @@ function renderBreadcrumbs() {
 
 function createMediaCard(item, index) {
   const inMyList = Boolean(item.ratingKey && state.myListKeys.has(String(item.ratingKey)));
+  const resumeMs = resumeTimeMsFor(item);
   const card = document.createElement("article");
   card.className = "media-card";
   card.dataset.itemIndex = String(index);
@@ -474,7 +496,7 @@ function createMediaCard(item, index) {
     <button class="poster-button" data-action="open">
       ${posterMarkup(item, index)}
       ${item.type === "collection" ? '<span class="collection-badge">Collection</span>' : ""}
-      ${item.viewCount ? '<span class="watched">Watched</span>' : ""}
+      ${item.viewCount && !resumeMs ? '<span class="watched">Watched</span>' : ""}
       ${inMyList ? '<span class="my-list-badge">My List</span>' : ""}
       ${supportedSubtitles(item).length ? `<span class="subtitle-badge${inMyList ? " stacked" : ""}">CC</span>` : ""}
       ${progressMarkup(item)}
@@ -483,7 +505,7 @@ function createMediaCard(item, index) {
       <h3>${escapeHtml(item.title)}</h3>
       <p>${escapeHtml(labelFor(item))}</p>
       <div class="card-actions">
-        ${itemIsPlayable(item) ? '<button data-action="play" class="mini-primary">Play</button>' : ""}
+        ${itemIsPlayable(item) ? `<button data-action="play" class="mini-primary">${resumeMs ? "Resume" : "Play"}</button>` : ""}
         ${item.type === "collection"
           ? `<button data-action="open" class="mini-secondary">Open</button>${item.smart ? "" : '<button data-action="delete-collection" class="mini-danger">Delete</button>'}`
           : '<button data-action="details" class="mini-secondary">Details</button>'}
@@ -916,23 +938,32 @@ function openDetails(item) {
   el.detailsKicker.textContent = [item.type, item.year || item.originallyAvailableAt].filter(Boolean).join(" / ");
   el.detailsTitle.textContent = displayTitle(item);
   el.detailsSummary.textContent = item.summary || "";
+  const resumeMs = resumeTimeMsFor(item);
   const percent = progressPercent(item);
   const meta = [
     item.contentRating,
     item.durationText,
     item.rating ? `${item.rating}/10` : "",
     item.media?.videoResolution,
-    item.viewCount ? "Watched" : percent ? `${percent}% watched` : "",
+    resumeMs ? `${percent}% watched` : item.viewCount ? "Watched" : "",
   ]
     .filter(Boolean)
     .map((value) => `<span>${escapeHtml(String(value))}</span>`)
     .join("");
   el.detailsMeta.innerHTML = meta;
   el.detailsPlay.hidden = !itemIsPlayable(item);
+  el.detailsPlay.textContent = resumeMs
+    ? `Resume ${formatPlaybackPosition(resumeMs)}`
+    : "Play";
   el.detailsPlay.onclick = () => {
     el.detailsDialog.close();
     playItem(item);
   };
+  const resettingProgress = state.progressResettingKey === item.ratingKey;
+  el.detailsStartOver.hidden = !itemIsPlayable(item) || !resumeMs;
+  el.detailsStartOver.disabled = resettingProgress;
+  el.detailsStartOver.textContent = resettingProgress ? "Starting..." : "Start over";
+  el.detailsStartOver.onclick = () => startItemOver(item);
   el.detailsOpen.hidden = !itemCanOpen(item);
   el.detailsOpen.onclick = async () => {
     el.detailsDialog.close();
@@ -1924,6 +1955,84 @@ function clearLocalProgress(item) {
   saveProgressStore(store);
 }
 
+async function resetPlaybackProgress(item) {
+  if (!item?.ratingKey) return;
+  const durationMs = Number(item.duration || item.media?.duration || 0);
+  await api("/api/playback-progress", {
+    method: "POST",
+    body: JSON.stringify({
+      ratingKey: item.ratingKey,
+      timeMs: 0,
+      durationMs,
+      state: "restarted",
+    }),
+  });
+  clearLocalProgress(item);
+  item.viewOffset = 0;
+  for (const candidate of state.currentItems) {
+    if (candidate.ratingKey === item.ratingKey) {
+      candidate.viewOffset = 0;
+      clearLocalProgress(candidate);
+    }
+  }
+  if (state.playerItem?.ratingKey === item.ratingKey) {
+    state.playerItem.viewOffset = 0;
+  }
+  state.lastProgressReportAt = 0;
+  state.lastReportedTimeMs = 0;
+}
+
+async function startItemOver(item) {
+  if (!item?.ratingKey || state.progressResettingKey) return;
+  state.progressResettingKey = item.ratingKey;
+  if (el.detailsDialog.open && state.detailsItem === item) {
+    openDetails(item);
+  }
+  try {
+    await resetPlaybackProgress(item);
+    if (el.detailsDialog.open) {
+      el.detailsDialog.close();
+    }
+    await playItem(item, { startFromBeginning: true });
+  } catch (error) {
+    setStatus(`Could not start ${displayTitle(item)} over: ${error.message}`, "error");
+  } finally {
+    state.progressResettingKey = null;
+    if (el.detailsDialog.open && state.detailsItem === item) {
+      openDetails(item);
+    }
+  }
+}
+
+function updatePlayerStartOverControl() {
+  const item = state.playerItem;
+  const hasPosition = Boolean(
+    item?.ratingKey && Math.max(resumeTimeMsFor(item), playbackTimeMs()) >= 10000,
+  );
+  const resetting = Boolean(item?.ratingKey && state.progressResettingKey === item.ratingKey);
+  el.playerStartOver.hidden = !hasPosition;
+  el.playerStartOver.disabled = resetting;
+  el.playerStartOver.textContent = resetting ? "Starting..." : "Start over";
+}
+
+async function restartCurrentPlayback() {
+  const item = state.playerItem;
+  if (!item?.ratingKey || state.progressResettingKey) return;
+  state.progressResettingKey = item.ratingKey;
+  updatePlayerStartOverControl();
+  try {
+    await resetPlaybackProgress(item);
+    el.player.currentTime = 0;
+    await el.player.play();
+    updatePlayerStartOverControl();
+  } catch (error) {
+    setStatus(`Could not start ${displayTitle(item)} over: ${error.message}`, "error");
+  } finally {
+    state.progressResettingKey = null;
+    updatePlayerStartOverControl();
+  }
+}
+
 function playbackDurationMs(item = state.playerItem) {
   if (Number.isFinite(el.player.duration) && el.player.duration > 0) {
     return Math.floor(el.player.duration * 1000);
@@ -1939,19 +2048,13 @@ function playbackTimeMs() {
 }
 
 function resumeTimeFor(item) {
-  const durationMs = item?.duration || item?.media?.duration || 0;
-  const plexOffset = Number(item?.viewOffset || 0);
-  const local = localProgressFor(item);
-  const localOffset = Number(local?.timeMs || 0);
-  const offset = Math.max(plexOffset, localOffset);
-  if (offset < 10000) return 0;
-  if (durationMs && durationMs - offset < 30000) return 0;
-  return offset / 1000;
+  return resumeTimeMsFor(item) / 1000;
 }
 
 async function reportPlaybackProgress(stateName = "stopped", { force = false, keepalive = false } = {}) {
   const item = state.playerItem;
   if (!item?.ratingKey) return;
+  if (state.progressResettingKey === item.ratingKey) return;
   const timeMs = stateName === "ended" ? playbackDurationMs(item) : playbackTimeMs();
   const durationMs = playbackDurationMs(item);
   if (!force && Math.abs(timeMs - state.lastReportedTimeMs) < 5000) {
@@ -2936,7 +3039,7 @@ function scheduleAutoplayNext() {
   }, 1000);
 }
 
-async function playItem(item) {
+async function playItem(item, { startFromBeginning = false } = {}) {
   cancelAutoplayCountdown();
   const preparationId = ++state.playerPreparationId;
   state.playerItem = item;
@@ -2968,7 +3071,8 @@ async function playItem(item) {
   state.lastProgressReportAt = 0;
   state.lastReportedTimeMs = 0;
   el.playerTitle.textContent = displayTitle(item);
-  const resumeTime = resumeTimeFor(item);
+  const resumeTime = startFromBeginning ? 0 : resumeTimeFor(item);
+  updatePlayerStartOverControl();
   if (item.devicePlayback?.ready) {
     state.usingDevicePlayback = true;
     state.usingSavedPlayback = false;
@@ -3343,6 +3447,9 @@ el.playerNextEpisode.addEventListener("click", () => {
   });
 });
 el.playerUpNextCancel.addEventListener("click", cancelAutoplayCountdown);
+el.playerStartOver.addEventListener("click", () => {
+  restartCurrentPlayback();
+});
 el.playerClose.addEventListener("click", () => el.playerDialog.close());
 el.playerDialog.addEventListener("close", async () => {
   state.playerPreparationId += 1;
@@ -3366,6 +3473,7 @@ el.playerDialog.addEventListener("close", async () => {
   el.playerDeviceSave.hidden = true;
   el.playerDeviceDelete.hidden = true;
   el.playerDownloadOriginal.hidden = true;
+  el.playerStartOver.hidden = true;
   el.autoplayNextLabel.hidden = true;
   el.playerNextEpisode.hidden = true;
   state.usingSavedPlayback = false;
@@ -3425,6 +3533,7 @@ el.player.addEventListener("timeupdate", () => {
   const item = state.playerItem;
   if (!item?.ratingKey) return;
   rememberLocalProgress(item, playbackTimeMs(), playbackDurationMs(item));
+  updatePlayerStartOverControl();
 });
 el.player.addEventListener("ended", () => {
   stopProgressReporting();

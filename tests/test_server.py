@@ -379,7 +379,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.22.2", responses[0][1]["version"])
+        self.assertEqual("0.23.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
@@ -394,7 +394,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.22.2", responses[0][1]["version"])
+        self.assertEqual("0.23.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
 
@@ -957,6 +957,100 @@ class LibraryViewTests(unittest.TestCase):
         for _, params in plex.xml_calls[1:]:
             self.assertEqual("11", params["genre"])
             self.assertEqual("1", params["unwatched"])
+
+
+class PlaybackProgressTests(unittest.TestCase):
+    def test_restart_records_override_without_changing_watched_state(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "42",
+                "timeMs": 0,
+                "durationMs": 600000,
+                "state": "restarted",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(
+            server, "record_playback_restart"
+        ) as record_restart:
+            handler.api_playback_progress("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertTrue(responses[0][1]["restarted"])
+        self.assertTrue(responses[0][1]["progressSaved"])
+        self.assertFalse(responses[0][1]["watched"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/:/progress", path)
+        self.assertEqual(0, params["time"])
+        self.assertEqual("PUT", kwargs["method"])
+        record_restart.assert_called_once_with("42", 0)
+
+    def test_short_playback_does_not_overwrite_existing_plex_progress(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "42",
+                "timeMs": 30000,
+                "durationMs": 600000,
+                "state": "stopped",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_playback_progress("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertFalse(responses[0][1]["progressSaved"])
+        self.assertFalse(responses[0][1]["restarted"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_rejects_an_unknown_playback_state(self):
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "42",
+                "timeMs": 0,
+                "durationMs": 600000,
+                "state": "rewind-everything",
+            }
+        )
+        handler.api_playback_progress("POST")
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_playback_state", responses[0][1]["error"])
+
+
+class PlaybackRestartOverrideTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.restart_file_patch = mock.patch.object(
+            server,
+            "PLAYBACK_RESTARTS_FILE",
+            Path(self.temporary_directory.name) / "playback-restarts.json",
+        )
+        self.restart_file_patch.start()
+        server.PLAYBACK_RESTARTS_CACHE = None
+
+    def tearDown(self):
+        server.PLAYBACK_RESTARTS_CACHE = None
+        self.restart_file_patch.stop()
+        self.temporary_directory.cleanup()
+
+    def test_restart_override_hides_unchanged_plex_position(self):
+        server.record_playback_restart("42", 180000)
+
+        self.assertEqual(0, server.effective_view_offset("42", 180000))
+        self.assertEqual(0, server.effective_view_offset("42", 205000))
+
+    def test_new_plex_position_releases_restart_override(self):
+        server.record_playback_restart("42", 180000)
+
+        self.assertEqual(240000, server.effective_view_offset("42", 240000))
+        self.assertEqual(240000, server.effective_view_offset("42", 240000))
+
+    def test_restart_override_survives_process_cache_reload(self):
+        server.record_playback_restart("42", 180000)
+        server.PLAYBACK_RESTARTS_CACHE = None
+
+        self.assertEqual(0, server.effective_view_offset("42", 180000))
 
 
 class WatchStateTests(unittest.TestCase):

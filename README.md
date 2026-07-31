@@ -37,6 +37,25 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.23.0
+
+**Added**
+
+- Added explicit `Resume <time>` and `Start over` actions to movie and episode details.
+- Added an in-player Start over action that returns to the beginning without closing or rebuilding the player.
+- Added a synchronized restart command that clears the shared app and browser resume position without changing watched status.
+
+**Improved**
+
+- Library cards now say Resume when a usable playback position exists and Play when the item will begin at the start.
+- Active replay progress remains visible even when Plex still retains the item's watched flag.
+
+**Fixed**
+
+- Fixed watched badges hiding a newer replay position and making resumable titles look completed.
+- Fixed starting over for less than a minute and reopening the title returning to the previous, older resume point.
+- Fixed Plex servers that retain a stale raw offset after accepting a restart by persisting the restart state until genuinely new playback progress is saved.
+
 ### 0.22.2
 
 **Improved**

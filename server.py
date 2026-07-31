@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.22.2"
+APP_VERSION = "0.23.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -200,6 +200,10 @@ STATIC_CACHE: Dict[Path, Tuple[int, bytes]] = {}
 
 
 MY_LIST_FILE = Settings.data_dir / "my-list.json"
+PLAYBACK_RESTARTS_FILE = Settings.data_dir / "playback-restarts.json"
+PLAYBACK_RESTARTS_MAX_ITEMS = 1000
+PLAYBACK_RESTARTS_LOCK = threading.Lock()
+PLAYBACK_RESTARTS_CACHE: Optional[Dict[str, Dict[str, int]]] = None
 MEDIA_DELETE_LOG_FILE = Settings.data_dir / "media-delete-log.jsonl"
 MEDIA_DELETE_LOCK = threading.Lock()
 VIDEO_EXTENSIONS = {
@@ -932,6 +936,110 @@ def update_plex_progress(rating_key: str, time_ms: int) -> None:
         method="PUT",
         timeout=Settings.request_timeout,
     ).close()
+
+
+def reset_plex_progress(rating_key: str) -> None:
+    PLEX.open(
+        "/:/progress",
+        params={
+            "key": rating_key,
+            "identifier": "com.plexapp.plugins.library",
+            "time": 0,
+            "state": "stopped",
+        },
+        method="PUT",
+        timeout=Settings.request_timeout,
+    ).close()
+
+
+def _read_playback_restarts() -> Dict[str, Dict[str, int]]:
+    try:
+        payload = json.loads(PLAYBACK_RESTARTS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    values = payload.get("items", {}) if isinstance(payload, dict) else {}
+    if not isinstance(values, dict):
+        return {}
+    entries: Dict[str, Dict[str, int]] = {}
+    for raw_key, raw_entry in values.items():
+        rating_key = str(raw_key).strip()
+        if not re.fullmatch(r"\d+", rating_key) or not isinstance(raw_entry, dict):
+            continue
+        plex_offset = max(0, to_int(str(raw_entry.get("plexOffset") or "0")) or 0)
+        restarted_at = max(0, to_int(str(raw_entry.get("restartedAt") or "0")) or 0)
+        entries[rating_key] = {
+            "plexOffset": plex_offset,
+            "restartedAt": restarted_at,
+        }
+    return dict(
+        sorted(
+            entries.items(),
+            key=lambda item: item[1]["restartedAt"],
+            reverse=True,
+        )[:PLAYBACK_RESTARTS_MAX_ITEMS]
+    )
+
+
+def _playback_restarts_locked() -> Dict[str, Dict[str, int]]:
+    global PLAYBACK_RESTARTS_CACHE
+    if PLAYBACK_RESTARTS_CACHE is None:
+        PLAYBACK_RESTARTS_CACHE = _read_playback_restarts()
+    return PLAYBACK_RESTARTS_CACHE
+
+
+def _write_playback_restarts_locked(entries: Dict[str, Dict[str, int]]) -> None:
+    PLAYBACK_RESTARTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = PLAYBACK_RESTARTS_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {"items": entries, "updatedAt": int(time.time())},
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary, PLAYBACK_RESTARTS_FILE)
+
+
+def record_playback_restart(rating_key: str, plex_offset: int) -> None:
+    with PLAYBACK_RESTARTS_LOCK:
+        entries = _playback_restarts_locked()
+        entries[rating_key] = {
+            "plexOffset": max(0, plex_offset),
+            "restartedAt": int(time.time()),
+        }
+        ordered = dict(
+            sorted(
+                entries.items(),
+                key=lambda item: item[1]["restartedAt"],
+                reverse=True,
+            )[:PLAYBACK_RESTARTS_MAX_ITEMS]
+        )
+        entries.clear()
+        entries.update(ordered)
+        _write_playback_restarts_locked(entries)
+
+
+def clear_playback_restart(rating_key: str) -> None:
+    with PLAYBACK_RESTARTS_LOCK:
+        entries = _playback_restarts_locked()
+        if entries.pop(rating_key, None) is not None:
+            _write_playback_restarts_locked(entries)
+
+
+def effective_view_offset(rating_key: Optional[str], plex_offset: int) -> int:
+    if not rating_key:
+        return max(0, plex_offset)
+    with PLAYBACK_RESTARTS_LOCK:
+        entries = _playback_restarts_locked()
+        entry = entries.get(rating_key)
+        if entry is None:
+            return max(0, plex_offset)
+        baseline = entry["plexOffset"]
+        if plex_offset >= 10000 and abs(plex_offset - baseline) > 30000:
+            entries.pop(rating_key, None)
+            _write_playback_restarts_locked(entries)
+            return plex_offset
+        return 0
 
 
 def mark_plex_watched(rating_key: str) -> None:
@@ -1941,6 +2049,10 @@ def item_from_xml(
     item_type = elem.get("type") or elem.tag.lower()
     guids, external_ids = external_ids_from_xml(elem) if include_guids else ([], {})
     playback = playback_info(part_key, media, elem.get("ratingKey"))
+    view_offset = effective_view_offset(
+        elem.get("ratingKey"),
+        to_int(elem.get("viewOffset")) or 0,
+    )
     item = {
         "ratingKey": elem.get("ratingKey"),
         "key": elem.get("key"),
@@ -1956,7 +2068,7 @@ def item_from_xml(
         "audienceRating": to_float(elem.get("audienceRating")),
         "duration": to_int(elem.get("duration")),
         "durationText": duration_text(to_int(elem.get("duration"))),
-        "viewOffset": to_int(elem.get("viewOffset")) or 0,
+        "viewOffset": view_offset,
         "addedAt": to_int(elem.get("addedAt")),
         "addedDate": unix_date(elem.get("addedAt")),
         "updatedAt": to_int(elem.get("updatedAt")),
@@ -5105,22 +5217,40 @@ class AppHandler(BaseHTTPRequestHandler):
         if not rating_key:
             self.send_json({"error": "missing_rating_key"}, status=400)
             return
-        if metadata_item_element(rating_key) is None:
+        if state not in {"playing", "paused", "stopped", "ended", "restarted"}:
+            self.send_json({"error": "invalid_playback_state"}, status=400)
+            return
+        item_elem = metadata_item_element(rating_key)
+        if item_elem is None:
             self.send_json({"error": "not_found"}, status=404)
             return
 
-        watched = state == "ended" or watched_threshold_reached(time_ms, duration_ms)
+        restarted = state == "restarted"
+        watched = not restarted and (state == "ended" or watched_threshold_reached(time_ms, duration_ms))
         progress_saved = False
-        if watched:
+        if restarted:
+            reset_plex_progress(rating_key)
+            record_playback_restart(
+                rating_key,
+                to_int(item_elem.get("viewOffset")) or 0,
+            )
+            API_CACHE.clear()
+            progress_saved = True
+        elif watched:
             mark_plex_watched(rating_key)
+            clear_playback_restart(rating_key)
+            API_CACHE.clear()
         elif time_ms >= 60000:
             update_plex_progress(rating_key, time_ms)
+            clear_playback_restart(rating_key)
+            API_CACHE.clear()
             progress_saved = True
         self.send_json(
             {
                 "ok": True,
                 "watched": watched,
                 "progressSaved": progress_saved,
+                "restarted": restarted,
                 "timeMs": time_ms,
                 "durationMs": duration_ms,
                 "state": state,
