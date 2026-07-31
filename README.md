@@ -14,6 +14,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Plex Fix Match and metadata refresh for movies and TV shows, with title/year/language search, ranked poster-backed candidates, metadata replacement, poster-only artwork repair, and one-command refresh of the current match.
 - Permanent movie and episode deletion with an exact disk preview, typed confirmation, hardlink cleanup, and safe folder pruning.
 - Server-backed My List shared with the Android app, with per-library browsing and poster badges.
+- Ordered Play Queue shared with the Android app, with per-library browsing, one-command playback, badges, and automatic continuation.
 - Surprise Me selection for opening a random item from the active genre and Unwatched filters.
 - Persistent library, view, genre, and sort context across reloads and sign-in sessions.
 - Resume-progress indicators and manual watched/unwatched controls synchronized with Plex.
@@ -22,6 +23,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Movie playback in the browser through a Range-aware stream proxy.
 - TV show navigation from show to season to episode.
 - Previous/next episode navigation with optional persisted autoplay and a cancellable Up Next countdown.
+- Persistent 0.75x to 2x playback speed that survives source changes and browser restarts.
 - Persistent per-item subtitle selection from Plex subtitle streams and sidecar subtitle files, including an explicit remembered Off choice.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
@@ -30,12 +32,34 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Poster/artwork proxy so the browser only needs this app URL.
 - Compressed API responses, right-sized artwork, and coalesced Plex reads for fast browsing over a tailnet.
 - Cancellable library/search requests, stable loading placeholders, incremental card rendering, and bounded visible-title metadata warming for responsive interaction.
+- Batched metadata warming that prepares the first visible titles through one Plex lookup instead of one round trip per card.
 - Browser-storage cleanup runs only during idle time and never blocks a video from starting.
 - No runtime dependencies beyond Python 3 standard library.
 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.24.0
+
+**Added**
+
+- Added a persistent ordered Play Queue synchronized between the web and Android apps.
+- Added a Queue library view, queue badges, and Add to Queue or Remove from Queue actions in movie and episode details.
+- Added Play Queue plus queue-aware Auto next, including the existing cancellable five-second Up Next countdown.
+- Added persistent playback-speed selection from 0.75x through 2x.
+
+**Improved**
+
+- Visible-title warming now fetches up to six detailed items in one Plex request and shares that work with immediate Details and Play taps.
+- The browser asks for video data eagerly, retains playback speed while switching between live, saved, and device sources, and keeps queue playback prepared ahead of interaction.
+- Play Queue state is written atomically outside the deployed source tree, preserves insertion order, and ignores duplicate additions.
+
+**Fixed**
+
+- Permanently deleted movies and episodes are now removed from Play Queue as well as My List and resume state.
+- Fixed repeated Add to Queue actions moving or duplicating an existing item.
+- Fixed playback speed returning to 1x after changing playback source or reopening the app.
 
 ### 0.23.0
 
@@ -594,7 +618,7 @@ Required settings:
 
 Optional app settings:
 
-- `APP_DATA_DIR`: persistent directory for server-owned state such as My List; defaults outside the source directory.
+- `APP_DATA_DIR`: persistent directory for server-owned state such as My List and Play Queue; defaults outside the source directory.
 
 Optional compatible-playback settings:
 

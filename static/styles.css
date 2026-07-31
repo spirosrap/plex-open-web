@@ -563,6 +563,22 @@ select:focus-visible {
   font-weight: 800;
 }
 
+.queue-badge {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  padding: 4px 7px;
+  border-radius: 4px;
+  background: var(--accent-2);
+  color: var(--on-accent);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.queue-badge.stacked {
+  top: 38px;
+}
+
 .resume-progress {
   position: absolute;
   right: 8px;
@@ -593,8 +609,12 @@ select:focus-visible {
   font-weight: 900;
 }
 
-.subtitle-badge.stacked {
+.subtitle-badge.stacked-1 {
   top: 38px;
+}
+
+.subtitle-badge.stacked-2 {
+  top: 68px;
 }
 
 .card-body {
@@ -1286,6 +1306,10 @@ select:focus-visible {
   background: var(--field);
   color: var(--text);
   padding: 0 8px;
+}
+
+.player-controls #playback-speed {
+  width: 82px;
 }
 
 .player-controls .secondary-button {

@@ -41,10 +41,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.23.0"
+APP_VERSION = "0.24.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
+PLAY_QUEUE_MAX_ITEMS = 100
+PLAY_QUEUE_LOCK = threading.Lock()
 STREAM_CHUNK_SIZE = 64 * 1024
 TRANSCODE_STARTUP_CHUNK_SIZE = 32 * 1024
 HLS_SEGMENT_PATTERN = re.compile(r"segment-\d{5}\.ts")
@@ -200,6 +202,7 @@ STATIC_CACHE: Dict[Path, Tuple[int, bytes]] = {}
 
 
 MY_LIST_FILE = Settings.data_dir / "my-list.json"
+PLAY_QUEUE_FILE = Settings.data_dir / "play-queue.json"
 PLAYBACK_RESTARTS_FILE = Settings.data_dir / "playback-restarts.json"
 PLAYBACK_RESTARTS_MAX_ITEMS = 1000
 PLAYBACK_RESTARTS_LOCK = threading.Lock()
@@ -2968,6 +2971,10 @@ def execute_media_delete(plan: Dict[str, Any]) -> Dict[str, Any]:
         update_my_list(plan["ratingKey"], False)
     except OSError:
         warnings.append("The item was deleted, but My List could not be updated.")
+    try:
+        update_play_queue(plan["ratingKey"], False)
+    except OSError:
+        warnings.append("The item was deleted, but Play Queue could not be updated.")
 
     plex_removed = False
     try:
@@ -3391,6 +3398,27 @@ def _read_my_list_keys() -> List[str]:
     return keys
 
 
+def _read_play_queue_keys() -> List[str]:
+    try:
+        payload = json.loads(PLAY_QUEUE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    values = payload.get("ratingKeys", []) if isinstance(payload, dict) else payload
+    if not isinstance(values, list):
+        return []
+    keys: List[str] = []
+    seen = set()
+    for value in values:
+        key = str(value).strip()
+        if not re.fullmatch(r"\d+", key) or key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+        if len(keys) >= PLAY_QUEUE_MAX_ITEMS:
+            break
+    return keys
+
+
 def my_list_keys() -> List[str]:
     with MY_LIST_LOCK:
         return _read_my_list_keys()
@@ -3412,15 +3440,44 @@ def update_my_list(rating_key: str, saved: bool) -> List[str]:
         return keys
 
 
-def metadata_items_for_rating_keys(rating_keys: List[str]) -> List[Dict[str, Any]]:
+def play_queue_keys() -> List[str]:
+    with PLAY_QUEUE_LOCK:
+        return _read_play_queue_keys()
+
+
+def update_play_queue(rating_key: str, queued: bool) -> List[str]:
+    with PLAY_QUEUE_LOCK:
+        keys = _read_play_queue_keys()
+        if queued and rating_key not in keys:
+            keys.append(rating_key)
+        elif not queued:
+            keys = [key for key in keys if key != rating_key]
+        keys = keys[:PLAY_QUEUE_MAX_ITEMS]
+        PLAY_QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = PLAY_QUEUE_FILE.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"ratingKeys": keys, "updatedAt": int(time.time())}, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, PLAY_QUEUE_FILE)
+        return keys
+
+
+def metadata_items_for_rating_keys(
+    rating_keys: List[str],
+    detailed: bool = False,
+) -> List[Dict[str, Any]]:
     found: Dict[str, Dict[str, Any]] = {}
     for start in range(0, len(rating_keys), 50):
         chunk = rating_keys[start : start + 50]
         if not chunk:
             continue
         joined = urllib.parse.quote(",".join(chunk), safe=",")
-        root = PLEX.xml(f"/library/metadata/{joined}", params={"includeGuids": "1"})
-        for item in items_from_container(root):
+        root = PLEX.xml(
+            f"/library/metadata/{joined}",
+            params={"includeGuids": "1", "includeCollections": "1"},
+        )
+        for item in items_from_container(root, detailed=detailed):
             rating_key = str(item.get("ratingKey") or "")
             if rating_key:
                 found[rating_key] = item
@@ -3463,6 +3520,19 @@ def my_list_items(section_key: str = "") -> Tuple[List[str], List[Dict[str, Any]
     return keys, items
 
 
+def play_queue_items(section_key: str = "") -> Tuple[List[str], List[Dict[str, Any]]]:
+    keys = play_queue_keys()
+    items = metadata_items_for_rating_keys(keys)
+    if section_key:
+        items = [item for item in items if str(item.get("librarySectionID") or "") == section_key]
+    my_list = set(my_list_keys())
+    for item in items:
+        rating_key = str(item.get("ratingKey") or "")
+        item["inMyList"] = rating_key in my_list
+        item["inPlayQueue"] = True
+    return keys, items
+
+
 def library_genres_for_section(section_key: str) -> List[Dict[str, Any]]:
     def load() -> List[Dict[str, Any]]:
         root = PLEX.xml(f"/library/sections/{urllib.parse.quote(section_key)}/genre")
@@ -3500,6 +3570,21 @@ def library_page_for_section(section_key: str, query: Dict[str, List[str]]) -> D
             "totalSize": total,
             "items": page,
         }
+    if view == "queue":
+        keys, items = play_queue_items(section_key)
+        total = len(items)
+        page = items[start : start + limit]
+        return {
+            "library": section_key,
+            "view": view,
+            "queueRatingKeys": keys,
+            "genre": None,
+            "start": start,
+            "limit": limit,
+            "size": len(page),
+            "totalSize": total,
+            "items": page,
+        }
 
     params: Dict[str, Any] = {
         "includeCollections": "1",
@@ -3523,7 +3608,7 @@ def library_page_for_section(section_key: str, query: Dict[str, List[str]]) -> D
     active_genre = genre if view != "collections" else ""
     if active_genre:
         params["genre"] = active_genre
-    if sort and view not in {"continue", "collections"}:
+    if sort and view not in {"continue", "collections", "queue"}:
         params["sort"] = sort
     cache_key = ":".join(
         ["library", str(id(PLEX)), section_key, view, sort, active_genre, str(start), str(limit)]
@@ -3763,6 +3848,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if path == "/api/my-list":
             self.api_my_list(method, query)
             return
+        if path == "/api/play-queue":
+            self.api_play_queue(method, query)
+            return
         if path == "/api/collection-membership":
             self.api_collection_membership(method, query)
             return
@@ -3827,6 +3915,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.api_children(rating_key)
         elif path == "/api/search":
             self.api_search(query)
+        elif path == "/api/metadata-batch":
+            self.api_metadata_batch(query)
         elif path == "/api/image":
             self.handle_image(method, query)
         elif path == "/api/stream":
@@ -3883,6 +3973,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 "server": cached_server_info(),
                 "libraries": libraries,
                 "ratingKeys": my_list_keys(),
+                "queueRatingKeys": play_queue_keys(),
                 "selectedLibraryKey": selected.get("key") if selected else None,
             }
         )
@@ -4202,6 +4293,83 @@ class AppHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def api_play_queue(self, method: str, query: Dict[str, List[str]]) -> None:
+        if method == "POST":
+            payload = self.read_json()
+            rating_key = str(payload.get("ratingKey") or "").strip()
+            queued = payload.get("queued")
+            if not re.fullmatch(r"\d+", rating_key):
+                self.send_json({"error": "invalid_rating_key"}, status=400)
+                return
+            if not isinstance(queued, bool):
+                self.send_json({"error": "invalid_queued_state"}, status=400)
+                return
+            existing_keys = play_queue_keys()
+            if queued and rating_key in existing_keys:
+                self.send_json(
+                    {
+                        "ok": True,
+                        "ratingKey": rating_key,
+                        "queued": True,
+                        "queueRatingKeys": existing_keys,
+                        "item": None,
+                    }
+                )
+                return
+            if queued and len(existing_keys) >= PLAY_QUEUE_MAX_ITEMS:
+                self.send_json(
+                    {"error": "play_queue_full", "message": "Play Queue is full."},
+                    status=409,
+                )
+                return
+            item = metadata_item_for_rating_key(rating_key) if queued else None
+            if queued and item is None:
+                self.send_json({"error": "metadata_not_found"}, status=404)
+                return
+            if queued and item.get("type") not in {"movie", "episode"}:
+                self.send_json({"error": "unsupported_media_type"}, status=400)
+                return
+            keys = update_play_queue(rating_key, queued)
+            if item is not None:
+                item["inMyList"] = rating_key in set(my_list_keys())
+                item["inPlayQueue"] = queued
+            self.send_json(
+                {
+                    "ok": True,
+                    "ratingKey": rating_key,
+                    "queued": queued,
+                    "queueRatingKeys": keys,
+                    "item": item,
+                }
+            )
+            return
+        if method not in {"GET", "HEAD"}:
+            self.send_json({"error": "method_not_allowed"}, status=405)
+            return
+        keys = play_queue_keys()
+        if one(query, "keysOnly", "").strip().lower() in {"1", "true", "yes", "on"}:
+            self.send_json({"queueRatingKeys": keys, "totalSize": len(keys)})
+            return
+        section_key = one(query, "sectionKey", "").strip()
+        if section_key and not re.fullmatch(r"\d+", section_key):
+            self.send_json({"error": "invalid_section"}, status=400)
+            return
+        start = max(0, to_int(one(query, "start", "0")) or 0)
+        limit = min(100, max(1, to_int(one(query, "limit", "48")) or 48))
+        keys, items = play_queue_items(section_key)
+        page = items[start : start + limit]
+        self.send_json(
+            {
+                "queueRatingKeys": keys,
+                "sectionKey": section_key or None,
+                "start": start,
+                "limit": limit,
+                "size": len(page),
+                "totalSize": len(items),
+                "items": page,
+            }
+        )
+
     def collection_membership(self, rating_key: str) -> Dict[str, Any]:
         metadata_root = PLEX.xml(
             f"/library/metadata/{urllib.parse.quote(rating_key)}",
@@ -4490,6 +4658,38 @@ class AppHandler(BaseHTTPRequestHandler):
             10.0,
             load,
         )
+        self.send_json(payload, cache_control=BROWSE_CACHE_CONTROL)
+
+    def api_metadata_batch(self, query: Dict[str, List[str]]) -> None:
+        raw_keys = one(query, "ratingKeys", "").strip()
+        rating_keys: List[str] = []
+        seen = set()
+        for value in raw_keys.split(","):
+            key = value.strip()
+            if not key:
+                continue
+            if not re.fullmatch(r"\d+", key):
+                self.send_json({"error": "invalid_rating_key"}, status=400)
+                return
+            if key not in seen:
+                seen.add(key)
+                rating_keys.append(key)
+        if not rating_keys or len(rating_keys) > 12:
+            self.send_json({"error": "invalid_rating_keys"}, status=400)
+            return
+
+        def load() -> Dict[str, Any]:
+            items = metadata_items_for_rating_keys(rating_keys, detailed=True)
+            my_list = set(my_list_keys())
+            queue = set(play_queue_keys())
+            for item in items:
+                rating_key = str(item.get("ratingKey") or "")
+                item["inMyList"] = rating_key in my_list
+                item["inPlayQueue"] = rating_key in queue
+            return {"ratingKeys": rating_keys, "items": items}
+
+        cache_key = f"metadata-batch:{id(PLEX)}:{','.join(rating_keys)}"
+        payload = API_CACHE.get_or_load(cache_key, 10.0, load)
         self.send_json(payload, cache_control=BROWSE_CACHE_CONTROL)
 
     def api_media_match(self, method: str, query: Dict[str, List[str]]) -> None:

@@ -375,13 +375,14 @@ class PerformancePathTests(unittest.TestCase):
         handler.is_authenticated = lambda: True
         with mock.patch.object(server, "PLEX", plex), mock.patch.object(
             server, "my_list_keys", return_value=["101"]
-        ):
+        ), mock.patch.object(server, "play_queue_keys", return_value=["202"]):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.23.0", responses[0][1]["version"])
+        self.assertEqual("0.24.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
+        self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
         self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
         self.assertEqual(["/library/sections", "/"], [call[0] for call in plex.xml_calls])
 
@@ -394,8 +395,30 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.23.0", responses[0][1]["version"])
+        self.assertEqual("0.24.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
+
+    def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(
+            server, "my_list_keys", return_value=["101"]
+        ), mock.patch.object(server, "play_queue_keys", return_value=["102"]):
+            handler.api_metadata_batch({"ratingKeys": ["101,102"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(["101", "102"], [item["ratingKey"] for item in responses[0][1]["items"]])
+        self.assertTrue(responses[0][1]["items"][0]["inMyList"])
+        self.assertTrue(responses[0][1]["items"][1]["inPlayQueue"])
+        self.assertEqual(1, len(plex.xml_calls))
+        self.assertEqual("/library/metadata/101,102", plex.xml_calls[0][0])
+
+    def test_metadata_batch_rejects_more_than_twelve_items(self):
+        handler, responses = handler_with_payload({})
+        handler.api_metadata_batch({"ratingKeys": [",".join(str(value) for value in range(13))]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_rating_keys", responses[0][1]["error"])
 
 
 class PlaybackCompatibilityTests(unittest.TestCase):
@@ -1383,10 +1406,17 @@ class MediaDeletionTests(unittest.TestCase):
             "MY_LIST_FILE",
             self.base / "data" / "my-list.json",
         )
+        self.queue_patch = mock.patch.object(
+            server,
+            "PLAY_QUEUE_FILE",
+            self.base / "data" / "play-queue.json",
+        )
         self.audit_patch.start()
         self.list_patch.start()
+        self.queue_patch.start()
 
     def tearDown(self):
+        self.queue_patch.stop()
         self.list_patch.stop()
         self.audit_patch.stop()
         self.settings_patch.stop()
@@ -1603,6 +1633,76 @@ class MyListTests(unittest.TestCase):
 
         self.assertEqual(400, responses[0][0])
         self.assertEqual("invalid_saved_state", responses[0][1]["error"])
+
+
+class PlayQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.queue_patch = mock.patch.object(server, "PLAY_QUEUE_FILE", root / "play-queue.json")
+        self.list_patch = mock.patch.object(server, "MY_LIST_FILE", root / "my-list.json")
+        self.queue_patch.start()
+        self.list_patch.start()
+
+    def tearDown(self):
+        self.list_patch.stop()
+        self.queue_patch.stop()
+        self.temp_dir.cleanup()
+
+    def test_add_duplicate_and_remove_preserve_queue_order(self):
+        plex = FakePlex()
+        with mock.patch.object(server, "PLEX", plex):
+            for rating_key in ("101", "102", "101"):
+                handler, responses = handler_with_payload({"ratingKey": rating_key, "queued": True})
+                handler.api_play_queue("POST", {})
+                self.assertEqual(200, responses[0][0])
+
+            handler, responses = handler_with_payload({})
+            handler.api_play_queue("GET", {"keysOnly": ["1"]})
+            self.assertEqual(["101", "102"], responses[0][1]["queueRatingKeys"])
+
+            handler, responses = handler_with_payload({"ratingKey": "101", "queued": False})
+            handler.api_play_queue("POST", {})
+            self.assertEqual(["102"], responses[0][1]["queueRatingKeys"])
+
+        metadata_calls = [call for call in plex.xml_calls if call[0].startswith("/library/metadata/")]
+        self.assertEqual(2, len(metadata_calls))
+
+        self.assertEqual(["102"], server.play_queue_keys())
+
+    def test_queue_library_view_filters_items_without_changing_global_order(self):
+        server.update_play_queue("101", True)
+        server.update_play_queue("202", True)
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library(
+                "/api/library/7",
+                {"view": ["queue"], "start": ["0"], "limit": ["10"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(["101", "202"], responses[0][1]["queueRatingKeys"])
+        self.assertEqual(["101"], [item["ratingKey"] for item in responses[0][1]["items"]])
+        self.assertTrue(responses[0][1]["items"][0]["inPlayQueue"])
+
+    def test_queue_rejects_non_boolean_state(self):
+        handler, responses = handler_with_payload({"ratingKey": "101", "queued": "true"})
+        handler.api_play_queue("POST", {})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_queued_state", responses[0][1]["error"])
+
+    def test_queue_rejects_new_items_when_full_without_calling_plex(self):
+        server.PLAY_QUEUE_FILE.write_text(json.dumps({"ratingKeys": [str(value) for value in range(100)]}))
+        plex = FakePlex()
+        handler, responses = handler_with_payload({"ratingKey": "999", "queued": True})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_play_queue("POST", {})
+
+        self.assertEqual(409, responses[0][0])
+        self.assertEqual("play_queue_full", responses[0][1]["error"])
+        self.assertEqual([], plex.xml_calls)
 
 
 if __name__ == "__main__":

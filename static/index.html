@@ -86,6 +86,7 @@
             <button class="view-button" data-view="unwatched">Unwatched</button>
             <button class="view-button" data-view="collections">Collections</button>
             <button class="view-button" data-view="mylist">My List</button>
+            <button class="view-button" data-view="queue">Queue</button>
           </div>
           <div class="toolbar-actions">
             <select id="genre-filter" aria-label="Genre">
@@ -130,6 +131,7 @@
             <button id="details-subtitles" class="secondary-button">Subtitles</button>
             <button id="details-watch-state" class="secondary-button">Mark watched</button>
             <button id="details-my-list" class="secondary-button">Add to My List</button>
+            <button id="details-play-queue" class="secondary-button">Add to Queue</button>
             <button id="details-collections" class="secondary-button" hidden>Collections</button>
             <button id="details-fix-match" class="secondary-button" hidden>Fix match</button>
             <button id="details-refresh-metadata" class="secondary-button" hidden>Refresh metadata</button>
@@ -230,6 +232,14 @@
         <strong id="player-title"></strong>
         <div class="player-controls">
           <span id="playback-mode" class="playback-mode"></span>
+          <label for="playback-speed">Speed</label>
+          <select id="playback-speed" aria-label="Playback speed">
+            <option value="0.75">0.75x</option>
+            <option value="1">1x</option>
+            <option value="1.25">1.25x</option>
+            <option value="1.5">1.5x</option>
+            <option value="2">2x</option>
+          </select>
           <label id="subtitle-select-label" for="subtitle-select">Subtitles</label>
           <select id="subtitle-select"></select>
           <button id="player-start-over" class="secondary-button" type="button" hidden>Start over</button>
@@ -247,7 +257,7 @@
           <button id="player-close" class="icon-button" aria-label="Close">x</button>
         </div>
       </header>
-      <video id="player" controls playsinline></video>
+      <video id="player" controls playsinline preload="auto"></video>
       <div id="player-error" class="player-error" role="alert" hidden></div>
       <div id="player-up-next" class="up-next-banner" hidden>
         <strong id="player-up-next-text"></strong>

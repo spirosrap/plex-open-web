@@ -7,6 +7,8 @@ const state = {
   genresLoading: false,
   myListKeys: new Set(),
   myListUpdatingKey: null,
+  playQueueKeys: new Set(),
+  playQueueUpdatingKey: null,
   selectedView: "all",
   sort: "addedAt:desc",
   stack: [],
@@ -50,6 +52,7 @@ const state = {
   autoplayNext: true,
   autoplayTimer: null,
   autoplaySeconds: 0,
+  playbackRate: 1,
   subtitleTrackElements: [],
   savePollTimer: null,
   progressTimer: null,
@@ -74,12 +77,13 @@ const SUBTITLE_PREFERENCES_MAX_ITEMS = 500;
 const THEME_KEY = "plex-open-web-theme-v1";
 const BROWSE_KEY = "plex-open-web-browse-v1";
 const AUTOPLAY_NEXT_KEY = "plex-open-web-autoplay-next-v1";
+const PLAYBACK_RATE_KEY = "plex-open-web-playback-rate-v1";
 const THEME_VALUES = new Set(["system", "light", "dark"]);
-const VIEW_VALUES = new Set(["continue", "recent", "all", "unwatched", "collections", "mylist"]);
+const VIEW_VALUES = new Set(["continue", "recent", "all", "unwatched", "collections", "mylist", "queue"]);
 const SORT_VALUES = new Set(["addedAt:desc", "titleSort", "year:desc", "lastViewedAt:desc"]);
+const PLAYBACK_RATES = new Set([0.75, 1, 1.25, 1.5, 2]);
 const PROGRESS_REPORT_INTERVAL_MS = 15000;
 const METADATA_PREFETCH_LIMIT = 6;
-const METADATA_PREFETCH_CONCURRENCY = 2;
 
 const savedBrowse = readBrowsePreferences();
 state.preferredLibraryKey = typeof savedBrowse.libraryKey === "string" ? savedBrowse.libraryKey : "";
@@ -90,6 +94,12 @@ try {
   state.autoplayNext = localStorage.getItem(AUTOPLAY_NEXT_KEY) !== "false";
 } catch {
   state.autoplayNext = true;
+}
+try {
+  const savedRate = Number(localStorage.getItem(PLAYBACK_RATE_KEY));
+  state.playbackRate = PLAYBACK_RATES.has(savedRate) ? savedRate : 1;
+} catch {
+  state.playbackRate = 1;
 }
 
 const el = {
@@ -131,6 +141,7 @@ const el = {
   detailsSubtitles: document.querySelector("#details-subtitles"),
   detailsWatchState: document.querySelector("#details-watch-state"),
   detailsMyList: document.querySelector("#details-my-list"),
+  detailsPlayQueue: document.querySelector("#details-play-queue"),
   detailsCollections: document.querySelector("#details-collections"),
   detailsFixMatch: document.querySelector("#details-fix-match"),
   detailsRefreshMetadata: document.querySelector("#details-refresh-metadata"),
@@ -176,6 +187,7 @@ const el = {
   playerDialog: document.querySelector("#player-dialog"),
   playerTitle: document.querySelector("#player-title"),
   playbackMode: document.querySelector("#playback-mode"),
+  playbackSpeed: document.querySelector("#playback-speed"),
   playerError: document.querySelector("#player-error"),
   playerClose: document.querySelector("#player-close"),
   playerStartOver: document.querySelector("#player-start-over"),
@@ -295,7 +307,7 @@ function selectedGenreKey() {
 
 function activeGenreKey() {
   const selected = selectedGenreKey();
-  return ["collections", "mylist"].includes(state.selectedView) || !state.genres.some((genre) => genre.key === selected)
+  return ["collections", "mylist", "queue"].includes(state.selectedView) || !state.genres.some((genre) => genre.key === selected)
     ? ""
     : selected;
 }
@@ -310,17 +322,18 @@ function renderGenreFilter() {
   el.genreFilter.disabled = !state.selectedLibrary
     || state.genresLoading
     || !state.genres.length
-    || ["collections", "mylist"].includes(state.selectedView);
+    || ["collections", "mylist", "queue"].includes(state.selectedView);
 }
 
 function syncBrowseControls() {
   el.viewButtons.forEach((button) => button.classList.toggle("active", button.dataset.view === state.selectedView));
   el.sort.value = state.sort;
-  el.sort.disabled = ["continue", "collections", "mylist"].includes(state.selectedView);
+  el.sort.disabled = ["continue", "collections", "mylist", "queue"].includes(state.selectedView);
   renderGenreFilter();
 }
 
 applyTheme(document.documentElement.dataset.theme, { persist: false });
+el.playbackSpeed.value = String(state.playbackRate);
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   if (document.documentElement.dataset.theme === "system") {
     applyTheme("system", { persist: false });
@@ -454,8 +467,16 @@ function updateScanButton() {
 
 function updateSurpriseButton() {
   if (!el.surpriseMe) return;
-  el.surpriseMe.disabled = !state.selectedLibrary || state.surpriseInProgress || state.selectedView === "mylist";
-  el.surpriseMe.textContent = state.surpriseInProgress ? "Choosing..." : "Surprise me";
+  const queueView = state.selectedView === "queue";
+  el.surpriseMe.disabled = !state.selectedLibrary
+    || state.surpriseInProgress
+    || state.selectedView === "mylist"
+    || (queueView && !state.currentItems.length);
+  el.surpriseMe.textContent = queueView
+    ? "Play queue"
+    : state.surpriseInProgress
+      ? "Choosing..."
+      : "Surprise me";
 }
 
 function renderBreadcrumbs() {
@@ -488,6 +509,8 @@ function renderBreadcrumbs() {
 
 function createMediaCard(item, index) {
   const inMyList = Boolean(item.ratingKey && state.myListKeys.has(String(item.ratingKey)));
+  const inPlayQueue = Boolean(item.ratingKey && state.playQueueKeys.has(String(item.ratingKey)));
+  const subtitleStack = Number(inMyList) + Number(inPlayQueue);
   const resumeMs = resumeTimeMsFor(item);
   const card = document.createElement("article");
   card.className = "media-card";
@@ -498,7 +521,8 @@ function createMediaCard(item, index) {
       ${item.type === "collection" ? '<span class="collection-badge">Collection</span>' : ""}
       ${item.viewCount && !resumeMs ? '<span class="watched">Watched</span>' : ""}
       ${inMyList ? '<span class="my-list-badge">My List</span>' : ""}
-      ${supportedSubtitles(item).length ? `<span class="subtitle-badge${inMyList ? " stacked" : ""}">CC</span>` : ""}
+      ${inPlayQueue ? `<span class="queue-badge${inMyList ? " stacked" : ""}">Queue</span>` : ""}
+      ${supportedSubtitles(item).length ? `<span class="subtitle-badge${subtitleStack ? ` stacked-${subtitleStack}` : ""}">CC</span>` : ""}
       ${progressMarkup(item)}
     </button>
     <div class="card-body">
@@ -544,17 +568,15 @@ function renderItems(items, { append = false } = {}) {
     const emptyContinueView = state.stack.length === 0 && state.selectedView === "continue";
     const emptyCollectionsView = state.stack.length === 0 && state.selectedView === "collections";
     const emptyMyListView = state.stack.length === 0 && state.selectedView === "mylist";
-    setStatus(
-      emptyContinueView
-        ? "Nothing to continue."
-        : emptyCollectionsView
-          ? "No collections found."
-          : emptyMyListView
-            ? "My List is empty."
-            : "No items found.",
-      "muted",
-    );
+    const emptyQueueView = state.stack.length === 0 && state.selectedView === "queue";
+    let emptyMessage = "No items found.";
+    if (emptyContinueView) emptyMessage = "Nothing to continue.";
+    if (emptyCollectionsView) emptyMessage = "No collections found.";
+    if (emptyMyListView) emptyMessage = "My List is empty.";
+    if (emptyQueueView) emptyMessage = "Play Queue is empty.";
+    setStatus(emptyMessage, "muted");
     updateLoadMore();
+    updateSurpriseButton();
     return;
   }
   setStatus(statusTextForItems(items.length), "muted");
@@ -564,6 +586,7 @@ function renderItems(items, { append = false } = {}) {
   }
   el.grid.append(fragment);
   updateLoadMore();
+  updateSurpriseButton();
   scheduleVisibleMetadataPrefetch(items);
   scheduleDeviceCachePrune();
 }
@@ -577,18 +600,27 @@ function scheduleVisibleMetadataPrefetch(items) {
 
   const warm = async () => {
     if (generation !== state.metadataPrefetchGeneration) return;
-    let index = 0;
-    const worker = async () => {
-      while (generation === state.metadataPrefetchGeneration && index < candidates.length) {
-        const item = candidates[index];
-        index += 1;
-        await hydrateItem(item);
+    const batchCandidates = candidates.filter(
+      (item) => !state.metadataRequests.has(String(item.ratingKey)),
+    );
+    if (batchCandidates.length) {
+      const keys = batchCandidates.map((item) => String(item.ratingKey));
+      const batchRequest = api(`/api/metadata-batch?${new URLSearchParams({ ratingKeys: keys.join(",") })}`)
+        .then((data) => new Map((data.items || []).map((item) => [String(item.ratingKey), item])));
+      for (const item of batchCandidates) {
+        const key = String(item.ratingKey);
+        let trackedRequest;
+        trackedRequest = batchRequest
+          .then((itemsByKey) => ({ item: itemsByKey.get(key) || null }))
+          .finally(() => {
+            if (state.metadataRequests.get(key) === trackedRequest) {
+              state.metadataRequests.delete(key);
+            }
+          });
+        state.metadataRequests.set(key, trackedRequest);
       }
-    };
-    await Promise.all(Array.from(
-      { length: Math.min(METADATA_PREFETCH_CONCURRENCY, candidates.length) },
-      worker,
-    ));
+    }
+    await Promise.all(candidates.map((item) => hydrateItem(item)));
   };
 
   if ("requestIdleCallback" in window) {
@@ -601,12 +633,12 @@ function scheduleVisibleMetadataPrefetch(items) {
 function statusTextForItems(count) {
   const collectionsView = state.stack.length === 0 && state.selectedView === "collections";
   const myListView = state.stack.length === 0 && state.selectedView === "mylist";
+  const queueView = state.stack.length === 0 && state.selectedView === "queue";
   const nounCount = state.libraryTotal && state.libraryTotal > count ? state.libraryTotal : count;
-  const noun = collectionsView
-    ? nounCount === 1 ? "collection" : "collections"
-    : myListView
-      ? nounCount === 1 ? "saved item" : "saved items"
-      : nounCount === 1 ? "item" : "items";
+  let noun = nounCount === 1 ? "item" : "items";
+  if (collectionsView) noun = nounCount === 1 ? "collection" : "collections";
+  if (myListView) noun = nounCount === 1 ? "saved item" : "saved items";
+  if (queueView) noun = nounCount === 1 ? "queued item" : "queued items";
   if (state.libraryTotal && state.libraryTotal > count) {
     return `${count} of ${state.libraryTotal} ${noun}`;
   }
@@ -629,13 +661,13 @@ function updateLoadMore() {
 
 function browseRequestParams(libraryKey, { start = 0, includeBrowse = false } = {}) {
   const savedGenre = state.genreKeysByLibrary[libraryKey] || "";
-  const genre = ["collections", "mylist"].includes(state.selectedView) ? "" : savedGenre;
+  const genre = ["collections", "mylist", "queue"].includes(state.selectedView) ? "" : savedGenre;
   const params = new URLSearchParams({
     view: state.selectedView,
     sort: state.sort,
     genre,
     start: String(start),
-    limit: String(state.pageSize),
+    limit: String(state.selectedView === "queue" ? 100 : state.pageSize),
   });
   if (includeBrowse) {
     params.set("includeBrowse", "1");
@@ -659,6 +691,9 @@ function applyLibraryPage(data, { append = false } = {}) {
   if (state.selectedView === "mylist" && data.ratingKeys) {
     state.myListKeys = new Set(data.ratingKeys.map(String));
   }
+  if (state.selectedView === "queue" && data.queueRatingKeys) {
+    state.playQueueKeys = new Set(data.queueRatingKeys.map(String));
+  }
   const incoming = data.items || [];
   state.libraryStart = Number(data.start || 0);
   state.libraryTotal = data.totalSize || data.size || 0;
@@ -677,6 +712,7 @@ async function loadLibraries() {
   showApp();
   el.serverName.textContent = data.server?.friendlyName || "Plex server";
   state.myListKeys = new Set((data.ratingKeys || []).map(String));
+  state.playQueueKeys = new Set((data.queueRatingKeys || []).map(String));
   state.libraries = data.libraries || [];
   const selectedKey = String(data.selectedLibraryKey || state.preferredLibraryKey || "");
   state.selectedLibrary = state.libraries.find((library) => String(library.key) === selectedKey)
@@ -802,7 +838,7 @@ async function loadLibrary({ append = false } = {}) {
     sort: state.sort,
     genre: activeGenreKey(),
     start: String(start),
-    limit: String(state.pageSize),
+    limit: String(state.selectedView === "queue" ? 100 : state.pageSize),
   });
   try {
     const data = await api(`/api/library/${encodeURIComponent(state.selectedLibrary.key)}?${params}`, {
@@ -859,6 +895,11 @@ async function scanSelectedLibrary() {
 
 async function surpriseMe() {
   if (!state.selectedLibrary || state.surpriseInProgress) return;
+  if (state.selectedView === "queue") {
+    const first = state.currentItems.find(itemIsPlayable);
+    if (first) await playItem(first);
+    return;
+  }
   state.surpriseInProgress = true;
   updateSurpriseButton();
   setStatus(`Choosing from ${state.selectedLibrary.title}...`);
@@ -990,6 +1031,16 @@ function openDetails(item) {
       ? "Remove from My List"
       : "Add to My List";
   el.detailsMyList.onclick = () => setMyList(item, !inMyList);
+  const canUsePlayQueue = Boolean(item.ratingKey && itemIsPlayable(item));
+  const inPlayQueue = canUsePlayQueue && state.playQueueKeys.has(String(item.ratingKey));
+  el.detailsPlayQueue.hidden = !canUsePlayQueue;
+  el.detailsPlayQueue.disabled = state.playQueueUpdatingKey === item.ratingKey;
+  el.detailsPlayQueue.textContent = state.playQueueUpdatingKey === item.ratingKey
+    ? "Updating..."
+    : inPlayQueue
+      ? "Remove from Queue"
+      : "Add to Queue";
+  el.detailsPlayQueue.onclick = () => setPlayQueue(item, !inPlayQueue);
   const canManageCollections = Boolean(item.ratingKey && item.type === "movie");
   const collectionCount = Array.isArray(item.collections) ? item.collections.length : 0;
   el.detailsCollections.hidden = !canManageCollections;
@@ -1452,6 +1503,7 @@ function removeDeletedItem(item) {
     state.libraryTotal = Math.max(0, state.libraryTotal - 1);
   }
   state.myListKeys.delete(ratingKey);
+  state.playQueueKeys.delete(ratingKey);
   state.metadataRequests.delete(ratingKey);
   clearLocalProgress(item);
   renderItems(nextItems);
@@ -1819,6 +1871,33 @@ async function setMyList(item, saved) {
     setStatus(`Could not update My List: ${error.message}`, "error");
   } finally {
     state.myListUpdatingKey = null;
+    if (el.detailsDialog.open) openDetails(item);
+  }
+}
+
+async function setPlayQueue(item, queued) {
+  if (!item?.ratingKey || state.playQueueUpdatingKey) return;
+  state.playQueueUpdatingKey = item.ratingKey;
+  openDetails(item);
+  try {
+    const data = await api("/api/play-queue", {
+      method: "POST",
+      body: JSON.stringify({ ratingKey: item.ratingKey, queued }),
+    });
+    state.playQueueKeys = new Set((data.queueRatingKeys || []).map(String));
+    item.inPlayQueue = queued;
+    const reloadQueue = state.stack.length === 0 && state.selectedView === "queue";
+    if (reloadQueue) {
+      el.detailsDialog.close();
+      await loadLibrary();
+    } else {
+      renderItems([...state.currentItems]);
+    }
+    setStatus(`${displayTitle(item)} ${queued ? "added to" : "removed from"} Play Queue.`, "success");
+  } catch (error) {
+    setStatus(`Could not update Play Queue: ${error.message}`, "error");
+  } finally {
+    state.playQueueUpdatingKey = null;
     if (el.detailsDialog.open) openDetails(item);
   }
 }
@@ -2821,6 +2900,8 @@ function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } =
   el.player.addEventListener("loadedmetadata", applyResume, { once: true });
   el.player.addEventListener("loadeddata", reapplyActiveSubtitle, { once: true });
   el.player.src = preparedStreamUrl;
+  el.player.defaultPlaybackRate = state.playbackRate;
+  el.player.playbackRate = state.playbackRate;
   configureSubtitles(item);
   el.player.load();
   if (autoplay) {
@@ -2961,6 +3042,21 @@ function persistAutoplayNext() {
   }
 }
 
+function applyPlaybackRate(value, { persist = true } = {}) {
+  const rate = Number(value);
+  state.playbackRate = PLAYBACK_RATES.has(rate) ? rate : 1;
+  el.playbackSpeed.value = String(state.playbackRate);
+  el.player.defaultPlaybackRate = state.playbackRate;
+  el.player.playbackRate = state.playbackRate;
+  if (persist) {
+    try {
+      localStorage.setItem(PLAYBACK_RATE_KEY, String(state.playbackRate));
+    } catch {
+      // The speed remains active for this page when storage is unavailable.
+    }
+  }
+}
+
 function cancelAutoplayCountdown() {
   if (state.autoplayTimer) {
     clearInterval(state.autoplayTimer);
@@ -2970,14 +3066,32 @@ function cancelAutoplayCountdown() {
   el.playerUpNext.hidden = true;
 }
 
+function nextQueuedItem(item = state.playerItem) {
+  if (state.selectedView !== "queue" || state.stack.length || !item?.ratingKey) return null;
+  const index = state.currentItems.findIndex(
+    (candidate) => String(candidate.ratingKey || "") === String(item.ratingKey),
+  );
+  if (index < 0) return null;
+  return state.currentItems.slice(index + 1).find(itemIsPlayable) || null;
+}
+
+function nextContinuationItem(item = state.playerItem) {
+  if (state.selectedView === "queue" && state.stack.length === 0) {
+    return nextQueuedItem(item);
+  }
+  return item?.type === "episode" ? state.playerNeighbors?.next : null;
+}
+
 function updatePlayerEpisodeControls(item = state.playerItem) {
   const isEpisode = item?.type === "episode";
-  const next = isEpisode ? state.playerNeighbors?.next : null;
+  const queuePlayback = state.selectedView === "queue" && state.stack.length === 0;
+  const queuedNext = nextQueuedItem(item);
+  const next = queuedNext || (isEpisode && !queuePlayback ? state.playerNeighbors?.next : null);
   el.autoplayNext.checked = state.autoplayNext;
-  el.autoplayNextLabel.hidden = !isEpisode;
+  el.autoplayNextLabel.hidden = (!isEpisode || queuePlayback) && !queuedNext;
   el.playerNextEpisode.hidden = !next;
   if (next) {
-    el.playerNextEpisode.textContent = `Next ${episodeCode(next)}`.trim();
+    el.playerNextEpisode.textContent = queuedNext ? "Next queued" : `Next ${episodeCode(next)}`.trim();
     el.playerNextEpisode.title = displayTitle(next);
   }
 }
@@ -3003,7 +3117,7 @@ function renderAutoplayCountdown(next) {
   el.playerUpNext.hidden = false;
 }
 
-async function playAdjacentEpisode(item, { ended = false } = {}) {
+async function playFollowingItem(item, { ended = false } = {}) {
   if (!item || !state.playerItem) return;
   cancelAutoplayCountdown();
   if (!ended) {
@@ -3018,7 +3132,7 @@ async function playAdjacentEpisode(item, { ended = false } = {}) {
 function scheduleAutoplayNext() {
   cancelAutoplayCountdown();
   const currentKey = state.playerItem?.ratingKey;
-  const next = state.playerNeighbors?.next;
+  const next = nextContinuationItem();
   if (!state.autoplayNext || !currentKey || !next) return;
   state.autoplaySeconds = 5;
   renderAutoplayCountdown(next);
@@ -3030,8 +3144,8 @@ function scheduleAutoplayNext() {
     state.autoplaySeconds -= 1;
     if (state.autoplaySeconds <= 0) {
       cancelAutoplayCountdown();
-      playAdjacentEpisode(next, { ended: true }).catch((error) => {
-        setStatus(`Could not play the next episode: ${error.message}`, "error");
+      playFollowingItem(next, { ended: true }).catch((error) => {
+        setStatus(`Could not play the next item: ${error.message}`, "error");
       });
       return;
     }
@@ -3440,10 +3554,11 @@ el.autoplayNext.addEventListener("change", () => {
     cancelAutoplayCountdown();
   }
 });
+el.playbackSpeed.addEventListener("change", () => applyPlaybackRate(el.playbackSpeed.value));
 el.playerNextEpisode.addEventListener("click", () => {
-  const next = state.playerNeighbors?.next;
-  playAdjacentEpisode(next).catch((error) => {
-    setStatus(`Could not play the next episode: ${error.message}`, "error");
+  const next = nextContinuationItem();
+  playFollowingItem(next).catch((error) => {
+    setStatus(`Could not play the next item: ${error.message}`, "error");
   });
 });
 el.playerUpNextCancel.addEventListener("click", cancelAutoplayCountdown);
