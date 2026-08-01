@@ -379,7 +379,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.24.1", responses[0][1]["version"])
+        self.assertEqual("0.24.2", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -395,7 +395,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.24.1", responses[0][1]["version"])
+        self.assertEqual("0.24.2", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):

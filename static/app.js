@@ -2801,9 +2801,9 @@ function updateDownloadControls(item = state.playerItem) {
   el.playerDownloadOriginal.hidden = !canDownload;
   el.playerDownloadOriginal.disabled = !canDownload;
   el.playerDownloadOriginal.title = canDownload
-    ? "Download the original media file in a zip with available subtitle files."
+    ? "Export the original media and subtitles as a ZIP. This is separate from offline playback."
     : "";
-  el.playerDownloadOriginal.textContent = "Download";
+  el.playerDownloadOriginal.textContent = "Original ZIP";
 }
 
 function downloadOriginalFiles(item = state.playerItem) {

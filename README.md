@@ -41,6 +41,16 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.24.2
+
+**Improved**
+
+- Renamed the portable original-media download to `Original ZIP` and clarified that it is separate from browser-managed offline playback.
+
+**Fixed**
+
+- Fixed the original ZIP export being easy to mistake for a completed `Save offline` operation.
+
 ### 0.24.1
 
 **Improved**
