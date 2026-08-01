@@ -27,18 +27,36 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Persistent per-item subtitle selection from Plex subtitle streams and sidecar subtitle files, including an explicit remembered Off choice.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
+- Persistent offline browser saves that are preferred before any remote stream and remain until explicitly deleted or browser storage is cleared.
 - Seekable, subtitle-synchronized Plex VOD playback for Safari and Apple-device browsers when video or audio conversion is required.
 - Codec-aware FFmpeg fallback that converts unsupported video such as HEVC to H.264 and unsupported audio such as AC3 to AAC.
 - Poster/artwork proxy so the browser only needs this app URL.
 - Compressed API responses, right-sized artwork, and coalesced Plex reads for fast browsing over a tailnet.
 - Cancellable library/search requests, stable loading placeholders, incremental card rendering, and bounded visible-title metadata warming for responsive interaction.
 - Batched metadata warming that prepares the first visible titles through one Plex lookup instead of one round trip per card.
-- Browser-storage cleanup runs only during idle time and never blocks a video from starting.
+- Stable per-title offline storage survives replacement or deletion of the server's prepared stream copy.
 - No runtime dependencies beyond Python 3 standard library.
 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.24.1
+
+**Improved**
+
+- Renamed browser-device actions to `Save offline`, `Play offline`, and `Delete offline`.
+- Renamed the server-only action to `Prepare stream` and clarified that it still uses internet data.
+- Offline copies now remain until explicitly deleted or browser storage is cleared instead of silently expiring after 14 days.
+- Offline playback now shows an explicit source label explaining that the local file is being used without video streaming.
+
+**Fixed**
+
+- Fixed offline movies falling back to a remote stream when the server regenerated or deleted its prepared copy.
+- Fixed local playback waiting for a network metadata request before opening the offline file on slow mobile data.
+- Fixed partial browser downloads being accepted when the response ended before its declared size.
+- Fixed a failed subtitle download canceling an otherwise complete offline movie save.
+- New offline downloads are committed under unique filenames before replacing metadata, preserving the previous playable copy if a refresh is interrupted.
 
 ### 0.24.0
 
