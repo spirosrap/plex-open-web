@@ -379,7 +379,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.24.2", responses[0][1]["version"])
+        self.assertEqual("0.24.3", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -395,7 +395,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.24.2", responses[0][1]["version"])
+        self.assertEqual("0.24.3", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
@@ -667,6 +667,92 @@ class PlaybackCompatibilityTests(unittest.TestCase):
             ],
             [call[0] for call in plex.calls],
         )
+
+    def test_background_hls_stop_schedules_idle_cleanup(self):
+        session_id = "c" * 32
+        session = {
+            "state": "ready",
+            "lastAccess": 100.0,
+            "event": threading.Event(),
+        }
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = session
+
+        with mock.patch.object(server.Settings, "hls_background_grace", 120), mock.patch.object(
+            server.time, "monotonic", return_value=100.0
+        ), mock.patch.object(server.threading, "Timer") as timer:
+            deferred = server.defer_plex_hls_session_stop(session_id)
+
+        self.assertTrue(deferred)
+        self.assertRegex(session["idleStopToken"], r"^[a-f0-9]{16}$")
+        self.assertEqual(120.0, timer.call_args.args[0])
+        self.assertIs(server.expire_plex_hls_session_if_idle, timer.call_args.args[1])
+        self.assertEqual(session_id, timer.call_args.kwargs["args"][0])
+        self.assertTrue(timer.return_value.daemon)
+        timer.return_value.start.assert_called_once_with()
+
+    def test_deferred_hls_cleanup_tracks_segment_activity(self):
+        session_id = "d" * 32
+        token = "lease"
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = {
+                "state": "ready",
+                "lastAccess": 90.0,
+                "idleStopToken": token,
+                "event": threading.Event(),
+            }
+
+        with mock.patch.object(server.time, "monotonic", return_value=100.0), mock.patch.object(
+            server, "schedule_plex_hls_idle_stop"
+        ) as schedule:
+            server.expire_plex_hls_session_if_idle(session_id, token, 60)
+
+        self.assertIn(session_id, server.PLEX_HLS_SESSIONS)
+        schedule.assert_called_once_with(session_id, token, 60, 50.0)
+
+    def test_deferred_hls_cleanup_stops_an_abandoned_session(self):
+        session_id = "e" * 32
+        event = threading.Event()
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = {
+                "state": "ready",
+                "lastAccess": 10.0,
+                "idleStopToken": "lease",
+                "event": event,
+            }
+
+        with mock.patch.object(server.time, "monotonic", return_value=100.0), mock.patch.object(
+            server, "stop_plex_hls_upstream"
+        ) as stop_upstream:
+            server.expire_plex_hls_session_if_idle(session_id, "lease", 60)
+
+        self.assertNotIn(session_id, server.PLEX_HLS_SESSIONS)
+        self.assertTrue(event.is_set())
+        stop_upstream.assert_called_once_with(session_id)
+
+    def test_hls_stop_endpoint_can_defer_background_cleanup(self):
+        session_id = "f" * 32
+        handler, responses = handler_with_payload({"id": session_id, "defer": True})
+        handler.require_auth = lambda: None
+
+        with mock.patch.object(server, "defer_plex_hls_session_stop", return_value=True) as defer:
+            handler.api_plex_hls_stop("POST")
+
+        defer.assert_called_once_with(session_id)
+        self.assertEqual(
+            (200, {"ok": True, "stopped": False, "deferred": True}),
+            responses[0],
+        )
+
+    def test_pagehide_uses_deferred_hls_release_for_an_open_player(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index('window.addEventListener("pagehide"')
+        end = source.index('el.playerSave.addEventListener("click"', start)
+        handler = source[start:end]
+
+        self.assertIn("playerSessionMayResumeAfterPageHide()", handler)
+        self.assertIn("deferActiveHlsSessionStop({ keepalive: true })", handler)
+        self.assertIn('progressState = mayResume && !el.player.paused ? "playing" : "paused"', handler)
 
 
 class MediaMatchTests(unittest.TestCase):

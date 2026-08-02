@@ -29,6 +29,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Original media download as a ZIP containing the untouched video file and available subtitles.
 - Persistent offline browser saves that are preferred before any remote stream and remain until explicitly deleted or browser storage is cleared.
 - Seekable, subtitle-synchronized Plex VOD playback for Safari and Apple-device browsers when video or audio conversion is required.
+- Background-safe iPhone HLS playback that keeps an active Picture-in-Picture session alive through screen lock.
 - Codec-aware FFmpeg fallback that converts unsupported video such as HEVC to H.264 and unsupported audio such as AC3 to AAC.
 - Poster/artwork proxy so the browser only needs this app URL.
 - Compressed API responses, right-sized artwork, and coalesced Plex reads for fast browsing over a tailnet.
@@ -40,6 +41,23 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.24.3
+
+**Added**
+
+- Added an idle-aware background lease for Safari HLS sessions when an iPhone locks, backgrounds the web app, or preserves video in Picture-in-Picture.
+
+**Improved**
+
+- Active iPhone playback now keeps its Plex HLS session while native media requests continue, even when JavaScript timers are suspended.
+- Abandoned background streams are still released automatically after a bounded inactive grace period, while closing the player explicitly remains immediate.
+- Background transitions report the current playing or paused state instead of incorrectly reporting that playback stopped.
+
+**Fixed**
+
+- Fixed iPhone Picture-in-Picture stopping after the screen had been off long enough to exhaust the video buffer.
+- Fixed Safari `pagehide` being treated as a definite player close and terminating the upstream Plex stream during legitimate background playback.
 
 ### 0.24.2
 
@@ -656,6 +674,7 @@ Optional compatible-playback settings:
 - `HLS_CACHE_MAX_BYTES`: target maximum for completed inactive fallback HLS sessions; defaults to 6 GiB, while an active playback session is always preserved.
 - `HLS_STARTUP_TIMEOUT`: maximum wait for Plex VOD setup or the first fallback HLS segment; defaults to 15 seconds.
 - `HLS_TRANSCODE_TIMEOUT`: maximum fallback HLS generation time; defaults to four hours.
+- `HLS_BACKGROUND_GRACE`: inactive grace period before a backgrounded Safari HLS session is released; defaults to 10 minutes and remains sliding while media segments are requested.
 
 Optional permanent media deletion settings:
 

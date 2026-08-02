@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.24.2"
+APP_VERSION = "0.24.3"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -120,6 +120,7 @@ class Settings:
     hls_cache_max_bytes = env_int("HLS_CACHE_MAX_BYTES", 6 * 1024 * 1024 * 1024)
     hls_startup_timeout = env_int("HLS_STARTUP_TIMEOUT", 15)
     hls_transcode_timeout = env_int("HLS_TRANSCODE_TIMEOUT", 4 * 60 * 60)
+    hls_background_grace = env_int("HLS_BACKGROUND_GRACE", 10 * 60)
     data_dir = Path(os.environ.get("APP_DATA_DIR", str(ROOT.parent / "plex-open-web-data")))
     media_delete_enabled = env_bool("MEDIA_DELETE_ENABLED", False)
     media_delete_roots = os.environ.get("MEDIA_DELETE_ROOTS", "")
@@ -1640,6 +1641,63 @@ def stop_plex_hls_session(session_id: str) -> bool:
         session["event"].set()
     stop_plex_hls_upstream(session_id)
     return session is not None
+
+
+def schedule_plex_hls_idle_stop(
+    session_id: str,
+    token: str,
+    idle_seconds: int,
+    delay: Optional[float] = None,
+) -> None:
+    wait_seconds = max(1.0, float(idle_seconds if delay is None else delay))
+    timer = threading.Timer(
+        wait_seconds,
+        expire_plex_hls_session_if_idle,
+        args=(session_id, token, idle_seconds),
+    )
+    timer.daemon = True
+    timer.start()
+
+
+def expire_plex_hls_session_if_idle(session_id: str, token: str, idle_seconds: int) -> None:
+    reschedule_after: Optional[float] = None
+    expired = False
+    now = time.monotonic()
+    with PLEX_HLS_SESSIONS_LOCK:
+        session = PLEX_HLS_SESSIONS.get(session_id)
+        if not session or session.get("idleStopToken") != token:
+            return
+        idle_for = max(0.0, now - float(session.get("lastAccess", 0)))
+        if idle_for < idle_seconds:
+            reschedule_after = idle_seconds - idle_for
+        else:
+            PLEX_HLS_SESSIONS.pop(session_id, None)
+            session["stopped"] = True
+            session["event"].set()
+            expired = True
+    if reschedule_after is not None:
+        schedule_plex_hls_idle_stop(session_id, token, idle_seconds, reschedule_after)
+    elif expired:
+        stop_plex_hls_upstream(session_id)
+
+
+def defer_plex_hls_session_stop(session_id: str) -> bool:
+    idle_seconds = max(60, Settings.hls_background_grace)
+    token = secrets.token_hex(8)
+    now = time.monotonic()
+    with PLEX_HLS_SESSIONS_LOCK:
+        session = PLEX_HLS_SESSIONS.get(session_id)
+        if not session:
+            return False
+        session["idleStopToken"] = token
+        idle_for = max(0.0, now - float(session.get("lastAccess", 0)))
+    schedule_plex_hls_idle_stop(
+        session_id,
+        token,
+        idle_seconds,
+        max(1.0, idle_seconds - idle_for),
+    )
+    return True
 
 
 def prune_plex_hls_sessions() -> None:
@@ -5308,12 +5366,17 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "method_not_allowed"}, status=405)
             return
         self.require_auth()
-        session_id = str(self.read_json().get("id") or "").strip().lower()
+        payload = self.read_json()
+        session_id = str(payload.get("id") or "").strip().lower()
         if not PLEX_HLS_SESSION_PATTERN.fullmatch(session_id):
             self.send_json({"error": "invalid_hls_session"}, status=400)
             return
+        if payload.get("defer") is True:
+            deferred = defer_plex_hls_session_stop(session_id)
+            self.send_json({"ok": True, "stopped": False, "deferred": deferred})
+            return
         stopped = stop_plex_hls_session(session_id)
-        self.send_json({"ok": True, "stopped": stopped})
+        self.send_json({"ok": True, "stopped": stopped, "deferred": False})
 
     def handle_hls_segment(self, method: str, query: Dict[str, List[str]]) -> None:
         if method not in {"GET", "HEAD"}:

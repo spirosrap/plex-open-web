@@ -2836,6 +2836,22 @@ function stopActiveHlsSession({ keepalive = false } = {}) {
   }).catch(() => {});
 }
 
+function deferActiveHlsSessionStop({ keepalive = false } = {}) {
+  const id = state.activeHlsSessionId;
+  if (!id) return;
+  fetch("/api/plex-hls-stop", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, defer: true }),
+    keepalive,
+  }).catch(() => {});
+}
+
+function playerSessionMayResumeAfterPageHide() {
+  return Boolean(state.playerItem && el.player.currentSrc && !el.player.ended);
+}
+
 function playerStreamUrl(streamUrl) {
   const url = new URL(streamUrl, window.location.origin);
   if (url.searchParams.get("format") !== "hls") {
@@ -3634,8 +3650,14 @@ el.player.addEventListener("ended", () => {
   scheduleAutoplayNext();
 });
 window.addEventListener("pagehide", () => {
-  reportPlaybackProgress("stopped", { force: true, keepalive: true }).catch(() => {});
-  stopActiveHlsSession({ keepalive: true });
+  const mayResume = playerSessionMayResumeAfterPageHide();
+  const progressState = mayResume && !el.player.paused ? "playing" : "paused";
+  reportPlaybackProgress(progressState, { force: true, keepalive: true }).catch(() => {});
+  if (mayResume) {
+    deferActiveHlsSessionStop({ keepalive: true });
+  } else {
+    stopActiveHlsSession({ keepalive: true });
+  }
 });
 el.playerSave.addEventListener("click", async () => {
   try {
