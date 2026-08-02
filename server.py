@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.24.3"
+APP_VERSION = "0.24.4"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -121,6 +121,7 @@ class Settings:
     hls_startup_timeout = env_int("HLS_STARTUP_TIMEOUT", 15)
     hls_transcode_timeout = env_int("HLS_TRANSCODE_TIMEOUT", 4 * 60 * 60)
     hls_background_grace = env_int("HLS_BACKGROUND_GRACE", 10 * 60)
+    hls_background_max_grace = env_int("HLS_BACKGROUND_MAX_GRACE", 12 * 60 * 60)
     data_dir = Path(os.environ.get("APP_DATA_DIR", str(ROOT.parent / "plex-open-web-data")))
     media_delete_enabled = env_bool("MEDIA_DELETE_ENABLED", False)
     media_delete_roots = os.environ.get("MEDIA_DELETE_ROOTS", "")
@@ -1681,8 +1682,19 @@ def expire_plex_hls_session_if_idle(session_id: str, token: str, idle_seconds: i
         stop_plex_hls_upstream(session_id)
 
 
-def defer_plex_hls_session_stop(session_id: str) -> bool:
-    idle_seconds = max(60, Settings.hls_background_grace)
+def plex_hls_background_idle_seconds(requested_idle_seconds: Optional[int] = None) -> int:
+    minimum = max(60, Settings.hls_background_grace)
+    maximum = max(minimum, Settings.hls_background_max_grace)
+    if requested_idle_seconds is None:
+        return minimum
+    return min(maximum, max(minimum, requested_idle_seconds))
+
+
+def defer_plex_hls_session_stop(
+    session_id: str,
+    requested_idle_seconds: Optional[int] = None,
+) -> bool:
+    idle_seconds = plex_hls_background_idle_seconds(requested_idle_seconds)
     token = secrets.token_hex(8)
     now = time.monotonic()
     with PLEX_HLS_SESSIONS_LOCK:
@@ -5372,8 +5384,23 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "invalid_hls_session"}, status=400)
             return
         if payload.get("defer") is True:
-            deferred = defer_plex_hls_session_stop(session_id)
-            self.send_json({"ok": True, "stopped": False, "deferred": deferred})
+            requested_grace = payload.get("graceSeconds")
+            if requested_grace is not None:
+                try:
+                    requested_grace = int(requested_grace)
+                except (TypeError, ValueError):
+                    self.send_json({"error": "invalid_hls_grace"}, status=400)
+                    return
+            effective_grace = plex_hls_background_idle_seconds(requested_grace)
+            deferred = defer_plex_hls_session_stop(session_id, effective_grace)
+            self.send_json(
+                {
+                    "ok": True,
+                    "stopped": False,
+                    "deferred": deferred,
+                    "graceSeconds": effective_grace,
+                }
+            )
             return
         stopped = stop_plex_hls_session(session_id)
         self.send_json({"ok": True, "stopped": stopped, "deferred": False})

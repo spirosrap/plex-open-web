@@ -60,6 +60,8 @@ const state = {
   usingSavedPlayback: false,
   usingDevicePlayback: false,
   activeHlsSessionId: null,
+  mediaSessionHandlersConfigured: false,
+  lastMediaSessionPositionAt: 0,
   subtitleSelectionPromise: Promise.resolve(),
   deviceSaveInProgress: false,
   deviceObjectUrls: [],
@@ -80,6 +82,9 @@ const SORT_VALUES = new Set(["addedAt:desc", "titleSort", "year:desc", "lastView
 const PLAYBACK_RATES = new Set([0.75, 1, 1.25, 1.5, 2]);
 const PROGRESS_REPORT_INTERVAL_MS = 15000;
 const METADATA_PREFETCH_LIMIT = 6;
+const BACKGROUND_HLS_COMPLETION_BUFFER_SECONDS = 30 * 60;
+const BACKGROUND_HLS_FALLBACK_GRACE_SECONDS = 12 * 60 * 60;
+const MEDIA_SESSION_POSITION_INTERVAL_MS = 5000;
 
 const savedBrowse = readBrowsePreferences();
 state.preferredLibraryKey = typeof savedBrowse.libraryKey === "string" ? savedBrowse.libraryKey : "";
@@ -2121,6 +2126,149 @@ function playbackTimeMs() {
   return Math.floor(el.player.currentTime * 1000);
 }
 
+function activatePlatformPlaybackSession() {
+  try {
+    if (navigator.audioSession && "type" in navigator.audioSession) {
+      navigator.audioSession.type = "playback";
+    }
+  } catch {
+    // The Audio Session API is experimental and may reject assignment.
+  }
+}
+
+function setPlatformPlaybackState(playbackState) {
+  if (!navigator.mediaSession) return;
+  try {
+    navigator.mediaSession.playbackState = playbackState;
+  } catch {
+    // Playback continues when a browser exposes only part of Media Session.
+  }
+}
+
+function seekPlatformPlayback(target, { fast = false } = {}) {
+  const duration = Number(el.player.duration);
+  if (!Number.isFinite(duration) || duration <= 0) return;
+  const position = Math.max(0, Math.min(duration, Number(target) || 0));
+  if (fast && typeof el.player.fastSeek === "function") {
+    el.player.fastSeek(position);
+  } else {
+    el.player.currentTime = position;
+  }
+  updatePlatformPlaybackPosition({ force: true });
+}
+
+function configurePlatformPlaybackHandlers() {
+  if (!navigator.mediaSession || state.mediaSessionHandlersConfigured) return;
+  const actions = {
+    play: () => {
+      activatePlatformPlaybackSession();
+      el.player.play().catch(() => {});
+    },
+    pause: () => {
+      el.player.pause();
+    },
+    seekbackward: (details) => {
+      const offset = Number.isFinite(details?.seekOffset) ? details.seekOffset : 10;
+      seekPlatformPlayback(el.player.currentTime - offset);
+    },
+    seekforward: (details) => {
+      const offset = Number.isFinite(details?.seekOffset) ? details.seekOffset : 10;
+      seekPlatformPlayback(el.player.currentTime + offset);
+    },
+    seekto: (details) => {
+      if (Number.isFinite(details?.seekTime)) {
+        seekPlatformPlayback(details.seekTime, { fast: Boolean(details.fastSeek) });
+      }
+    },
+    stop: () => {
+      el.player.pause();
+      reportPlaybackProgress("paused", { force: true }).catch(() => {});
+    },
+  };
+  for (const [action, handler] of Object.entries(actions)) {
+    try {
+      navigator.mediaSession.setActionHandler(action, handler);
+    } catch {
+      // Safari versions expose different subsets of Media Session actions.
+    }
+  }
+  state.mediaSessionHandlersConfigured = true;
+}
+
+function updatePlatformPlaybackPosition({ force = false } = {}) {
+  if (!navigator.mediaSession?.setPositionState || !state.playerItem) return;
+  const now = Date.now();
+  if (!force && now - state.lastMediaSessionPositionAt < MEDIA_SESSION_POSITION_INTERVAL_MS) return;
+  const duration = Number(el.player.duration);
+  const position = Number(el.player.currentTime);
+  const playbackRate = Number(el.player.playbackRate);
+  if (
+    !Number.isFinite(duration)
+    || duration <= 0
+    || !Number.isFinite(position)
+    || !Number.isFinite(playbackRate)
+    || playbackRate <= 0
+  ) {
+    return;
+  }
+  try {
+    navigator.mediaSession.setPositionState({
+      duration,
+      playbackRate,
+      position: Math.max(0, Math.min(duration, position)),
+    });
+    state.lastMediaSessionPositionAt = now;
+  } catch {
+    // Invalid or temporarily unavailable duration should not interrupt video.
+  }
+}
+
+function configurePlatformPlaybackSession(item) {
+  activatePlatformPlaybackSession();
+  configurePlatformPlaybackHandlers();
+  if (!navigator.mediaSession || typeof window.MediaMetadata !== "function") return;
+  const artist = item?.type === "episode"
+    ? item.grandparentTitle || ""
+    : item?.year
+      ? String(item.year)
+      : "";
+  const album = item?.type === "episode"
+    ? [item.parentTitle, episodeCode(item)].filter(Boolean).join(" - ")
+    : "Plex Open Web";
+  const artwork = [];
+  if (item?.posterUrl) {
+    try {
+      artwork.push({ src: new URL(item.posterUrl, window.location.origin).href });
+    } catch {
+      // Metadata remains useful when artwork is unavailable.
+    }
+  }
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: item?.title || displayTitle(item),
+      artist,
+      album,
+      artwork,
+    });
+  } catch {
+    // Older Safari builds may reject otherwise valid artwork metadata.
+  }
+  state.lastMediaSessionPositionAt = 0;
+  setPlatformPlaybackState(el.player.paused ? "paused" : "playing");
+}
+
+function clearPlatformPlaybackSession() {
+  if (!navigator.mediaSession) return;
+  try {
+    navigator.mediaSession.metadata = null;
+    navigator.mediaSession.playbackState = "none";
+    navigator.mediaSession.setPositionState?.();
+  } catch {
+    // Clearing platform state is best effort during page/player teardown.
+  }
+  state.lastMediaSessionPositionAt = 0;
+}
+
 function resumeTimeFor(item) {
   return resumeTimeMsFor(item) / 1000;
 }
@@ -2836,14 +2984,28 @@ function stopActiveHlsSession({ keepalive = false } = {}) {
   }).catch(() => {});
 }
 
-function deferActiveHlsSessionStop({ keepalive = false } = {}) {
+function backgroundHlsGraceSeconds() {
+  const duration = playbackDurationMs() / 1000;
+  const position = playbackTimeMs() / 1000;
+  const playbackRate = Number(el.player.playbackRate) || 1;
+  if (Number.isFinite(duration) && duration > position) {
+    return Math.ceil(
+      (duration - position) / Math.max(0.25, playbackRate)
+      + BACKGROUND_HLS_COMPLETION_BUFFER_SECONDS,
+    );
+  }
+  return BACKGROUND_HLS_FALLBACK_GRACE_SECONDS;
+}
+
+function deferActiveHlsSessionStop({ keepalive = false, graceSeconds = null } = {}) {
   const id = state.activeHlsSessionId;
   if (!id) return;
+  const requestedGrace = Number.isFinite(graceSeconds) ? graceSeconds : backgroundHlsGraceSeconds();
   fetch("/api/plex-hls-stop", {
     method: "POST",
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, defer: true }),
+    body: JSON.stringify({ id, defer: true, graceSeconds: Math.ceil(requestedGrace) }),
     keepalive,
   }).catch(() => {});
 }
@@ -2871,6 +3033,7 @@ function playerStreamUrl(streamUrl) {
 }
 
 function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } = {}) {
+  configurePlatformPlaybackSession(item);
   el.playerError.hidden = true;
   el.playerError.textContent = "";
   clearSubtitleTracks();
@@ -3587,6 +3750,7 @@ el.playerDialog.addEventListener("close", async () => {
   el.playerNextEpisode.hidden = true;
   state.usingSavedPlayback = false;
   state.usingDevicePlayback = false;
+  clearPlatformPlaybackSession();
   revokeDeviceObjectUrls();
   clearSubtitleTracks();
   el.player.load();
@@ -3611,9 +3775,15 @@ el.subtitleSelect.addEventListener("change", () => {
     });
 });
 el.player.addEventListener("play", () => {
+  activatePlatformPlaybackSession();
+  setPlatformPlaybackState("playing");
+  updatePlatformPlaybackPosition({ force: true });
   startProgressReporting();
 });
 el.player.addEventListener("playing", () => {
+  activatePlatformPlaybackSession();
+  setPlatformPlaybackState("playing");
+  updatePlatformPlaybackPosition({ force: true });
   el.playerError.hidden = true;
   el.playerError.textContent = "";
   if (state.playerItem) {
@@ -3623,6 +3793,7 @@ el.player.addEventListener("playing", () => {
 });
 el.player.addEventListener("error", () => {
   if (!state.playerItem || !el.player.currentSrc) return;
+  setPlatformPlaybackState("paused");
   const message = state.playerItem.savedPlayback?.ready
     ? "Playback failed. Select Play stream to retry with the prepared remote copy."
     : "Playback failed. Select Prepare stream to create a browser-compatible remote copy and retry.";
@@ -3634,6 +3805,8 @@ el.player.addEventListener("error", () => {
   setStatus(`Could not play ${displayTitle(state.playerItem)}.`, "error");
 });
 el.player.addEventListener("pause", () => {
+  setPlatformPlaybackState(el.player.ended ? "none" : "paused");
+  updatePlatformPlaybackPosition({ force: true });
   if (!el.player.ended) {
     reportPlaybackProgress("paused", { force: true }).catch(() => {});
   }
@@ -3643,8 +3816,15 @@ el.player.addEventListener("timeupdate", () => {
   if (!item?.ratingKey) return;
   rememberLocalProgress(item, playbackTimeMs(), playbackDurationMs(item));
   updatePlayerStartOverControl();
+  updatePlatformPlaybackPosition();
 });
+el.player.addEventListener("loadedmetadata", () => updatePlatformPlaybackPosition({ force: true }));
+el.player.addEventListener("durationchange", () => updatePlatformPlaybackPosition({ force: true }));
+el.player.addEventListener("ratechange", () => updatePlatformPlaybackPosition({ force: true }));
+el.player.addEventListener("enterpictureinpicture", activatePlatformPlaybackSession);
+el.player.addEventListener("webkitpresentationmodechanged", activatePlatformPlaybackSession);
 el.player.addEventListener("ended", () => {
+  setPlatformPlaybackState("none");
   stopProgressReporting();
   reportPlaybackProgress("ended", { force: true }).catch(() => {});
   scheduleAutoplayNext();
@@ -3652,12 +3832,28 @@ el.player.addEventListener("ended", () => {
 window.addEventListener("pagehide", () => {
   const mayResume = playerSessionMayResumeAfterPageHide();
   const progressState = mayResume && !el.player.paused ? "playing" : "paused";
+  if (mayResume) {
+    activatePlatformPlaybackSession();
+    setPlatformPlaybackState(el.player.paused ? "paused" : "playing");
+  }
   reportPlaybackProgress(progressState, { force: true, keepalive: true }).catch(() => {});
   if (mayResume) {
     deferActiveHlsSessionStop({ keepalive: true });
   } else {
     stopActiveHlsSession({ keepalive: true });
   }
+});
+window.addEventListener("pageshow", () => {
+  if (!playerSessionMayResumeAfterPageHide()) return;
+  activatePlatformPlaybackSession();
+  setPlatformPlaybackState(el.player.paused ? "paused" : "playing");
+  updatePlatformPlaybackPosition({ force: true });
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden || !state.playerItem || el.player.paused || el.player.ended) return;
+  activatePlatformPlaybackSession();
+  setPlatformPlaybackState("playing");
+  updatePlatformPlaybackPosition({ force: true });
 });
 el.playerSave.addEventListener("click", async () => {
   try {

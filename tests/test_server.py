@@ -379,7 +379,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.24.3", responses[0][1]["version"])
+        self.assertEqual("0.24.4", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -395,7 +395,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.24.3", responses[0][1]["version"])
+        self.assertEqual("0.24.4", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
@@ -691,6 +691,26 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertTrue(timer.return_value.daemon)
         timer.return_value.start.assert_called_once_with()
 
+    def test_background_hls_stop_accepts_playback_length_with_a_bounded_maximum(self):
+        session_id = "1" * 32
+        session = {
+            "state": "ready",
+            "lastAccess": 100.0,
+            "event": threading.Event(),
+        }
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = session
+
+        with mock.patch.object(server.Settings, "hls_background_grace", 120), mock.patch.object(
+            server.Settings, "hls_background_max_grace", 3600
+        ), mock.patch.object(server.time, "monotonic", return_value=100.0), mock.patch.object(
+            server.threading, "Timer"
+        ) as timer:
+            deferred = server.defer_plex_hls_session_stop(session_id, 7200)
+
+        self.assertTrue(deferred)
+        self.assertEqual(3600.0, timer.call_args.args[0])
+
     def test_deferred_hls_cleanup_tracks_segment_activity(self):
         session_id = "d" * 32
         token = "lease"
@@ -735,14 +755,37 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         handler, responses = handler_with_payload({"id": session_id, "defer": True})
         handler.require_auth = lambda: None
 
+        with mock.patch.object(server.Settings, "hls_background_grace", 600), mock.patch.object(
+            server.Settings, "hls_background_max_grace", 43200
+        ), mock.patch.object(server, "defer_plex_hls_session_stop", return_value=True) as defer:
+            handler.api_plex_hls_stop("POST")
+
+        defer.assert_called_once_with(session_id, 600)
+        self.assertEqual(
+            (
+                200,
+                {
+                    "ok": True,
+                    "stopped": False,
+                    "deferred": True,
+                    "graceSeconds": 600,
+                },
+            ),
+            responses[0],
+        )
+
+    def test_hls_stop_endpoint_passes_remaining_playback_grace(self):
+        session_id = "2" * 32
+        handler, responses = handler_with_payload(
+            {"id": session_id, "defer": True, "graceSeconds": 5400}
+        )
+        handler.require_auth = lambda: None
+
         with mock.patch.object(server, "defer_plex_hls_session_stop", return_value=True) as defer:
             handler.api_plex_hls_stop("POST")
 
-        defer.assert_called_once_with(session_id)
-        self.assertEqual(
-            (200, {"ok": True, "stopped": False, "deferred": True}),
-            responses[0],
-        )
+        defer.assert_called_once_with(session_id, 5400)
+        self.assertEqual(5400, responses[0][1]["graceSeconds"])
 
     def test_pagehide_uses_deferred_hls_release_for_an_open_player(self):
         source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
@@ -753,6 +796,21 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertIn("playerSessionMayResumeAfterPageHide()", handler)
         self.assertIn("deferActiveHlsSessionStop({ keepalive: true })", handler)
         self.assertIn('progressState = mayResume && !el.player.paused ? "playing" : "paused"', handler)
+
+    def test_frontend_background_lease_uses_remaining_runtime(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function backgroundHlsGraceSeconds()", source)
+        self.assertIn("BACKGROUND_HLS_COMPLETION_BUFFER_SECONDS", source)
+        self.assertIn("graceSeconds: Math.ceil(requestedGrace)", source)
+
+    def test_frontend_registers_ios_platform_playback_session(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('navigator.audioSession.type = "playback"', source)
+        self.assertIn("navigator.mediaSession.metadata = new MediaMetadata", source)
+        self.assertIn('navigator.mediaSession.setActionHandler(action, handler)', source)
+        self.assertIn('el.player.addEventListener("enterpictureinpicture"', source)
 
 
 class MediaMatchTests(unittest.TestCase):

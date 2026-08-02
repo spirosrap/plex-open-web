@@ -42,6 +42,25 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.24.4
+
+**Added**
+
+- Added native iOS Media Session integration with movie or episode metadata plus lock-screen play, pause, ten-second seek, and timeline controls.
+- Added explicit iOS playback audio-session activation for long-running video when Safari or an installed web app moves into the background.
+
+**Improved**
+
+- Screen-lock HLS leases now use the title's remaining playback time plus a completion buffer instead of assuming that ten quiet minutes means playback was abandoned.
+- Background lease requests are bounded by a configurable server maximum, while explicit player close still releases the Plex transcode immediately.
+- Picture-in-Picture, page visibility, and page restoration transitions now refresh the native playback state and position presented by iOS.
+- Added legacy `webkit-playsinline` signaling alongside the standard inline-video attribute for older Apple browser engines.
+
+**Fixed**
+
+- Fixed iPhone playback stopping after the display remained locked longer than the previous fixed HLS inactivity grace period.
+- Fixed the lock screen lacking reliable metadata and playback actions for the active Plex Open Web title.
+
 ### 0.24.3
 
 **Added**
@@ -674,7 +693,8 @@ Optional compatible-playback settings:
 - `HLS_CACHE_MAX_BYTES`: target maximum for completed inactive fallback HLS sessions; defaults to 6 GiB, while an active playback session is always preserved.
 - `HLS_STARTUP_TIMEOUT`: maximum wait for Plex VOD setup or the first fallback HLS segment; defaults to 15 seconds.
 - `HLS_TRANSCODE_TIMEOUT`: maximum fallback HLS generation time; defaults to four hours.
-- `HLS_BACKGROUND_GRACE`: inactive grace period before a backgrounded Safari HLS session is released; defaults to 10 minutes and remains sliding while media segments are requested.
+- `HLS_BACKGROUND_GRACE`: minimum inactive grace period before a backgrounded Safari HLS session is released; defaults to 10 minutes.
+- `HLS_BACKGROUND_MAX_GRACE`: maximum playback-aware background lease; defaults to 12 hours. The browser requests the remaining title runtime plus a completion buffer, and active media requests keep the lease sliding.
 
 Optional permanent media deletion settings:
 
