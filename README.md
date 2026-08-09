@@ -44,6 +44,18 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.25.1
+
+**Improved**
+
+- HLS startup errors now trigger one automatic stream renewal while preserving the saved position, subtitle choice, and playback speed.
+- Plex HLS segments are served as complete transport-stream chunks, matching the non-BYTERANGE playlists consumed by Safari.
+
+**Fixed**
+
+- Fixed Safari replaying an obsolete segment byte range and receiving HTTP 416, which left the player black with a Playback failed message.
+- Fixed startup failures requiring Prepare stream even though Plex had already produced a healthy browser-compatible transcode.
+
 ### 0.25.0
 
 **Added**

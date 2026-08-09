@@ -4165,9 +4165,7 @@ el.player.addEventListener("playing", () => {
 });
 el.player.addEventListener("error", () => {
   if (!state.playerItem || !el.player.currentSrc) return;
-  if (state.playerHasPlayed
-      && !state.hlsRecoveryInProgress
-      && renewActiveHlsPlayback("stalled")) {
+  if (!state.hlsRecoveryInProgress && renewActiveHlsPlayback("error")) {
     return;
   }
   clearHlsRecoveryTimer();

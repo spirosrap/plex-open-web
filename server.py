@@ -42,7 +42,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.25.0"
+APP_VERSION = "0.25.1"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -6242,10 +6242,11 @@ class AppHandler(BaseHTTPRequestHandler):
         path = f"/video/:/transcode/universal/session/{upstream_id}/{variant}/{name}"
 
         def segment_headers() -> Dict[str, str]:
-            result = plex_hls_headers(upstream_id)
-            if self.headers.get("Range"):
-                result["Range"] = self.headers["Range"]
-            return result
+            # Each playlist entry is already a complete MPEG-TS segment. Safari can
+            # retain a byte range from an interrupted fetch and replay it against a
+            # later request, which Plex rejects with 416. Serving the whole segment
+            # is valid for a non-BYTERANGE HLS playlist and avoids poisoning playback.
+            return plex_hls_headers(upstream_id)
 
         def open_segment(
             segment_path: Optional[str] = None,
@@ -6265,7 +6266,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         method=segment_method,
                     )
                 except urllib.error.HTTPError as exc:
-                    if exc.code not in {404, 410} or attempt == len(delays) - 1:
+                    if exc.code not in {404, 410, 416} or attempt == len(delays) - 1:
                         raise
                     exc.close()
             raise RuntimeError("Plex HLS segment did not become available")
@@ -6274,7 +6275,7 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 response = open_segment()
             except urllib.error.HTTPError as exc:
-                if exc.code not in {404, 410}:
+                if exc.code not in {404, 410, 416}:
                     raise
                 exc.close()
                 recovered = recover_plex_hls_session(session_id, session)
@@ -6303,10 +6304,11 @@ class AppHandler(BaseHTTPRequestHandler):
             with response:
                 self.send_response(response.status)
                 self.send_header("Content-Type", response.headers.get("Content-Type", "video/mp2t"))
-                for header in ["Content-Length", "Content-Range", "Accept-Ranges", "ETag"]:
+                for header in ["Content-Length", "ETag"]:
                     value = response.headers.get(header)
                     if value:
                         self.send_header(header, value)
+                self.send_header("Accept-Ranges", "none")
                 self.send_header("Cache-Control", "private, max-age=14400, immutable")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()

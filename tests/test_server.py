@@ -381,7 +381,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.25.0", responses[0][1]["version"])
+        self.assertEqual("0.25.1", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -397,7 +397,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.25.0", responses[0][1]["version"])
+        self.assertEqual("0.25.1", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
@@ -821,6 +821,59 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         )
         recover.assert_called_once_with(session_id, session)
 
+    def test_plex_hls_segment_ignores_stale_browser_byte_range(self):
+        class SegmentResponse(io.BytesIO):
+            status = 200
+            headers = {
+                "Content-Length": "7",
+                "Content-Type": "video/mp2t",
+                "Content-Range": "bytes 0-6/7",
+                "Accept-Ranges": "bytes",
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.close()
+                return False
+
+        session_id = "7" * 32
+        session = {
+            "state": "ready",
+            "ratingKey": "701",
+            "variants": {"base"},
+            "event": threading.Event(),
+        }
+        upstream = mock.Mock()
+        upstream.open.return_value = SegmentResponse(b"segment")
+        handler = object.__new__(server.AppHandler)
+        handler.headers = {"Range": "bytes=999999999-"}
+        handler.wfile = io.BytesIO()
+        statuses = []
+        response_headers = []
+        handler.require_auth = lambda: None
+        handler.send_response = statuses.append
+        handler.send_header = lambda key, value: response_headers.append((key, value))
+        handler.end_headers = lambda: None
+        handler.send_json = lambda body, status=200, **kwargs: self.fail(
+            f"Unexpected JSON response {status}: {body}"
+        )
+
+        with mock.patch.object(server, "PLEX", upstream), mock.patch.object(
+            server, "active_plex_hls_session", return_value=session
+        ):
+            handler.handle_plex_hls_segment(
+                "GET",
+                {"id": [session_id], "variant": ["base"], "name": ["00042.ts"]},
+            )
+
+        self.assertEqual([200], statuses)
+        self.assertEqual(b"segment", handler.wfile.getvalue())
+        self.assertNotIn("Range", upstream.open.call_args.kwargs["headers"])
+        self.assertIn(("Accept-Ranges", "none"), response_headers)
+        self.assertFalse(any(key == "Content-Range" for key, _ in response_headers))
+
     def test_background_hls_stop_schedules_idle_cleanup(self):
         session_id = "c" * 32
         session = {
@@ -967,6 +1020,15 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertIn('el.player.addEventListener("waiting", scheduleHlsStallRecovery)', source)
         self.assertIn('el.player.addEventListener("stalled", scheduleHlsStallRecovery)', source)
         self.assertIn("loadPlayerSource(item, streamUrl, { resumeTime, autoplay: true, recovering: true })", source)
+
+    def test_frontend_renews_hls_when_startup_playback_errors(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index('el.player.addEventListener("error"')
+        end = source.index('el.player.addEventListener("pause"', start)
+        handler = source[start:end]
+
+        self.assertIn('renewActiveHlsPlayback("error")', handler)
+        self.assertNotIn("state.playerHasPlayed", handler)
 
     def test_frontend_does_not_toggle_an_already_active_subtitle_track(self):
         source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
