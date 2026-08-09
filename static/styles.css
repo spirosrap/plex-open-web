@@ -1334,11 +1334,42 @@ select:focus-visible {
   padding: 0 12px;
 }
 
+.player-stage {
+  position: relative;
+  background: #000;
+}
+
 .player-dialog video {
   display: block;
   width: 100%;
   max-height: calc(100vh - 120px);
   background: #000;
+}
+
+.skip-intro-button {
+  position: absolute;
+  right: 22px;
+  bottom: 72px;
+  z-index: 4;
+  min-width: 126px;
+  min-height: 44px;
+  border: 1px solid rgba(255, 255, 255, 0.58);
+  border-radius: 6px;
+  background: rgba(18, 18, 18, 0.9);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.34);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.skip-intro-button:hover,
+.skip-intro-button:focus-visible {
+  border-color: #fff;
+  background: rgba(38, 38, 38, 0.96);
+}
+
+.skip-intro-button[hidden] {
+  display: none;
 }
 
 .player-error {
@@ -1649,5 +1680,10 @@ select:focus-visible {
 
   .player-dialog video {
     max-height: calc(100vh - 210px);
+  }
+
+  .skip-intro-button {
+    right: 12px;
+    bottom: 64px;
   }
 }

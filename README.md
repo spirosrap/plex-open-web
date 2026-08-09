@@ -23,6 +23,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Movie playback in the browser through a Range-aware stream proxy.
 - TV show navigation from show to season to episode.
 - Previous/next episode navigation with optional persisted autoplay and a cancellable Up Next countdown.
+- Per-episode Skip Intro controls backed by native Plex markers or cached Chromaprint audio matching across a season.
 - Persistent 0.75x to 2x playback speed that survives source changes and browser restarts.
 - Persistent per-item subtitle selection from Plex subtitle streams and sidecar subtitle files, including an explicit remembered Off choice.
 - Lazy, cached embedded-subtitle windows that follow playback and seeking without scanning every language track.
@@ -42,6 +43,26 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.25.0
+
+**Added**
+
+- Added a Netflix-style Skip Intro button that appears only while a detected TV opening is playing.
+- Added support for native Plex intro markers when a server already provides them.
+- Added an independent season analyzer that uses FFmpeg's Chromaprint engine to recognize the same opening audio at different offsets in each episode.
+- Added a persistent per-season marker cache and a lightweight status endpoint shared with the Android client.
+
+**Improved**
+
+- Cold opens are measured per episode instead of assuming that every intro starts at the same timestamp or has one fixed skip duration.
+- Intro analysis runs on one background worker, prioritizes the episode being opened, publishes useful partial results after three seed episodes, and never blocks browsing or playback.
+- Cached analysis automatically refreshes when an episode is added or its Plex metadata or media file changes.
+- The skip target lands conservatively near the end of the recognized opening to avoid cutting into the first line after the titles.
+
+**Fixed**
+
+- Avoided unreliable global skip timers that could jump over story content on episodes with longer, shorter, moved, or missing openings.
 
 ### 0.24.7
 
@@ -744,6 +765,15 @@ Optional compatible-playback settings:
 - `HLS_TRANSCODE_TIMEOUT`: maximum fallback HLS generation time; defaults to four hours.
 - `HLS_BACKGROUND_GRACE`: minimum inactive grace period before a backgrounded Safari HLS session is released; defaults to 10 minutes.
 - `HLS_BACKGROUND_MAX_GRACE`: maximum playback-aware background lease; defaults to 12 hours. The browser requests the remaining title runtime plus a completion buffer, and active media requests keep the lease sliding.
+
+Optional intro-analysis settings:
+
+- `INTRO_ANALYSIS_ENABLED`: set to `0` to disable custom audio-based intro detection; native Plex markers remain readable.
+- `INTRO_ANALYSIS_WINDOW_SECONDS`: opening portion inspected in each episode; defaults to 12 minutes and never extends beyond the episode midpoint.
+- `INTRO_ANALYSIS_MIN_SECONDS`: shortest repeated opening accepted as an intro; defaults to 20 seconds.
+- `INTRO_ANALYSIS_MAX_SECONDS`: longest repeated opening accepted as an intro; defaults to three minutes.
+- `INTRO_ANALYSIS_SEED_EPISODES`: episodes compared before the first partial result is published; defaults to three.
+- `INTRO_ANALYSIS_TIMEOUT`: maximum FFmpeg fingerprint time per episode; defaults to 180 seconds.
 
 Optional permanent media deletion settings:
 

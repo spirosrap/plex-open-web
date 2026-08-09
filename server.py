@@ -23,6 +23,7 @@ import re
 import secrets
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -41,7 +42,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.24.7"
+APP_VERSION = "0.25.0"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -126,6 +127,12 @@ class Settings:
     subtitle_extract_timeout = env_int("SUBTITLE_EXTRACT_TIMEOUT", 300)
     subtitle_cache_ttl = env_int("SUBTITLE_CACHE_TTL", 30 * 24 * 60 * 60)
     subtitle_cache_max_bytes = env_int("SUBTITLE_CACHE_MAX_BYTES", 256 * 1024 * 1024)
+    intro_analysis_enabled = env_bool("INTRO_ANALYSIS_ENABLED", True)
+    intro_analysis_window_seconds = env_int("INTRO_ANALYSIS_WINDOW_SECONDS", 12 * 60)
+    intro_analysis_min_seconds = env_int("INTRO_ANALYSIS_MIN_SECONDS", 20)
+    intro_analysis_max_seconds = env_int("INTRO_ANALYSIS_MAX_SECONDS", 3 * 60)
+    intro_analysis_seed_episodes = env_int("INTRO_ANALYSIS_SEED_EPISODES", 3)
+    intro_analysis_timeout = env_int("INTRO_ANALYSIS_TIMEOUT", 180)
     data_dir = Path(os.environ.get("APP_DATA_DIR", str(ROOT.parent / "plex-open-web-data")))
     media_delete_enabled = env_bool("MEDIA_DELETE_ENABLED", False)
     media_delete_roots = os.environ.get("MEDIA_DELETE_ROOTS", "")
@@ -203,6 +210,7 @@ class TimedResultCache:
 
 API_CACHE = TimedResultCache()
 BROWSE_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="plex-browse")
+INTRO_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="intro-analysis")
 STATIC_CACHE_LOCK = threading.Lock()
 STATIC_CACHE: Dict[Path, Tuple[int, bytes]] = {}
 
@@ -216,6 +224,24 @@ PLAYBACK_RESTARTS_CACHE: Optional[Dict[str, Dict[str, int]]] = None
 MEDIA_DELETE_LOG_FILE = Settings.data_dir / "media-delete-log.jsonl"
 MEDIA_DELETE_LOCK = threading.Lock()
 EMBEDDED_SUBTITLE_CACHE_LOCK = threading.Lock()
+INTRO_MARKERS_FILE = Settings.data_dir / "intro-markers.json"
+INTRO_MARKERS_LOCK = threading.Lock()
+INTRO_MARKERS_CACHE: Optional[Dict[str, Any]] = None
+INTRO_JOBS_LOCK = threading.Lock()
+INTRO_JOBS: Dict[str, Dict[str, Any]] = {}
+INTRO_FINGERPRINT_HZ = 8.077
+INTRO_FINGERPRINT_DELAY_SECONDS = 2.6
+INTRO_FINGERPRINT_MASKS = (
+    0x000000FF,
+    0x0000FF00,
+    0x00FF0000,
+    0xFF000000,
+    0x11111111,
+    0x22222222,
+    0x44444444,
+    0x88888888,
+)
+BYTE_BIT_COUNTS = tuple(bin(value).count("1") for value in range(256))
 VIDEO_EXTENSIONS = {
     ".3g2", ".3gp", ".asf", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov",
     ".mp4", ".mpeg", ".mpg", ".mts", ".ogm", ".ogv", ".ts", ".vob", ".webm", ".wmv",
@@ -2215,6 +2241,12 @@ def item_from_xml(
         elem.get("ratingKey"),
         to_int(elem.get("viewOffset")) or 0,
     )
+    native_intro_marker = native_intro_marker_from_xml(elem) if item_type == "episode" else None
+    cached_intro_marker = cached_intro_marker_for_episode(
+        elem.get("ratingKey"),
+        elem.get("parentRatingKey"),
+    ) if item_type == "episode" else None
+    intro_marker = native_intro_marker or cached_intro_marker
     item = {
         "ratingKey": elem.get("ratingKey"),
         "key": elem.get("key"),
@@ -2271,6 +2303,12 @@ def item_from_xml(
         "subtitles": subtitles,
         "media": media,
         "guids": guids,
+        "introMarker": intro_marker,
+        "introAnalysis": intro_analysis_status(
+            elem.get("ratingKey"),
+            elem.get("parentRatingKey"),
+            native_intro_marker,
+        ) if item_type == "episode" else None,
     }
     item.update(external_ids)
     return item
@@ -2489,7 +2527,10 @@ def opensubtitles_json(
 
 
 def metadata_item_element(rating_key: str) -> Optional[ET.Element]:
-    root = PLEX.xml(f"/library/metadata/{urllib.parse.quote(rating_key)}", params={"includeGuids": "1"})
+    root = PLEX.xml(
+        f"/library/metadata/{urllib.parse.quote(rating_key)}",
+        params={"includeGuids": "1", "includeMarkers": "1"},
+    )
     for elem in root.iter():
         if elem.tag in {"Video", "Directory", "Track"} and elem.get("ratingKey") == rating_key:
             return elem
@@ -2513,6 +2554,609 @@ def first_part_element(elem: ET.Element) -> Optional[ET.Element]:
         if part is not None:
             return part
     return None
+
+
+def normalized_intro_marker(
+    start_ms: Any,
+    end_ms: Any,
+    source: str,
+    confidence: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    start = to_int(str(start_ms)) if start_ms is not None else None
+    end = to_int(str(end_ms)) if end_ms is not None else None
+    if start is None or end is None or start < 0 or end <= start:
+        return None
+    marker: Dict[str, Any] = {
+        "type": "intro",
+        "startTimeOffset": start,
+        "endTimeOffset": end,
+        "source": source,
+    }
+    if confidence is not None:
+        marker["confidence"] = round(max(0.0, min(1.0, float(confidence))), 3)
+    return marker
+
+
+def native_intro_marker_from_xml(elem: ET.Element) -> Optional[Dict[str, Any]]:
+    for marker in elem.findall("Marker"):
+        if (marker.get("type") or "").lower() != "intro":
+            continue
+        normalized = normalized_intro_marker(
+            marker.get("startTimeOffset"),
+            marker.get("endTimeOffset"),
+            "plex",
+            1.0,
+        )
+        if normalized:
+            return normalized
+    return None
+
+
+def _load_intro_marker_store_locked() -> Dict[str, Any]:
+    global INTRO_MARKERS_CACHE
+    if INTRO_MARKERS_CACHE is not None:
+        return INTRO_MARKERS_CACHE
+    try:
+        payload = json.loads(INTRO_MARKERS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    seasons = payload.get("seasons")
+    if not isinstance(seasons, dict):
+        seasons = {}
+    INTRO_MARKERS_CACHE = {"version": 1, "seasons": seasons}
+    return INTRO_MARKERS_CACHE
+
+
+def _save_intro_marker_store_locked(store: Dict[str, Any]) -> None:
+    INTRO_MARKERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = INTRO_MARKERS_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(store, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.replace(temporary, INTRO_MARKERS_FILE)
+
+
+def cached_intro_marker_for_episode(
+    rating_key: Optional[str],
+    season_key: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not rating_key or not season_key:
+        return None
+    with INTRO_MARKERS_LOCK:
+        store = _load_intro_marker_store_locked()
+        season = store["seasons"].get(str(season_key), {})
+        marker = season.get("markers", {}).get(str(rating_key)) if isinstance(season, dict) else None
+        if not isinstance(marker, dict):
+            return None
+        normalized = normalized_intro_marker(
+            marker.get("startTimeOffset"),
+            marker.get("endTimeOffset"),
+            "audio",
+            to_float(str(marker.get("confidence"))) if marker.get("confidence") is not None else None,
+        )
+        return normalized
+
+
+def _intro_record_for_season(season_key: Optional[str]) -> Dict[str, Any]:
+    if not season_key:
+        return {}
+    with INTRO_MARKERS_LOCK:
+        record = _load_intro_marker_store_locked()["seasons"].get(str(season_key), {})
+        return dict(record) if isinstance(record, dict) else {}
+
+
+def _intro_record_current_for_item(item: Dict[str, Any]) -> bool:
+    rating_key = str(item.get("ratingKey") or "")
+    season_key = str(item.get("parentRatingKey") or "")
+    if not rating_key or not season_key:
+        return False
+    record = _intro_record_for_season(season_key)
+    versions = record.get("episodeVersions", {})
+    if record.get("state") != "ready" or not isinstance(versions, dict):
+        return False
+    return str(versions.get(rating_key, "")) == str(item.get("updatedAt") or 0)
+
+
+def intro_analysis_status(
+    rating_key: Optional[str],
+    season_key: Optional[str],
+    native_marker: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if native_marker:
+        return {"state": "ready", "source": "plex", "markerFound": True}
+    if not Settings.intro_analysis_enabled:
+        return {"state": "disabled", "source": "audio", "markerFound": False}
+    if not rating_key or not season_key:
+        return {"state": "unavailable", "source": "audio", "markerFound": False}
+    marker = cached_intro_marker_for_episode(str(rating_key), str(season_key))
+    with INTRO_JOBS_LOCK:
+        job = dict(INTRO_JOBS.get(str(season_key), {}))
+    if job.get("state") in {"queued", "analyzing"}:
+        return {
+            "state": job["state"],
+            "source": "audio",
+            "markerFound": bool(marker),
+        }
+    if job.get("state") == "failed":
+        return {
+            "state": "failed",
+            "source": "audio",
+            "markerFound": False,
+            "reason": job.get("reason") or "analysis_failed",
+        }
+    record = _intro_record_for_season(str(season_key))
+    if record.get("state") == "ready":
+        return {
+            "state": "ready",
+            "source": "audio",
+            "markerFound": bool(marker),
+            "reason": record.get("reason"),
+            "updatedAt": record.get("updatedAt"),
+        }
+    return {"state": "idle", "source": "audio", "markerFound": False}
+
+
+def _intro_candidate_shifts(
+    reference: List[int],
+    target: List[int],
+    limit: int = 40,
+) -> List[Tuple[int, int]]:
+    if not reference or not target:
+        return []
+    buckets: Dict[Tuple[int, int], List[int]] = collections.defaultdict(list)
+    for target_index, word in enumerate(target):
+        for mask_index, mask in enumerate(INTRO_FINGERPRINT_MASKS):
+            buckets[(mask_index, word & mask)].append(target_index)
+    votes: "collections.Counter[int]" = collections.Counter()
+    for reference_index, word in enumerate(reference):
+        for mask_index, mask in enumerate(INTRO_FINGERPRINT_MASKS):
+            positions = buckets.get((mask_index, word & mask), [])
+            if len(positions) > 96:
+                continue
+            for target_index in positions:
+                votes[target_index - reference_index] += 1
+    return [candidate for candidate in votes.most_common(limit) if candidate[1] >= 12]
+
+
+def fingerprint_hamming_distance(left: int, right: int) -> int:
+    value = left ^ right
+    return (
+        BYTE_BIT_COUNTS[value & 0xFF]
+        + BYTE_BIT_COUNTS[(value >> 8) & 0xFF]
+        + BYTE_BIT_COUNTS[(value >> 16) & 0xFF]
+        + BYTE_BIT_COUNTS[(value >> 24) & 0xFF]
+    )
+
+
+def _intro_runs_for_shift(
+    reference: List[int],
+    target: List[int],
+    shift: int,
+    reference_duration_ms: Optional[int],
+    target_duration_ms: Optional[int],
+) -> List[Dict[str, Any]]:
+    overlap_start = max(0, -shift)
+    overlap_end = min(len(reference), len(target) - shift)
+    smooth_frames = max(4, round(INTRO_FINGERPRINT_HZ * 2))
+    if overlap_end - overlap_start < smooth_frames:
+        return []
+    distances = [
+        fingerprint_hamming_distance(reference[index], target[index + shift])
+        for index in range(overlap_start, overlap_end)
+    ]
+    window_total = sum(distances[:smooth_frames])
+    averages = [window_total / smooth_frames]
+    for index in range(smooth_frames, len(distances)):
+        window_total += distances[index] - distances[index - smooth_frames]
+        averages.append(window_total / smooth_frames)
+
+    raw_runs: List[Tuple[int, int]] = []
+    run_start: Optional[int] = None
+    for index, average in enumerate(averages + [99.0]):
+        if average <= 8.0 and run_start is None:
+            run_start = index
+        elif average > 8.0 and run_start is not None:
+            raw_runs.append((run_start, index))
+            run_start = None
+    merged: List[Tuple[int, int]] = []
+    allowed_gap = round(INTRO_FINGERPRINT_HZ * 1.5)
+    for start, end in raw_runs:
+        if merged and start - merged[-1][1] <= allowed_gap:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+
+    minimum = max(10, Settings.intro_analysis_min_seconds)
+    maximum = max(minimum, Settings.intro_analysis_max_seconds)
+    matches: List[Dict[str, Any]] = []
+    for start, end in merged:
+        reference_start = overlap_start + start
+        reference_end = overlap_start + end + smooth_frames - 1
+        seconds = (reference_end - reference_start) / INTRO_FINGERPRINT_HZ
+        if seconds < minimum or seconds > maximum:
+            continue
+        target_start = reference_start + shift
+        target_end = reference_end + shift
+        reference_end_seconds = INTRO_FINGERPRINT_DELAY_SECONDS + reference_end / INTRO_FINGERPRINT_HZ
+        target_end_seconds = INTRO_FINGERPRINT_DELAY_SECONDS + target_end / INTRO_FINGERPRINT_HZ
+        if reference_duration_ms and reference_end_seconds * 2000 > reference_duration_ms + 4000:
+            continue
+        if target_duration_ms and target_end_seconds * 2000 > target_duration_ms + 4000:
+            continue
+        local_start = max(0, reference_start - overlap_start)
+        local_end = min(len(distances), reference_end - overlap_start)
+        average_distance = sum(distances[local_start:local_end]) / max(1, local_end - local_start)
+        confidence = max(0.0, min(1.0, 1.0 - average_distance / 16.0))
+        if confidence < 0.5:
+            continue
+        matches.append(
+            {
+                "referenceStart": reference_start,
+                "referenceEnd": reference_end,
+                "targetStart": target_start,
+                "targetEnd": target_end,
+                "seconds": seconds,
+                "averageDistance": average_distance,
+                "confidence": confidence,
+                "score": seconds * confidence * confidence,
+            }
+        )
+    return matches
+
+
+def find_common_intro_pair(
+    reference: List[int],
+    target: List[int],
+    reference_duration_ms: Optional[int] = None,
+    target_duration_ms: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    matches: List[Dict[str, Any]] = []
+    for shift, votes in _intro_candidate_shifts(reference, target):
+        for match in _intro_runs_for_shift(
+            reference,
+            target,
+            shift,
+            reference_duration_ms,
+            target_duration_ms,
+        ):
+            match["shift"] = shift
+            match["votes"] = votes
+            matches.append(match)
+    return max(matches, key=lambda candidate: candidate["score"], default=None)
+
+
+def _intro_marker_from_frames(
+    start_frame: int,
+    end_frame: int,
+    confidence: float,
+) -> Optional[Dict[str, Any]]:
+    start_ms = round(
+        (INTRO_FINGERPRINT_DELAY_SECONDS + start_frame / INTRO_FINGERPRINT_HZ) * 1000 + 500
+    )
+    end_ms = round(
+        (INTRO_FINGERPRINT_DELAY_SECONDS + end_frame / INTRO_FINGERPRINT_HZ) * 1000 - 1500
+    )
+    return normalized_intro_marker(start_ms, end_ms, "audio", confidence)
+
+
+def align_intro_template(
+    template: List[int],
+    target: List[int],
+    target_duration_ms: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    best: Optional[Dict[str, Any]] = None
+    for shift, votes in _intro_candidate_shifts(template, target, limit=48):
+        if shift < 0 or shift + len(template) > len(target):
+            continue
+        distances = [
+            fingerprint_hamming_distance(word, target[shift + index])
+            for index, word in enumerate(template)
+        ]
+        average_distance = sum(distances) / max(1, len(distances))
+        close_fraction = sum(distance <= 10 for distance in distances) / max(1, len(distances))
+        if average_distance > 8.0 or close_fraction < 0.72:
+            continue
+        marker = _intro_marker_from_frames(
+            shift,
+            shift + len(template),
+            1.0 - average_distance / 16.0,
+        )
+        if not marker:
+            continue
+        if target_duration_ms and marker["endTimeOffset"] * 2 > target_duration_ms + 4000:
+            continue
+        candidate = {
+            "marker": marker,
+            "averageDistance": average_distance,
+            "closeFraction": close_fraction,
+            "votes": votes,
+        }
+        if best is None or (
+            candidate["averageDistance"], -candidate["closeFraction"], -candidate["votes"]
+        ) < (
+            best["averageDistance"], -best["closeFraction"], -best["votes"]
+        ):
+            best = candidate
+    return best
+
+
+def detect_intro_markers(
+    fingerprints: Dict[str, List[int]],
+    durations_ms: Dict[str, Optional[int]],
+) -> Dict[str, Dict[str, Any]]:
+    keys = [key for key, fingerprint in fingerprints.items() if fingerprint]
+    seed_count = max(2, min(len(keys), Settings.intro_analysis_seed_episodes))
+    seeds = keys[:seed_count]
+    anchor: Optional[Dict[str, Any]] = None
+    for left_index, left_key in enumerate(seeds):
+        for right_key in seeds[left_index + 1 :]:
+            match = find_common_intro_pair(
+                fingerprints[left_key],
+                fingerprints[right_key],
+                durations_ms.get(left_key),
+                durations_ms.get(right_key),
+            )
+            if match and (anchor is None or match["score"] > anchor["match"]["score"]):
+                anchor = {"key": left_key, "match": match}
+    if not anchor:
+        return {}
+    match = anchor["match"]
+    reference = fingerprints[anchor["key"]]
+    template = reference[match["referenceStart"] : match["referenceEnd"]]
+    minimum_frames = round(max(10, Settings.intro_analysis_min_seconds) * INTRO_FINGERPRINT_HZ)
+    if len(template) < minimum_frames:
+        return {}
+    markers: Dict[str, Dict[str, Any]] = {}
+    for key in keys:
+        aligned = align_intro_template(template, fingerprints[key], durations_ms.get(key))
+        if aligned:
+            markers[key] = aligned["marker"]
+    return markers if len(markers) >= 2 else {}
+
+
+def extract_intro_fingerprint(media_path: Path, duration_ms: Optional[int]) -> List[int]:
+    if not media_path.is_absolute() or not media_path.is_file():
+        return []
+    analysis_seconds = max(30, Settings.intro_analysis_window_seconds)
+    if duration_ms and duration_ms > 0:
+        analysis_seconds = min(analysis_seconds, max(1, int(duration_ms / 2000)))
+    if analysis_seconds < max(10, Settings.intro_analysis_min_seconds):
+        return []
+    command = [
+        Settings.ffmpeg_path,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        "1",
+        "-i",
+        str(media_path),
+        "-map",
+        "0:a:0",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "11025",
+        "-t",
+        str(analysis_seconds),
+        "-f",
+        "chromaprint",
+        "-fp_format",
+        "raw",
+        "pipe:1",
+    ]
+    nice_path = shutil.which("nice")
+    if nice_path:
+        command = [nice_path, "-n", "10", *command]
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        timeout=max(30, Settings.intro_analysis_timeout),
+    )
+    if process.returncode != 0 or len(process.stdout) < 4:
+        return []
+    usable = len(process.stdout) - (len(process.stdout) % 4)
+    return [value[0] for value in struct.iter_unpack("=I", process.stdout[:usable])]
+
+
+def _season_episode_rows(season_key: str) -> List[Dict[str, Any]]:
+    root = PLEX.xml(
+        f"/library/metadata/{urllib.parse.quote(season_key)}/children",
+        params={"includeMarkers": "1"},
+    )
+    rows: List[Dict[str, Any]] = []
+    for elem in root.findall("Video"):
+        rating_key = str(elem.get("ratingKey") or "")
+        part = first_part_element(elem)
+        path = Path(part.get("file", "")) if part is not None and part.get("file") else None
+        if not re.fullmatch(r"\d+", rating_key) or path is None or not path.is_absolute():
+            continue
+        rows.append(
+            {
+                "ratingKey": rating_key,
+                "updatedAt": to_int(elem.get("updatedAt")) or 0,
+                "duration": to_int(elem.get("duration")) or to_int(part.get("duration")),
+                "size": to_int(part.get("size")) or 0,
+                "index": to_int(elem.get("index")) or 0,
+                "path": path,
+                "nativeMarker": native_intro_marker_from_xml(elem),
+            }
+        )
+    rows.sort(key=lambda row: (row["index"], int(row["ratingKey"])))
+    return rows
+
+
+def _intro_season_signature(rows: List[Dict[str, Any]]) -> str:
+    values = []
+    for row in rows:
+        try:
+            file_stamp = row["path"].stat().st_mtime_ns
+        except OSError:
+            file_stamp = 0
+        values.append(
+            ":".join(
+                str(value)
+                for value in (
+                    row["ratingKey"],
+                    row["updatedAt"],
+                    row["duration"] or 0,
+                    row["size"],
+                    file_stamp,
+                )
+            )
+        )
+    return hashlib.sha256("|".join(values).encode("utf-8")).hexdigest()[:24]
+
+
+def _store_intro_season_record(season_key: str, record: Dict[str, Any]) -> None:
+    with INTRO_MARKERS_LOCK:
+        store = _load_intro_marker_store_locked()
+        store["seasons"][str(season_key)] = record
+        _save_intro_marker_store_locked(store)
+
+
+def analyze_intro_season(
+    season_key: str,
+    priority_rating_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    rows = _season_episode_rows(season_key)
+    signature = _intro_season_signature(rows)
+    existing = _intro_record_for_season(season_key)
+    if existing.get("state") == "ready" and existing.get("signature") == signature:
+        return existing
+
+    fingerprints: Dict[str, List[int]] = {}
+    durations = {row["ratingKey"]: row["duration"] for row in rows}
+    seed_target = max(2, min(len(rows), Settings.intro_analysis_seed_episodes))
+    analysis_rows = sorted(
+        rows,
+        key=lambda row: (0 if row["ratingKey"] == priority_rating_key else 1, row["index"]),
+    )
+    for row in analysis_rows:
+        fingerprint = extract_intro_fingerprint(row["path"], row["duration"])
+        if fingerprint:
+            fingerprints[row["ratingKey"]] = fingerprint
+        if len(fingerprints) >= seed_target:
+            break
+
+    markers = detect_intro_markers(fingerprints, durations) if len(fingerprints) >= 2 else {}
+    if markers:
+        _store_intro_season_record(
+            season_key,
+            {
+                "state": "analyzing",
+                "reason": "detected_partial",
+                "signature": signature,
+                "updatedAt": int(time.time()),
+                "episodeCount": len(rows),
+                "analyzedCount": len(fingerprints),
+                "episodeVersions": {
+                    row["ratingKey"]: str(row["updatedAt"] or 0)
+                    for row in rows
+                },
+                "markers": markers,
+            },
+        )
+        for row in analysis_rows:
+            if row["ratingKey"] in fingerprints:
+                continue
+            fingerprint = extract_intro_fingerprint(row["path"], row["duration"])
+            if fingerprint:
+                fingerprints[row["ratingKey"]] = fingerprint
+        markers = detect_intro_markers(fingerprints, durations)
+    for row in rows:
+        if row["nativeMarker"]:
+            markers.pop(row["ratingKey"], None)
+
+    if len(rows) < 2:
+        reason = "insufficient_episodes"
+    elif markers:
+        reason = "detected"
+    else:
+        reason = "no_common_intro"
+    record = {
+        "state": "ready",
+        "reason": reason,
+        "signature": signature,
+        "updatedAt": int(time.time()),
+        "episodeCount": len(rows),
+        "analyzedCount": len(fingerprints),
+        "episodeVersions": {
+            row["ratingKey"]: str(row["updatedAt"] or 0)
+            for row in rows
+        },
+        "markers": markers,
+    }
+    _store_intro_season_record(season_key, record)
+    return record
+
+
+def _run_intro_analysis_job(season_key: str, priority_rating_key: Optional[str] = None) -> None:
+    with INTRO_JOBS_LOCK:
+        INTRO_JOBS[season_key] = {"state": "analyzing", "startedAt": int(time.time())}
+    try:
+        analyze_intro_season(season_key, priority_rating_key)
+    except Exception as exc:
+        print(f"Intro analysis failed for season {season_key}: {exc}", file=sys.stderr)
+        with INTRO_JOBS_LOCK:
+            INTRO_JOBS[season_key] = {
+                "state": "failed",
+                "startedAt": int(time.time()),
+                "reason": "analysis_failed",
+            }
+    else:
+        with INTRO_JOBS_LOCK:
+            INTRO_JOBS.pop(season_key, None)
+
+
+def schedule_intro_analysis(item: Dict[str, Any]) -> bool:
+    if not Settings.intro_analysis_enabled or item.get("type") != "episode":
+        return False
+    if (item.get("introMarker") or {}).get("source") == "plex":
+        return False
+    rating_key = str(item.get("ratingKey") or "")
+    season_key = str(item.get("parentRatingKey") or "")
+    if not re.fullmatch(r"\d+", rating_key) or not re.fullmatch(r"\d+", season_key):
+        return False
+    if _intro_record_current_for_item(item):
+        return False
+    now = int(time.time())
+    with INTRO_JOBS_LOCK:
+        job = INTRO_JOBS.get(season_key)
+        if job and job.get("state") in {"queued", "analyzing"}:
+            return False
+        if job and job.get("state") == "failed" and now - int(job.get("startedAt") or 0) < 21600:
+            return False
+        INTRO_JOBS[season_key] = {"state": "queued", "startedAt": now}
+    INTRO_ANALYSIS_EXECUTOR.submit(_run_intro_analysis_job, season_key, rating_key)
+    return True
+
+
+def prepare_intro_analysis(item: Dict[str, Any]) -> None:
+    if item.get("type") != "episode":
+        return
+    current = _intro_record_current_for_item(item)
+    schedule_intro_analysis(item)
+    native = item.get("introMarker") if (item.get("introMarker") or {}).get("source") == "plex" else None
+    status = intro_analysis_status(item.get("ratingKey"), item.get("parentRatingKey"), native)
+    cached = cached_intro_marker_for_episode(
+        item.get("ratingKey"),
+        item.get("parentRatingKey"),
+    ) if not native else None
+    if cached:
+        item["introMarker"] = cached
+    elif not native and not current and status.get("state") in {"queued", "analyzing"}:
+        item["introMarker"] = None
+    elif not native:
+        item["introMarker"] = cached
+    item["introAnalysis"] = status
 
 
 class MediaDeletionError(Exception):
@@ -3761,7 +4405,7 @@ def metadata_items_for_rating_keys(
         joined = urllib.parse.quote(",".join(chunk), safe=",")
         root = PLEX.xml(
             f"/library/metadata/{joined}",
-            params={"includeGuids": "1", "includeCollections": "1"},
+            params={"includeGuids": "1", "includeCollections": "1", "includeMarkers": "1"},
         )
         for item in items_from_container(root, detailed=detailed):
             rating_key = str(item.get("ratingKey") or "")
@@ -4203,6 +4847,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.api_search(query)
         elif path == "/api/metadata-batch":
             self.api_metadata_batch(query)
+        elif path == "/api/intro-marker":
+            self.api_intro_marker(query)
         elif path == "/api/image":
             self.handle_image(method, query)
         elif path == "/api/stream":
@@ -4933,9 +5579,15 @@ class AppHandler(BaseHTTPRequestHandler):
         def load() -> Dict[str, Any]:
             root = PLEX.xml(
                 f"/library/metadata/{urllib.parse.quote(rating_key)}",
-                params={"includeGuids": "1", "includeCollections": "1"},
+                params={
+                    "includeGuids": "1",
+                    "includeCollections": "1",
+                    "includeMarkers": "1",
+                },
             )
             items = items_from_container(root, detailed=True)
+            for item in items:
+                prepare_intro_analysis(item)
             return {"item": items[0] if items else None}
 
         refresh = one(query or {}, "refresh", "").strip().lower() in {"1", "true", "yes"}
@@ -4972,11 +5624,48 @@ class AppHandler(BaseHTTPRequestHandler):
                 rating_key = str(item.get("ratingKey") or "")
                 item["inMyList"] = rating_key in my_list
                 item["inPlayQueue"] = rating_key in queue
+                prepare_intro_analysis(item)
             return {"ratingKeys": rating_keys, "items": items}
 
         cache_key = f"metadata-batch:{id(PLEX)}:{','.join(rating_keys)}"
         payload = API_CACHE.get_or_load(cache_key, 10.0, load)
         self.send_json(payload, cache_control=BROWSE_CACHE_CONTROL)
+
+    def api_intro_marker(self, query: Dict[str, List[str]]) -> None:
+        rating_key = one(query, "ratingKey", "").strip()
+        season_key = one(query, "seasonKey", "").strip()
+        if not re.fullmatch(r"\d+", rating_key):
+            self.send_json({"error": "invalid_rating_key"}, status=400)
+            return
+        if season_key and not re.fullmatch(r"\d+", season_key):
+            self.send_json({"error": "invalid_season_key"}, status=400)
+            return
+
+        status = intro_analysis_status(rating_key, season_key) if season_key else {"state": "idle"}
+        marker = cached_intro_marker_for_episode(rating_key, season_key) if season_key else None
+        if status.get("state") == "idle":
+            root = PLEX.xml(
+                f"/library/metadata/{urllib.parse.quote(rating_key)}",
+                params={"includeMarkers": "1"},
+            )
+            items = items_from_container(root, detailed=True)
+            item = items[0] if items else None
+            if not item or item.get("type") != "episode":
+                self.send_json({"error": "episode_not_found"}, status=404)
+                return
+            prepare_intro_analysis(item)
+            season_key = str(item.get("parentRatingKey") or season_key)
+            marker = item.get("introMarker")
+            status = item.get("introAnalysis") or intro_analysis_status(rating_key, season_key)
+        self.send_json(
+            {
+                "ratingKey": rating_key,
+                "seasonKey": season_key or None,
+                "introMarker": marker,
+                "introAnalysis": status,
+            },
+            cache_control="no-store",
+        )
 
     def api_media_match(self, method: str, query: Dict[str, List[str]]) -> None:
         if method not in {"GET", "POST"}:

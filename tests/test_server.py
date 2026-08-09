@@ -2,6 +2,7 @@ import gzip
 import io
 import json
 import os
+import random
 import threading
 import time
 import unittest
@@ -380,7 +381,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.24.7", responses[0][1]["version"])
+        self.assertEqual("0.25.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -396,7 +397,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.24.7", responses[0][1]["version"])
+        self.assertEqual("0.25.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
@@ -420,6 +421,50 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(400, responses[0][0])
         self.assertEqual("invalid_rating_keys", responses[0][1]["error"])
+
+
+class IntroAnalysisTests(unittest.TestCase):
+    @staticmethod
+    def words(seed, count):
+        generator = random.Random(seed)
+        return [generator.getrandbits(32) for _ in range(count)]
+
+    def test_native_plex_intro_marker_is_preferred(self):
+        episode = ET.fromstring(
+            '<Video ratingKey="42" type="episode">'
+            '<Marker type="intro" startTimeOffset="31000" endTimeOffset="92000" />'
+            '</Video>'
+        )
+
+        marker = server.native_intro_marker_from_xml(episode)
+
+        self.assertEqual("plex", marker["source"])
+        self.assertEqual(31000, marker["startTimeOffset"])
+        self.assertEqual(92000, marker["endTimeOffset"])
+
+    def test_audio_fingerprint_finds_the_same_intro_after_different_cold_opens(self):
+        common = self.words(9, 480)
+        first = self.words(1, 500) + common + self.words(2, 900)
+        second_common = [word ^ 0x00010001 for word in common]
+        second = self.words(3, 800) + second_common + self.words(4, 600)
+
+        markers = server.detect_intro_markers(
+            {"first": first, "second": second},
+            {"first": 600000, "second": 600000},
+        )
+
+        self.assertEqual({"first", "second"}, set(markers))
+        self.assertAlmostEqual(65000, markers["first"]["startTimeOffset"], delta=2500)
+        self.assertAlmostEqual(102000, markers["second"]["startTimeOffset"], delta=2500)
+        self.assertGreater(markers["second"]["confidence"], 0.8)
+
+    def test_unrelated_episode_audio_does_not_create_a_marker(self):
+        markers = server.detect_intro_markers(
+            {"first": self.words(11, 1800), "second": self.words(22, 1800)},
+            {"first": 600000, "second": 600000},
+        )
+
+        self.assertEqual({}, markers)
 
 
 class PlaybackCompatibilityTests(unittest.TestCase):

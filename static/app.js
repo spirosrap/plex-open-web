@@ -69,6 +69,10 @@ const state = {
   lastHlsRecoveryAt: 0,
   mediaSessionHandlersConfigured: false,
   lastMediaSessionPositionAt: 0,
+  introPollTimer: null,
+  introPollGeneration: 0,
+  introPollAttempts: 0,
+  introSkippedRatingKey: null,
   subtitleSelectionPromise: Promise.resolve(),
   deviceSaveInProgress: false,
   deviceObjectUrls: [],
@@ -220,6 +224,7 @@ const el = {
   playerUpNext: document.querySelector("#player-up-next"),
   playerUpNextText: document.querySelector("#player-up-next-text"),
   playerUpNextCancel: document.querySelector("#player-up-next-cancel"),
+  playerSkipIntro: document.querySelector("#player-skip-intro"),
   player: document.querySelector("#player"),
   subtitleDialog: document.querySelector("#subtitle-dialog"),
   subtitleClose: document.querySelector("#subtitle-close"),
@@ -2140,6 +2145,96 @@ function playbackTimeMs() {
   return Math.floor(el.player.currentTime * 1000);
 }
 
+
+function introMarkerFor(item = state.playerItem) {
+  if (item?.type !== "episode") return null;
+  const marker = item.introMarker;
+  const startTimeOffset = Number(marker?.startTimeOffset);
+  const endTimeOffset = Number(marker?.endTimeOffset);
+  if (
+    marker?.type !== "intro"
+    || !Number.isFinite(startTimeOffset)
+    || !Number.isFinite(endTimeOffset)
+    || startTimeOffset < 0
+    || endTimeOffset <= startTimeOffset + 3000
+  ) {
+    return null;
+  }
+  return { ...marker, startTimeOffset, endTimeOffset };
+}
+
+function updateSkipIntroControl() {
+  const item = state.playerItem;
+  const marker = introMarkerFor(item);
+  const currentTime = playbackTimeMs();
+  const alreadySkipped = Boolean(
+    item?.ratingKey && state.introSkippedRatingKey === String(item.ratingKey),
+  );
+  el.playerSkipIntro.hidden = Boolean(
+    !marker
+    || alreadySkipped
+    || currentTime < Math.max(0, marker.startTimeOffset - 2000)
+    || currentTime >= marker.endTimeOffset - 500
+  );
+}
+
+function skipCurrentIntro() {
+  const item = state.playerItem;
+  const marker = introMarkerFor(item);
+  if (!item?.ratingKey || !marker) return;
+  state.introSkippedRatingKey = String(item.ratingKey);
+  seekPlatformPlayback(marker.endTimeOffset / 1000 + 0.2, { fast: true });
+  rememberLocalProgress(item, playbackTimeMs(), playbackDurationMs(item));
+  updateSkipIntroControl();
+}
+
+function stopIntroMarkerPolling() {
+  state.introPollGeneration += 1;
+  state.introPollAttempts = 0;
+  if (state.introPollTimer) {
+    clearTimeout(state.introPollTimer);
+    state.introPollTimer = null;
+  }
+}
+
+function introAnalysisFinished(item) {
+  return ["ready", "failed", "disabled", "unavailable"].includes(item?.introAnalysis?.state);
+}
+
+function startIntroMarkerPolling(item = state.playerItem) {
+  stopIntroMarkerPolling();
+  updateSkipIntroControl();
+  if (item?.type !== "episode" || !item.ratingKey || introMarkerFor(item) || introAnalysisFinished(item)) {
+    return;
+  }
+  const generation = state.introPollGeneration;
+  const ratingKey = String(item.ratingKey);
+  const poll = async () => {
+    if (
+      generation !== state.introPollGeneration
+      || String(state.playerItem?.ratingKey || "") !== ratingKey
+      || state.introPollAttempts >= 60
+    ) {
+      return;
+    }
+    state.introPollAttempts += 1;
+    try {
+      const params = new URLSearchParams({ ratingKey });
+      if (item.parentRatingKey) params.set("seasonKey", item.parentRatingKey);
+      const data = await api(`/api/intro-marker?${params}`);
+      if (generation !== state.introPollGeneration) return;
+      item.introMarker = data.introMarker || null;
+      item.introAnalysis = data.introAnalysis || item.introAnalysis;
+      updateSkipIntroControl();
+      if (introMarkerFor(item) || introAnalysisFinished(item)) return;
+    } catch {
+      if (state.introPollAttempts >= 15) return;
+    }
+    state.introPollTimer = setTimeout(poll, 4000);
+  };
+  state.introPollTimer = setTimeout(poll, 1500);
+}
+
 function activatePlatformPlaybackSession() {
   try {
     if (navigator.audioSession && "type" in navigator.audioSession) {
@@ -3558,6 +3653,9 @@ function scheduleAutoplayNext() {
 
 async function playItem(item, { startFromBeginning = false } = {}) {
   cancelAutoplayCountdown();
+  stopIntroMarkerPolling();
+  state.introSkippedRatingKey = null;
+  el.playerSkipIntro.hidden = true;
   const preparationId = ++state.playerPreparationId;
   state.playerItem = item;
   el.playerTitle.textContent = displayTitle(item);
@@ -3628,6 +3726,7 @@ async function playItem(item, { startFromBeginning = false } = {}) {
     pollSavedPlayback(item, false);
   }
   updatePlayerEpisodeControls(item);
+  startIntroMarkerPolling(item);
   loadPlayerEpisodeNeighbors(item);
 }
 
@@ -3975,6 +4074,7 @@ el.playerUpNextCancel.addEventListener("click", cancelAutoplayCountdown);
 el.playerStartOver.addEventListener("click", () => {
   restartCurrentPlayback();
 });
+el.playerSkipIntro.addEventListener("click", skipCurrentIntro);
 el.playerClose.addEventListener("click", () => el.playerDialog.close());
 el.playerDialog.addEventListener("close", async () => {
   state.playerPreparationId += 1;
@@ -3982,6 +4082,8 @@ el.playerDialog.addEventListener("close", async () => {
   const reloadFilteredView = state.stack.length === 0 && ["continue", "unwatched"].includes(state.selectedView);
   const progressReport = reportPlaybackProgress("stopped", { force: true, keepalive: true });
   cancelAutoplayCountdown();
+  stopIntroMarkerPolling();
+  state.introSkippedRatingKey = null;
   state.playerItem = null;
   state.playerNeighbors = null;
   stopProgressReporting();
@@ -4004,6 +4106,7 @@ el.playerDialog.addEventListener("close", async () => {
   el.playerDeviceDelete.hidden = true;
   el.playerDownloadOriginal.hidden = true;
   el.playerStartOver.hidden = true;
+  el.playerSkipIntro.hidden = true;
   el.autoplayNextLabel.hidden = true;
   el.playerNextEpisode.hidden = true;
   state.usingSavedPlayback = false;
@@ -4098,13 +4201,20 @@ el.player.addEventListener("timeupdate", () => {
   if (!item?.ratingKey) return;
   rememberLocalProgress(item, playbackTimeMs(), playbackDurationMs(item));
   updatePlayerStartOverControl();
+  updateSkipIntroControl();
   updatePlatformPlaybackPosition();
   refreshActiveSubtitleWindow();
 });
-el.player.addEventListener("loadedmetadata", () => updatePlatformPlaybackPosition({ force: true }));
+el.player.addEventListener("loadedmetadata", () => {
+  updatePlatformPlaybackPosition({ force: true });
+  updateSkipIntroControl();
+});
 el.player.addEventListener("durationchange", () => updatePlatformPlaybackPosition({ force: true }));
 el.player.addEventListener("ratechange", () => updatePlatformPlaybackPosition({ force: true }));
-el.player.addEventListener("seeked", refreshActiveSubtitleWindow);
+el.player.addEventListener("seeked", () => {
+  refreshActiveSubtitleWindow();
+  updateSkipIntroControl();
+});
 el.player.addEventListener("enterpictureinpicture", activatePlatformPlaybackSession);
 el.player.addEventListener("webkitpresentationmodechanged", activatePlatformPlaybackSession);
 el.player.addEventListener("ended", () => {
