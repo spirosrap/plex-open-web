@@ -43,6 +43,24 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.24.6
+
+**Added**
+
+- Added automatic recovery when Plex retires an inactive HLS transcode session.
+- Added a browser-side HLS stall watchdog that renews an unresponsive stream while preserving the current position.
+
+**Improved**
+
+- Resuming after a long pause now refreshes the HLS source before Safari can become stuck retrying an expired segment.
+- Server-side segment recovery keeps the same playback identity, allowing most stale-session repairs to complete without rebuilding the visible player.
+- Recovery retains the active title, resume position, subtitle choice, playback rate, and autoplay state.
+
+**Fixed**
+
+- Fixed Safari receiving repeated HLS segment `404` responses after a movie or episode remained paused for several minutes.
+- Fixed Play appearing to resume while the video remained frozen until the stream was closed and reopened.
+
 ### 0.24.5
 
 **Added**

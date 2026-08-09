@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.24.5"
+APP_VERSION = "0.24.6"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -53,6 +53,7 @@ HLS_SEGMENT_PATTERN = re.compile(r"segment-\d{5}\.ts")
 PLEX_HLS_SESSION_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 PLEX_HLS_VARIANT_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 PLEX_HLS_SEGMENT_PATTERN = re.compile(r"^\d{5}\.ts$")
+PLEX_HLS_WARMUP_SEGMENT = "00000.ts"
 MATCH_GUID_PATTERN = re.compile(r"^plex://(movie|show)/[A-Za-z0-9._-]{1,160}$")
 MATCH_LANGUAGE_PATTERN = re.compile(r"^[a-z]{2}(?:-[A-Z]{2})?$")
 JSON_COMPRESSION_MIN_BYTES = 1024
@@ -559,6 +560,7 @@ HLS_JOBS: Dict[str, Dict[str, Any]] = {}
 HLS_JOBS_LOCK = threading.Lock()
 PLEX_HLS_SESSIONS: Dict[str, Dict[str, Any]] = {}
 PLEX_HLS_SESSIONS_LOCK = threading.Lock()
+PLEX_HLS_RECOVERY_LOCK = threading.Lock()
 
 
 def subtitle_codec_aliases(codec: Optional[str]) -> set:
@@ -1579,11 +1581,16 @@ def plex_hls_transcode_params(
     }
 
 
-def plex_hls_master_text(session_id: str, raw_manifest: str) -> Tuple[str, set]:
+def plex_hls_master_text(
+    session_id: str,
+    raw_manifest: str,
+    upstream_session_id: Optional[str] = None,
+) -> Tuple[str, set]:
     lines: List[str] = []
     variants = set()
+    upstream_id = upstream_session_id or session_id
     pattern = re.compile(
-        rf"(?:^|/)session/{re.escape(session_id)}/([A-Za-z0-9_-]+)/(?:index\.m3u8)$"
+        rf"(?:^|/)session/{re.escape(upstream_id)}/([A-Za-z0-9_-]+)/(?:index\.m3u8)$"
     )
     for raw_line in raw_manifest.splitlines():
         line = raw_line.strip()
@@ -1641,10 +1648,14 @@ def stop_plex_hls_upstream(session_id: str) -> None:
 def stop_plex_hls_session(session_id: str) -> bool:
     with PLEX_HLS_SESSIONS_LOCK:
         session = PLEX_HLS_SESSIONS.pop(session_id, None)
+    upstream_id = session_id
     if session:
         session["stopped"] = True
         session["event"].set()
-    stop_plex_hls_upstream(session_id)
+        candidate = str(session.get("upstreamId") or session_id).strip().lower()
+        if PLEX_HLS_SESSION_PATTERN.fullmatch(candidate):
+            upstream_id = candidate
+    stop_plex_hls_upstream(upstream_id)
     return session is not None
 
 
@@ -1667,6 +1678,7 @@ def schedule_plex_hls_idle_stop(
 def expire_plex_hls_session_if_idle(session_id: str, token: str, idle_seconds: int) -> None:
     reschedule_after: Optional[float] = None
     expired = False
+    upstream_id = session_id
     now = time.monotonic()
     with PLEX_HLS_SESSIONS_LOCK:
         session = PLEX_HLS_SESSIONS.get(session_id)
@@ -1679,11 +1691,14 @@ def expire_plex_hls_session_if_idle(session_id: str, token: str, idle_seconds: i
             PLEX_HLS_SESSIONS.pop(session_id, None)
             session["stopped"] = True
             session["event"].set()
+            candidate = str(session.get("upstreamId") or session_id).strip().lower()
+            if PLEX_HLS_SESSION_PATTERN.fullmatch(candidate):
+                upstream_id = candidate
             expired = True
     if reschedule_after is not None:
         schedule_plex_hls_idle_stop(session_id, token, idle_seconds, reschedule_after)
     elif expired:
-        stop_plex_hls_upstream(session_id)
+        stop_plex_hls_upstream(upstream_id)
 
 
 def plex_hls_background_idle_seconds(requested_idle_seconds: Optional[int] = None) -> int:
@@ -1720,14 +1735,24 @@ def prune_plex_hls_sessions() -> None:
     cutoff = time.monotonic() - max(300, Settings.hls_cache_ttl)
     with PLEX_HLS_SESSIONS_LOCK:
         expired = [
-            session_id
+            (
+                session_id,
+                str(session.get("upstreamId") or session_id).strip().lower(),
+            )
             for session_id, session in PLEX_HLS_SESSIONS.items()
             if session.get("lastAccess", 0) < cutoff
         ]
-        for session_id in expired:
-            PLEX_HLS_SESSIONS.pop(session_id, None)
-    for session_id in expired:
-        stop_plex_hls_upstream(session_id)
+        for session_id, _ in expired:
+            session = PLEX_HLS_SESSIONS.pop(session_id, None)
+            if session:
+                session["stopped"] = True
+                session["event"].set()
+    for session_id, upstream_id in expired:
+        stop_plex_hls_upstream(
+            upstream_id
+            if PLEX_HLS_SESSION_PATTERN.fullmatch(upstream_id)
+            else session_id
+        )
 
 
 def ensure_plex_hls_session(
@@ -1736,6 +1761,8 @@ def ensure_plex_hls_session(
     remote_quality: bool = False,
     media_index: int = 0,
     part_index: int = 0,
+    *,
+    upstream_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     prune_plex_hls_sessions()
     now = time.monotonic()
@@ -1750,12 +1777,16 @@ def ensure_plex_hls_session(
             raise ValueError("plex_hls_session_conflict")
         owner = session is None
         if owner:
+            upstream_id = str(upstream_session_id or session_id).strip().lower()
+            if not PLEX_HLS_SESSION_PATTERN.fullmatch(upstream_id):
+                raise ValueError("invalid_plex_hls_upstream_session")
             session = {
                 "state": "starting",
                 "ratingKey": rating_key,
                 "remoteQuality": remote_quality,
                 "mediaIndex": media_index,
                 "partIndex": part_index,
+                "upstreamId": upstream_id,
                 "lastAccess": now,
                 "event": threading.Event(),
                 "stopped": False,
@@ -1775,14 +1806,15 @@ def ensure_plex_hls_session(
         raise RuntimeError(session.get("message") or "Plex HLS session did not start")
 
     try:
+        upstream_id = str(session.get("upstreamId") or session_id)
         params = plex_hls_transcode_params(
             rating_key,
-            session_id,
+            upstream_id,
             remote_quality,
             media_index,
             part_index,
         )
-        headers = plex_hls_headers(session_id)
+        headers = plex_hls_headers(upstream_id)
         with PLEX.open(
             "/video/:/transcode/universal/decision",
             params=params,
@@ -1797,7 +1829,7 @@ def ensure_plex_hls_session(
             timeout=Settings.hls_startup_timeout,
         ) as response:
             raw_master = response.read().decode("utf-8")
-        master, variants = plex_hls_master_text(session_id, raw_master)
+        master, variants = plex_hls_master_text(session_id, raw_master, upstream_id)
         with PLEX_HLS_SESSIONS_LOCK:
             current = PLEX_HLS_SESSIONS.get(session_id)
             if current is not session or session.get("stopped"):
@@ -1814,7 +1846,7 @@ def ensure_plex_hls_session(
                 )
                 session["event"].set()
         if stopped:
-            stop_plex_hls_upstream(session_id)
+            stop_plex_hls_upstream(upstream_id)
             raise RuntimeError("Plex HLS session was stopped")
         return session
     except Exception as exc:
@@ -1824,6 +1856,41 @@ def ensure_plex_hls_session(
                 session.update({"state": "error", "message": str(exc)[:500]})
                 session["event"].set()
         raise
+
+
+def recover_plex_hls_session(session_id: str, failed_session: Dict[str, Any]) -> Dict[str, Any]:
+    rating_key = str(failed_session.get("ratingKey") or "").strip()
+    if not rating_key:
+        raise RuntimeError("Plex HLS session cannot be recovered without an item id")
+    remote_quality = bool(failed_session.get("remoteQuality"))
+    media_index = int(failed_session.get("mediaIndex") or 0)
+    part_index = int(failed_session.get("partIndex") or 0)
+    failed_upstream_id = str(failed_session.get("upstreamId") or session_id).strip().lower()
+
+    # Plex retires idle transcode sessions independently of our browser lease. Serialize
+    # replacement so concurrent segment retries cannot stop a newly created session.
+    with PLEX_HLS_RECOVERY_LOCK:
+        should_stop = False
+        with PLEX_HLS_SESSIONS_LOCK:
+            current = PLEX_HLS_SESSIONS.get(session_id)
+            if current is failed_session:
+                PLEX_HLS_SESSIONS.pop(session_id, None)
+                failed_session["stopped"] = True
+                failed_session["event"].set()
+                should_stop = True
+        if should_stop:
+            stop_plex_hls_upstream(failed_upstream_id)
+        replacement_upstream_id = secrets.token_hex(16)
+        while replacement_upstream_id == failed_upstream_id:
+            replacement_upstream_id = secrets.token_hex(16)
+        return ensure_plex_hls_session(
+            session_id,
+            rating_key,
+            remote_quality,
+            media_index,
+            part_index,
+            upstream_session_id=replacement_upstream_id,
+        )
 
 
 def active_plex_hls_session(session_id: str, variant: str) -> Optional[Dict[str, Any]]:
@@ -1839,6 +1906,24 @@ def active_plex_hls_session(session_id: str, variant: str) -> Optional[Dict[str,
             return None
         session["lastAccess"] = time.monotonic()
         return session
+
+
+def fetch_plex_hls_playlist(
+    session_id: str,
+    variant: str,
+    session: Dict[str, Any],
+) -> str:
+    upstream_id = str(session.get("upstreamId") or session_id).strip().lower()
+    if not PLEX_HLS_SESSION_PATTERN.fullmatch(upstream_id):
+        raise ValueError("invalid_plex_hls_upstream_session")
+    path = f"/video/:/transcode/universal/session/{upstream_id}/{variant}/index.m3u8"
+    with PLEX.open(
+        path,
+        params={"X-Plex-Incomplete-Segments": "1"},
+        headers=plex_hls_headers(upstream_id),
+        timeout=Settings.hls_startup_timeout,
+    ) as response:
+        return response.read().decode("utf-8")
 
 
 def metadata_item_for_rating_key(rating_key: str) -> Optional[Dict[str, Any]]:
@@ -5432,15 +5517,8 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        path = f"/video/:/transcode/universal/session/{session_id}/{variant}/index.m3u8"
         try:
-            with PLEX.open(
-                path,
-                params={"X-Plex-Incomplete-Segments": "1"},
-                headers=plex_hls_headers(session_id),
-                timeout=Settings.hls_startup_timeout,
-            ) as response:
-                raw_manifest = response.read().decode("utf-8")
+            raw_manifest = fetch_plex_hls_playlist(session_id, variant, session)
             body = plex_hls_playlist_text(session_id, variant, raw_manifest).encode("utf-8")
         except (UnicodeDecodeError, ValueError, RuntimeError, urllib.error.URLError) as exc:
             self.send_json(
@@ -5471,17 +5549,69 @@ class AppHandler(BaseHTTPRequestHandler):
         if not session or not PLEX_HLS_SEGMENT_PATTERN.fullmatch(name):
             self.send_json({"error": "plex_hls_segment_not_found"}, status=404)
             return
-        path = f"/video/:/transcode/universal/session/{session_id}/{variant}/{name}"
-        headers = plex_hls_headers(session_id)
-        if self.headers.get("Range"):
-            headers["Range"] = self.headers["Range"]
+        upstream_id = str(session.get("upstreamId") or session_id)
+        path = f"/video/:/transcode/universal/session/{upstream_id}/{variant}/{name}"
+
+        def segment_headers() -> Dict[str, str]:
+            result = plex_hls_headers(upstream_id)
+            if self.headers.get("Range"):
+                result["Range"] = self.headers["Range"]
+            return result
+
+        def open_segment(
+            segment_path: Optional[str] = None,
+            segment_method: str = method,
+            retry_startup: bool = False,
+        ) -> Any:
+            requested_path = segment_path or path
+            delays = (0.0, 0.15, 0.3, 0.6, 1.0, 1.5) if retry_startup else (0.0,)
+            for attempt, delay in enumerate(delays):
+                if delay:
+                    time.sleep(delay)
+                try:
+                    return PLEX.open(
+                        requested_path,
+                        headers=segment_headers(),
+                        timeout=Settings.stream_timeout,
+                        method=segment_method,
+                    )
+                except urllib.error.HTTPError as exc:
+                    if exc.code not in {404, 410} or attempt == len(delays) - 1:
+                        raise
+                    exc.close()
+            raise RuntimeError("Plex HLS segment did not become available")
+
         try:
-            with PLEX.open(
-                path,
-                headers=headers,
-                timeout=Settings.stream_timeout,
-                method=method,
-            ) as response:
+            try:
+                response = open_segment()
+            except urllib.error.HTTPError as exc:
+                if exc.code not in {404, 410}:
+                    raise
+                exc.close()
+                recovered = recover_plex_hls_session(session_id, session)
+                if variant not in recovered.get("variants", set()):
+                    raise RuntimeError("Recovered Plex HLS session changed variants")
+                upstream_id = str(recovered.get("upstreamId") or session_id)
+                path = (
+                    f"/video/:/transcode/universal/session/{upstream_id}/"
+                    f"{variant}/{name}"
+                )
+                recovered_playlist = fetch_plex_hls_playlist(
+                    session_id,
+                    variant,
+                    recovered,
+                )
+                plex_hls_playlist_text(session_id, variant, recovered_playlist)
+                if name != PLEX_HLS_WARMUP_SEGMENT:
+                    warmup_path = (
+                        f"/video/:/transcode/universal/session/{upstream_id}/"
+                        f"{variant}/{PLEX_HLS_WARMUP_SEGMENT}"
+                    )
+                    with open_segment(warmup_path, "GET", True) as warmup:
+                        while read_stream_chunk(warmup):
+                            pass
+                response = open_segment(retry_startup=True)
+            with response:
                 self.send_response(response.status)
                 self.send_header("Content-Type", response.headers.get("Content-Type", "video/mp2t"))
                 for header in ["Content-Length", "Content-Range", "Accept-Ranges", "ETag"]:
@@ -5501,6 +5631,11 @@ class AppHandler(BaseHTTPRequestHandler):
         except urllib.error.URLError as exc:
             self.send_json(
                 {"error": "plex_hls_segment_failed", "message": str(exc)},
+                status=502,
+            )
+        except (ET.ParseError, UnicodeDecodeError, ValueError, RuntimeError) as exc:
+            self.send_json(
+                {"error": "plex_hls_recovery_failed", "message": str(exc)},
                 status=502,
             )
 

@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 import tempfile
+import urllib.error
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -379,7 +380,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.24.5", responses[0][1]["version"])
+        self.assertEqual("0.24.6", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -395,7 +396,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.24.5", responses[0][1]["version"])
+        self.assertEqual("0.24.6", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
@@ -600,10 +601,12 @@ class PlaybackCompatibilityTests(unittest.TestCase):
 
     def test_plex_hls_manifests_are_rewritten_as_complete_vod(self):
         session_id = "a" * 32
+        upstream_session_id = "9" * 32
         master, variants = server.plex_hls_master_text(
             session_id,
             "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n"
-            f"session/{session_id}/base/index.m3u8?X-Plex-Incomplete-Segments=1\n",
+            f"session/{upstream_session_id}/base/index.m3u8?X-Plex-Incomplete-Segments=1\n",
+            upstream_session_id,
         )
         playlist = server.plex_hls_playlist_text(
             session_id,
@@ -614,6 +617,8 @@ class PlaybackCompatibilityTests(unittest.TestCase):
 
         self.assertEqual({"base"}, variants)
         self.assertIn("/api/plex-hls-playlist?id=", master)
+        self.assertIn(session_id, master)
+        self.assertNotIn(upstream_session_id, master)
         self.assertIn("#EXT-X-PLAYLIST-TYPE:VOD", playlist)
         self.assertIn("/api/plex-hls-segment?id=", playlist)
         self.assertIn("name=00000.ts", playlist)
@@ -667,6 +672,109 @@ class PlaybackCompatibilityTests(unittest.TestCase):
             ],
             [call[0] for call in plex.calls],
         )
+
+    def test_stale_plex_hls_session_restarts_with_the_same_playback_identity(self):
+        session_id = "3" * 32
+        failed_upstream_id = "8" * 32
+        event = threading.Event()
+        failed = {
+            "state": "ready",
+            "ratingKey": "701",
+            "remoteQuality": True,
+            "mediaIndex": 2,
+            "partIndex": 1,
+            "variants": {"base"},
+            "upstreamId": failed_upstream_id,
+            "event": event,
+        }
+        replacement = {"state": "ready", "variants": {"base"}}
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = failed
+
+        with mock.patch.object(server, "stop_plex_hls_upstream") as stop, mock.patch.object(
+            server, "ensure_plex_hls_session", return_value=replacement
+        ) as ensure:
+            recovered = server.recover_plex_hls_session(session_id, failed)
+
+        self.assertIs(replacement, recovered)
+        self.assertTrue(failed["stopped"])
+        self.assertTrue(event.is_set())
+        stop.assert_called_once_with(failed_upstream_id)
+        self.assertEqual((session_id, "701", True, 2, 1), ensure.call_args.args)
+        replacement_upstream_id = ensure.call_args.kwargs["upstream_session_id"]
+        self.assertRegex(replacement_upstream_id, r"^[a-f0-9]{32}$")
+        self.assertNotEqual(failed_upstream_id, replacement_upstream_id)
+
+    def test_missing_plex_hls_segment_recovers_and_retries_in_the_same_request(self):
+        class SegmentResponse(io.BytesIO):
+            status = 200
+            headers = {"Content-Length": "7", "Content-Type": "video/mp2t"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.close()
+                return False
+
+        session_id = "4" * 32
+        replacement_upstream_id = "5" * 32
+        session = {
+            "state": "ready",
+            "ratingKey": "701",
+            "variants": {"base"},
+            "event": threading.Event(),
+        }
+        upstream = mock.Mock()
+        upstream.open.side_effect = [
+            urllib.error.HTTPError("segment", 404, "missing", {}, io.BytesIO()),
+            FakeBytesResponse(
+                b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+                b"#EXTINF:10,\n00000.ts\n#EXT-X-ENDLIST\n"
+            ),
+            SegmentResponse(b"warm-up"),
+            SegmentResponse(b"segment"),
+        ]
+        handler = object.__new__(server.AppHandler)
+        handler.headers = {}
+        handler.wfile = io.BytesIO()
+        statuses = []
+        json_responses = []
+        handler.require_auth = lambda: None
+        handler.send_response = statuses.append
+        handler.send_header = lambda key, value: None
+        handler.end_headers = lambda: None
+        handler.send_json = lambda body, status=200, **kwargs: json_responses.append((status, body))
+
+        with mock.patch.object(server, "PLEX", upstream), mock.patch.object(
+            server, "active_plex_hls_session", return_value=session
+        ), mock.patch.object(
+            server,
+            "recover_plex_hls_session",
+            return_value={"variants": {"base"}, "upstreamId": replacement_upstream_id},
+        ) as recover:
+            handler.handle_plex_hls_segment(
+                "GET",
+                {"id": [session_id], "variant": ["base"], "name": ["00042.ts"]},
+            )
+
+        self.assertEqual([200], statuses)
+        self.assertEqual(b"segment", handler.wfile.getvalue())
+        self.assertEqual([], json_responses)
+        self.assertEqual(4, upstream.open.call_count)
+        self.assertIn(
+            f"/session/{replacement_upstream_id}/base/index.m3u8",
+            upstream.open.call_args_list[1].args[0],
+        )
+        self.assertIn(
+            f"/session/{replacement_upstream_id}/base/00000.ts",
+            upstream.open.call_args_list[2].args[0],
+        )
+        self.assertIn(
+            f"/session/{replacement_upstream_id}/base/00042.ts",
+            upstream.open.call_args_list[3].args[0],
+        )
+        recover.assert_called_once_with(session_id, session)
 
     def test_background_hls_stop_schedules_idle_cleanup(self):
         session_id = "c" * 32
@@ -732,12 +840,14 @@ class PlaybackCompatibilityTests(unittest.TestCase):
 
     def test_deferred_hls_cleanup_stops_an_abandoned_session(self):
         session_id = "e" * 32
+        upstream_session_id = "6" * 32
         event = threading.Event()
         with server.PLEX_HLS_SESSIONS_LOCK:
             server.PLEX_HLS_SESSIONS[session_id] = {
                 "state": "ready",
                 "lastAccess": 10.0,
                 "idleStopToken": "lease",
+                "upstreamId": upstream_session_id,
                 "event": event,
             }
 
@@ -748,7 +858,7 @@ class PlaybackCompatibilityTests(unittest.TestCase):
 
         self.assertNotIn(session_id, server.PLEX_HLS_SESSIONS)
         self.assertTrue(event.is_set())
-        stop_upstream.assert_called_once_with(session_id)
+        stop_upstream.assert_called_once_with(upstream_session_id)
 
     def test_hls_stop_endpoint_can_defer_background_cleanup(self):
         session_id = "f" * 32
@@ -803,6 +913,15 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertIn("function backgroundHlsGraceSeconds()", source)
         self.assertIn("BACKGROUND_HLS_COMPLETION_BUFFER_SECONDS", source)
         self.assertIn("graceSeconds: Math.ceil(requestedGrace)", source)
+
+    def test_frontend_renews_hls_after_a_long_pause_or_stall(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("HLS_PAUSE_RENEW_AFTER_MS", source)
+        self.assertIn('renewActiveHlsPlayback("paused")', source)
+        self.assertIn('el.player.addEventListener("waiting", scheduleHlsStallRecovery)', source)
+        self.assertIn('el.player.addEventListener("stalled", scheduleHlsStallRecovery)', source)
+        self.assertIn("loadPlayerSource(item, streamUrl, { resumeTime, autoplay: true, recovering: true })", source)
 
     def test_frontend_registers_ios_platform_playback_session(self):
         source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")

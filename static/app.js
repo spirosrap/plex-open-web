@@ -62,6 +62,11 @@ const state = {
   usingSavedPlayback: false,
   usingDevicePlayback: false,
   activeHlsSessionId: null,
+  playerPausedAt: 0,
+  playerHasPlayed: false,
+  hlsRecoveryInProgress: false,
+  hlsRecoveryTimer: null,
+  lastHlsRecoveryAt: 0,
   mediaSessionHandlersConfigured: false,
   lastMediaSessionPositionAt: 0,
   subtitleSelectionPromise: Promise.resolve(),
@@ -86,6 +91,9 @@ const PROGRESS_REPORT_INTERVAL_MS = 15000;
 const METADATA_PREFETCH_LIMIT = 6;
 const BACKGROUND_HLS_COMPLETION_BUFFER_SECONDS = 30 * 60;
 const BACKGROUND_HLS_FALLBACK_GRACE_SECONDS = 12 * 60 * 60;
+const HLS_PAUSE_RENEW_AFTER_MS = 5 * 60 * 1000;
+const HLS_STALL_RECOVERY_DELAY_MS = 8 * 1000;
+const HLS_RECOVERY_COOLDOWN_MS = 30 * 1000;
 const MEDIA_SESSION_POSITION_INTERVAL_MS = 5000;
 const SUBTITLE_WINDOW_MS = 15 * 60 * 1000;
 const SUBTITLE_WINDOW_LEAD_MS = 2 * 60 * 1000;
@@ -3185,7 +3193,91 @@ function playerStreamUrl(streamUrl) {
   return url.origin === window.location.origin ? `${url.pathname}${url.search}` : url.href;
 }
 
-function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } = {}) {
+function clearHlsRecoveryTimer() {
+  if (!state.hlsRecoveryTimer) return;
+  clearTimeout(state.hlsRecoveryTimer);
+  state.hlsRecoveryTimer = null;
+}
+
+function activePlexHlsSource() {
+  if (!state.activeHlsSessionId || state.usingDevicePlayback || state.usingSavedPlayback) return false;
+  const source = el.player.currentSrc || el.player.src;
+  if (!source) return false;
+  try {
+    const url = new URL(source, window.location.origin);
+    return url.searchParams.get("format") === "hls"
+      && url.searchParams.get("session") === state.activeHlsSessionId;
+  } catch {
+    return false;
+  }
+}
+
+function renewActiveHlsPlayback(reason = "stalled") {
+  const item = state.playerItem;
+  const now = Date.now();
+  if (!item?.ratingKey || !activePlexHlsSource() || state.hlsRecoveryInProgress) return false;
+  if (state.lastHlsRecoveryAt && now - state.lastHlsRecoveryAt < HLS_RECOVERY_COOLDOWN_MS) return false;
+
+  const rawStreamUrl = liveStreamUrlFor(item);
+  if (!rawStreamUrl) return false;
+  const renewedUrl = new URL(rawStreamUrl, window.location.origin);
+  if (renewedUrl.searchParams.get("format") !== "hls") return false;
+  renewedUrl.searchParams.delete("session");
+
+  const resumeTime = Number.isFinite(el.player.currentTime)
+    ? Math.max(0, el.player.currentTime)
+    : Math.max(0, resumeTimeFor(item));
+  state.hlsRecoveryInProgress = true;
+  state.lastHlsRecoveryAt = now;
+  state.playerPausedAt = 0;
+  state.playerHasPlayed = false;
+  clearHlsRecoveryTimer();
+  el.playbackMode.textContent = "Reconnecting...";
+  el.playbackMode.title = reason === "paused"
+    ? "Refreshing an inactive Plex stream while keeping your position."
+    : "Recovering the Plex stream while keeping your position.";
+  el.playbackMode.hidden = false;
+  stopActiveHlsSession();
+  const streamUrl = renewedUrl.origin === window.location.origin
+    ? `${renewedUrl.pathname}${renewedUrl.search}`
+    : renewedUrl.href;
+  loadPlayerSource(item, streamUrl, { resumeTime, autoplay: true, recovering: true });
+  return true;
+}
+
+function scheduleHlsStallRecovery() {
+  if (state.hlsRecoveryTimer) return;
+  if (!activePlexHlsSource()
+      || !state.playerHasPlayed
+      || state.hlsRecoveryInProgress
+      || el.player.paused
+      || el.player.ended) {
+    return;
+  }
+  const stalledAt = Number(el.player.currentTime) || 0;
+  state.hlsRecoveryTimer = setTimeout(() => {
+    state.hlsRecoveryTimer = null;
+    const currentTime = Number(el.player.currentTime) || 0;
+    if (!el.player.paused
+        && !el.player.ended
+        && currentTime <= stalledAt + 0.25) {
+      renewActiveHlsPlayback("stalled");
+    }
+  }, HLS_STALL_RECOVERY_DELAY_MS);
+}
+
+function loadPlayerSource(
+  item,
+  streamUrl,
+  { resumeTime = 0, autoplay = true, recovering = false } = {},
+) {
+  clearHlsRecoveryTimer();
+  state.playerPausedAt = 0;
+  state.playerHasPlayed = false;
+  if (!recovering) {
+    state.hlsRecoveryInProgress = false;
+    state.lastHlsRecoveryAt = 0;
+  }
   configurePlatformPlaybackSession(item);
   el.playerError.hidden = true;
   el.playerError.textContent = "";
@@ -3494,6 +3586,11 @@ async function playItem(item, { startFromBeginning = false } = {}) {
   state.playerNeighbors = null;
   state.lastProgressReportAt = 0;
   state.lastReportedTimeMs = 0;
+  state.playerPausedAt = 0;
+  state.playerHasPlayed = false;
+  state.hlsRecoveryInProgress = false;
+  state.lastHlsRecoveryAt = 0;
+  clearHlsRecoveryTimer();
   el.playerTitle.textContent = displayTitle(item);
   const resumeTime = startFromBeginning ? 0 : resumeTimeFor(item);
   updatePlayerStartOverControl();
@@ -3887,6 +3984,11 @@ el.playerDialog.addEventListener("close", async () => {
   stopProgressReporting();
   stopSavePolling();
   stopActiveHlsSession({ keepalive: true });
+  clearHlsRecoveryTimer();
+  state.playerPausedAt = 0;
+  state.playerHasPlayed = false;
+  state.hlsRecoveryInProgress = false;
+  state.lastHlsRecoveryAt = 0;
   el.player.pause();
   el.player.removeAttribute("src");
   el.playbackMode.hidden = true;
@@ -3930,12 +4032,21 @@ el.subtitleSelect.addEventListener("change", () => {
     });
 });
 el.player.addEventListener("play", () => {
+  const pausedFor = state.playerPausedAt ? Date.now() - state.playerPausedAt : 0;
+  if (pausedFor >= HLS_PAUSE_RENEW_AFTER_MS && renewActiveHlsPlayback("paused")) {
+    return;
+  }
+  state.playerPausedAt = 0;
   activatePlatformPlaybackSession();
   setPlatformPlaybackState("playing");
   updatePlatformPlaybackPosition({ force: true });
   startProgressReporting();
 });
 el.player.addEventListener("playing", () => {
+  clearHlsRecoveryTimer();
+  state.playerPausedAt = 0;
+  state.playerHasPlayed = true;
+  state.hlsRecoveryInProgress = false;
   activatePlatformPlaybackSession();
   setPlatformPlaybackState("playing");
   updatePlatformPlaybackPosition({ force: true });
@@ -3948,6 +4059,13 @@ el.player.addEventListener("playing", () => {
 });
 el.player.addEventListener("error", () => {
   if (!state.playerItem || !el.player.currentSrc) return;
+  if (state.playerHasPlayed
+      && !state.hlsRecoveryInProgress
+      && renewActiveHlsPlayback("stalled")) {
+    return;
+  }
+  clearHlsRecoveryTimer();
+  state.hlsRecoveryInProgress = false;
   setPlatformPlaybackState("paused");
   const message = state.playerItem.savedPlayback?.ready
     ? "Playback failed. Select Play stream to retry with the prepared remote copy."
@@ -3960,12 +4078,18 @@ el.player.addEventListener("error", () => {
   setStatus(`Could not play ${displayTitle(state.playerItem)}.`, "error");
 });
 el.player.addEventListener("pause", () => {
+  clearHlsRecoveryTimer();
+  if (!el.player.ended && !state.hlsRecoveryInProgress && state.playerHasPlayed) {
+    state.playerPausedAt = Date.now();
+  }
   setPlatformPlaybackState(el.player.ended ? "none" : "paused");
   updatePlatformPlaybackPosition({ force: true });
   if (!el.player.ended) {
     reportPlaybackProgress("paused", { force: true }).catch(() => {});
   }
 });
+el.player.addEventListener("waiting", scheduleHlsStallRecovery);
+el.player.addEventListener("stalled", scheduleHlsStallRecovery);
 el.player.addEventListener("timeupdate", () => {
   const item = state.playerItem;
   if (!item?.ratingKey) return;
@@ -3981,6 +4105,10 @@ el.player.addEventListener("seeked", refreshActiveSubtitleWindow);
 el.player.addEventListener("enterpictureinpicture", activatePlatformPlaybackSession);
 el.player.addEventListener("webkitpresentationmodechanged", activatePlatformPlaybackSession);
 el.player.addEventListener("ended", () => {
+  clearHlsRecoveryTimer();
+  state.playerPausedAt = 0;
+  state.playerHasPlayed = false;
+  state.hlsRecoveryInProgress = false;
   setPlatformPlaybackState("none");
   stopProgressReporting();
   reportPlaybackProgress("ended", { force: true }).catch(() => {});
