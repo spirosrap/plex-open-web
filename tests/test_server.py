@@ -380,7 +380,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.24.6", responses[0][1]["version"])
+        self.assertEqual("0.24.7", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -396,7 +396,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.24.6", responses[0][1]["version"])
+        self.assertEqual("0.24.7", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
@@ -922,6 +922,15 @@ class PlaybackCompatibilityTests(unittest.TestCase):
         self.assertIn('el.player.addEventListener("waiting", scheduleHlsStallRecovery)', source)
         self.assertIn('el.player.addEventListener("stalled", scheduleHlsStallRecovery)', source)
         self.assertIn("loadPlayerSource(item, streamUrl, { resumeTime, autoplay: true, recovering: true })", source)
+
+    def test_frontend_does_not_toggle_an_already_active_subtitle_track(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function setActiveSubtitle")
+        end = source.index("\n}\n", start)
+        function_source = source[start:end]
+
+        self.assertIn("track.mode !== nextMode", function_source)
+        self.assertNotIn("disableAllTextTracks()", function_source)
 
     def test_frontend_registers_ios_platform_playback_session(self):
         source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")

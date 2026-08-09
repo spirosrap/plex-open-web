@@ -43,6 +43,17 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
 
+### 0.24.7
+
+**Improved**
+
+- Subtitle track updates now leave an already active track untouched instead of rebuilding its visible state during playback.
+
+**Fixed**
+
+- Fixed subtitles visibly trembling, flickering, or jumping in Safari while video playback continued normally.
+- Fixed the active text track being disabled and immediately re-enabled on every video `timeupdate` event.
+
 ### 0.24.6
 
 **Added**

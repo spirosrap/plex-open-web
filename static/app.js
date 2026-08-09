@@ -2832,10 +2832,13 @@ function currentSubtitleIndex() {
 }
 
 function setActiveSubtitle(index = currentSubtitleIndex()) {
-  disableAllTextTracks();
   const trackElement = state.subtitleTrackElements[index];
-  if (trackElement?.src && trackElement.track) {
-    trackElement.track.mode = "showing";
+  const activeTrack = trackElement?.src && trackElement.track ? trackElement.track : null;
+  for (const track of [...el.player.textTracks]) {
+    const nextMode = track === activeTrack ? "showing" : "disabled";
+    if (track.mode !== nextMode) {
+      track.mode = nextMode;
+    }
   }
 }
 
