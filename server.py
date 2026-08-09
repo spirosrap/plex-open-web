@@ -41,7 +41,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-APP_VERSION = "0.24.4"
+APP_VERSION = "0.24.5"
 COOKIE_NAME = "plex_open_session"
 MY_LIST_MAX_ITEMS = 500
 MY_LIST_LOCK = threading.Lock()
@@ -122,6 +122,9 @@ class Settings:
     hls_transcode_timeout = env_int("HLS_TRANSCODE_TIMEOUT", 4 * 60 * 60)
     hls_background_grace = env_int("HLS_BACKGROUND_GRACE", 10 * 60)
     hls_background_max_grace = env_int("HLS_BACKGROUND_MAX_GRACE", 12 * 60 * 60)
+    subtitle_extract_timeout = env_int("SUBTITLE_EXTRACT_TIMEOUT", 300)
+    subtitle_cache_ttl = env_int("SUBTITLE_CACHE_TTL", 30 * 24 * 60 * 60)
+    subtitle_cache_max_bytes = env_int("SUBTITLE_CACHE_MAX_BYTES", 256 * 1024 * 1024)
     data_dir = Path(os.environ.get("APP_DATA_DIR", str(ROOT.parent / "plex-open-web-data")))
     media_delete_enabled = env_bool("MEDIA_DELETE_ENABLED", False)
     media_delete_roots = os.environ.get("MEDIA_DELETE_ROOTS", "")
@@ -211,6 +214,7 @@ PLAYBACK_RESTARTS_LOCK = threading.Lock()
 PLAYBACK_RESTARTS_CACHE: Optional[Dict[str, Dict[str, int]]] = None
 MEDIA_DELETE_LOG_FILE = Settings.data_dir / "media-delete-log.jsonl"
 MEDIA_DELETE_LOCK = threading.Lock()
+EMBEDDED_SUBTITLE_CACHE_LOCK = threading.Lock()
 VIDEO_EXTENSIONS = {
     ".3g2", ".3gp", ".asf", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov",
     ".mp4", ".mpeg", ".mpg", ".mts", ".ogm", ".ogv", ".ts", ".vob", ".webm", ".wmv",
@@ -3388,27 +3392,154 @@ def resolve_embedded_subtitle(
     return None
 
 
-def extract_embedded_subtitle(media_path: Path, stream_index: int) -> bytes:
+def embedded_subtitle_cache_dir(create: bool = False) -> Path:
+    path = Settings.data_dir / "subtitle-cache"
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def embedded_subtitle_cache_path(
+    media_path: Path,
+    stream_index: int,
+    start_ms: Optional[int],
+    window_ms: Optional[int],
+) -> Path:
+    media_stat = media_path.stat()
+    identity = "\0".join(
+        [
+            str(media_path.resolve()),
+            str(media_stat.st_size),
+            str(media_stat.st_mtime_ns),
+            str(stream_index),
+            str(start_ms if start_ms is not None else "full"),
+            str(window_ms if window_ms is not None else "full"),
+            "webvtt-v2",
+        ]
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return embedded_subtitle_cache_dir(create=True) / f"{digest}.vtt"
+
+
+def read_cached_embedded_subtitle(cache_path: Path) -> Optional[bytes]:
+    try:
+        if not cache_path.is_file() or cache_path.stat().st_size > 30 * 1024 * 1024:
+            return None
+        body = cache_path.read_bytes()
+        if not body.startswith(b"WEBVTT"):
+            cache_path.unlink(missing_ok=True)
+            return None
+        os.utime(cache_path, None)
+        return body
+    except OSError:
+        return None
+
+
+def prune_embedded_subtitle_cache() -> None:
+    cache_dir = embedded_subtitle_cache_dir()
+    try:
+        files = [path for path in cache_dir.iterdir() if path.is_file() and path.suffix == ".vtt"]
+    except OSError:
+        return
+    now = time.time()
+    retained = []
+    for path in files:
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        if now - info.st_mtime > max(0, Settings.subtitle_cache_ttl):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        retained.append((info.st_mtime, info.st_size, path))
+    total = sum(size for _, size, _ in retained)
+    for _, size, path in sorted(retained):
+        if total <= max(0, Settings.subtitle_cache_max_bytes):
+            break
+        try:
+            path.unlink()
+            total -= size
+        except OSError:
+            continue
+
+
+def embedded_subtitle_window(
+    start_ms: Optional[int],
+    window_ms: Optional[int],
+) -> Tuple[Optional[int], Optional[int]]:
+    if start_ms is None or window_ms is None:
+        return None, None
+    bounded_start = max(0, min(start_ms, 7 * 24 * 60 * 60 * 1000))
+    bounded_window = max(60_000, min(window_ms, 30 * 60 * 1000))
+    return bounded_start, bounded_window
+
+
+def extract_embedded_subtitle(
+    media_path: Path,
+    stream_index: int,
+    start_ms: Optional[int] = None,
+    window_ms: Optional[int] = None,
+) -> bytes:
+    start_ms, window_ms = embedded_subtitle_window(start_ms, window_ms)
+    cache_path = embedded_subtitle_cache_path(media_path, stream_index, start_ms, window_ms)
+    cached = read_cached_embedded_subtitle(cache_path)
+    if cached is not None:
+        return cached
+
+    with EMBEDDED_SUBTITLE_CACHE_LOCK:
+        cached = read_cached_embedded_subtitle(cache_path)
+        if cached is not None:
+            return cached
+        body = run_embedded_subtitle_extract(media_path, stream_index, start_ms, window_ms)
+        temporary_path = cache_path.with_name(f".{cache_path.name}.{secrets.token_hex(6)}.tmp")
+        try:
+            temporary_path.write_bytes(body)
+            os.replace(temporary_path, cache_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        prune_embedded_subtitle_cache()
+        return body
+
+
+def run_embedded_subtitle_extract(
+    media_path: Path,
+    stream_index: int,
+    start_ms: Optional[int],
+    window_ms: Optional[int],
+) -> bytes:
     command = [
         Settings.ffmpeg_path,
         "-hide_banner",
         "-loglevel",
         "error",
         "-nostdin",
+    ]
+    if start_ms is not None and start_ms > 0:
+        command.extend(["-ss", f"{start_ms / 1000:.3f}"])
+    command.extend([
         "-i",
         str(media_path),
         "-map",
         f"0:{stream_index}",
+    ])
+    if window_ms is not None:
+        command.extend(["-t", f"{window_ms / 1000:.3f}"])
+    if start_ms is not None and start_ms > 0:
+        command.extend(["-output_ts_offset", f"{start_ms / 1000:.3f}"])
+    command.extend([
         "-f",
         "webvtt",
         "pipe:1",
-    ]
+    ])
     process = subprocess.run(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
-        timeout=min(Settings.stream_timeout, 120),
+        timeout=min(Settings.stream_timeout, max(30, Settings.subtitle_extract_timeout)),
     )
     if process.returncode != 0:
         message = process.stderr.decode("utf-8", errors="ignore").strip()
@@ -5691,13 +5822,22 @@ class AppHandler(BaseHTTPRequestHandler):
         stream_id = one(query, "streamId", "")
         stream_index = to_int(one(query, "streamIndex", ""))
         codec = one(query, "codec", "").lower()
+        start_ms, window_ms = embedded_subtitle_window(
+            to_int(one(query, "startMs", "")),
+            to_int(one(query, "windowMs", "")),
+        )
         resolved = resolve_embedded_subtitle(rating_key, part_id, stream_id, stream_index, codec)
         if resolved is None:
             self.send_json({"error": "bad_embedded_subtitle"}, status=400)
             return
         media_path, actual_index, _ = resolved
         try:
-            body = b"" if method == "HEAD" else extract_embedded_subtitle(media_path, actual_index)
+            body = b"" if method == "HEAD" else extract_embedded_subtitle(
+                media_path,
+                actual_index,
+                start_ms,
+                window_ms,
+            )
         except FileNotFoundError:
             self.send_json({"error": "ffmpeg_unavailable"}, status=500)
             return
@@ -5715,6 +5855,9 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/vtt; charset=utf-8")
         self.send_header("Cache-Control", "private, max-age=3600")
+        if start_ms is not None and window_ms is not None:
+            self.send_header("X-Subtitle-Window-Start-Ms", str(start_ms))
+            self.send_header("X-Subtitle-Window-Duration-Ms", str(window_ms))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if method != "HEAD":

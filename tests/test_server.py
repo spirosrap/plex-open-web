@@ -379,7 +379,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.24.4", responses[0][1]["version"])
+        self.assertEqual("0.24.5", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -395,7 +395,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.24.4", responses[0][1]["version"])
+        self.assertEqual("0.24.5", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
@@ -1295,6 +1295,61 @@ class SubtitleSelectionTests(unittest.TestCase):
         self.assertEqual(400, responses[0][0])
         self.assertEqual("subtitle_stream_not_found", responses[0][1]["error"])
         self.assertEqual([], plex.open_calls)
+
+
+class EmbeddedSubtitleTests(unittest.TestCase):
+    def test_frontend_loads_only_the_active_track_after_resume_is_applied(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        configure_start = source.index("function configureSubtitles(item)")
+        configure_end = source.index("function compatibilityTranscodeRequired", configure_start)
+        configure = source[configure_start:configure_end]
+        player_start = source.index("function loadPlayerSource")
+        player_end = source.index("function stopSavePolling", player_start)
+        player_source = source[player_start:player_end]
+
+        self.assertNotIn("track.src = subtitle.subtitleUrl", configure)
+        self.assertIn('url.searchParams.set("startMs"', source)
+        self.assertIn('url.searchParams.set("windowMs"', source)
+        self.assertLess(
+            player_source.index("el.player.currentTime ="),
+            player_source.index("refreshActiveSubtitleWindow"),
+        )
+
+    def test_windowed_extract_seeks_preserves_timestamps_and_reuses_disk_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_path = root / "episode.mkv"
+            media_path.write_bytes(b"test media")
+            completed = server.subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=b"WEBVTT\n\n00:10.000 --> 00:12.000\nHello\n",
+                stderr=b"",
+            )
+            with mock.patch.object(server.Settings, "data_dir", root / "data"), mock.patch.object(
+                server.subprocess,
+                "run",
+                return_value=completed,
+            ) as run:
+                first = server.extract_embedded_subtitle(media_path, 9, 600_000, 900_000)
+                second = server.extract_embedded_subtitle(media_path, 9, 600_000, 900_000)
+
+            self.assertEqual(first, second)
+            run.assert_called_once()
+            command = run.call_args.args[0]
+            self.assertLess(command.index("-ss"), command.index("-i"))
+            self.assertEqual("600.000", command[command.index("-ss") + 1])
+            self.assertEqual("900.000", command[command.index("-t") + 1])
+            self.assertEqual("600.000", command[command.index("-output_ts_offset") + 1])
+            self.assertEqual(1, len(list((root / "data" / "subtitle-cache").glob("*.vtt"))))
+
+    def test_subtitle_windows_are_bounded(self):
+        self.assertEqual((None, None), server.embedded_subtitle_window(1000, None))
+        self.assertEqual((0, 60_000), server.embedded_subtitle_window(-100, 10))
+        self.assertEqual(
+            (7 * 24 * 60 * 60 * 1000, 30 * 60 * 1000),
+            server.embedded_subtitle_window(99 * 24 * 60 * 60 * 1000, 9 * 60 * 60 * 1000),
+        )
 
 
 class CollectionMembershipTests(unittest.TestCase):

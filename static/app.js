@@ -52,6 +52,8 @@ const state = {
   autoplaySeconds: 0,
   playbackRate: 1,
   subtitleTrackElements: [],
+  subtitleTrackWindows: [],
+  subtitleLoadGeneration: 0,
   savePollTimer: null,
   progressTimer: null,
   lastProgressReportAt: 0,
@@ -85,6 +87,9 @@ const METADATA_PREFETCH_LIMIT = 6;
 const BACKGROUND_HLS_COMPLETION_BUFFER_SECONDS = 30 * 60;
 const BACKGROUND_HLS_FALLBACK_GRACE_SECONDS = 12 * 60 * 60;
 const MEDIA_SESSION_POSITION_INTERVAL_MS = 5000;
+const SUBTITLE_WINDOW_MS = 15 * 60 * 1000;
+const SUBTITLE_WINDOW_LEAD_MS = 2 * 60 * 1000;
+const SUBTITLE_WINDOW_BUCKET_MS = 5 * 60 * 1000;
 
 const savedBrowse = readBrowsePreferences();
 state.preferredLibraryKey = typeof savedBrowse.libraryKey === "string" ? savedBrowse.libraryKey : "";
@@ -194,6 +199,7 @@ const el = {
   playerStartOver: document.querySelector("#player-start-over"),
   subtitleLabel: document.querySelector("#subtitle-select-label"),
   subtitleSelect: document.querySelector("#subtitle-select"),
+  subtitleLoadStatus: document.querySelector("#subtitle-load-status"),
   playerSave: document.querySelector("#player-save"),
   playerDeleteSave: document.querySelector("#player-delete-save"),
   playerDeviceSave: document.querySelector("#player-device-save"),
@@ -2687,14 +2693,28 @@ async function deleteDevicePlayback(item = state.playerItem) {
 }
 
 function clearSubtitleTracks() {
+  state.subtitleLoadGeneration += 1;
   disableAllTextTracks();
+  for (const entry of state.subtitleTrackWindows) {
+    if (entry?.objectUrl) {
+      URL.revokeObjectURL(entry.objectUrl);
+    }
+  }
   for (const track of [...el.player.querySelectorAll("track")]) {
     track.remove();
   }
   state.subtitleTrackElements = [];
+  state.subtitleTrackWindows = [];
   el.subtitleSelect.innerHTML = "";
   el.subtitleSelect.hidden = true;
   el.subtitleLabel.hidden = true;
+  setSubtitleLoadStatus("");
+}
+
+function setSubtitleLoadStatus(message, isError = false) {
+  el.subtitleLoadStatus.textContent = message || "";
+  el.subtitleLoadStatus.classList.toggle("error", Boolean(message && isError));
+  el.subtitleLoadStatus.hidden = !message;
 }
 
 function subtitlePreferenceStore() {
@@ -2806,13 +2826,138 @@ function currentSubtitleIndex() {
 function setActiveSubtitle(index = currentSubtitleIndex()) {
   disableAllTextTracks();
   const trackElement = state.subtitleTrackElements[index];
-  if (trackElement?.track) {
+  if (trackElement?.src && trackElement.track) {
     trackElement.track.mode = "showing";
   }
 }
 
 function reapplyActiveSubtitle() {
   requestAnimationFrame(() => setActiveSubtitle());
+}
+
+function subtitleWindowForCurrentTime() {
+  const currentMs = Math.max(0, Math.floor((Number(el.player.currentTime) || 0) * 1000));
+  const earliestMs = Math.max(0, currentMs - SUBTITLE_WINDOW_LEAD_MS);
+  const startMs = Math.floor(earliestMs / SUBTITLE_WINDOW_BUCKET_MS) * SUBTITLE_WINDOW_BUCKET_MS;
+  return { startMs, endMs: startMs + SUBTITLE_WINDOW_MS };
+}
+
+function subtitleTrackRequest(subtitle) {
+  const url = new URL(subtitle.subtitleUrl, window.location.origin);
+  if (!subtitle.embedded) {
+    return { url: `${url.pathname}${url.search}`, startMs: null, endMs: null };
+  }
+  const { startMs, endMs } = subtitleWindowForCurrentTime();
+  url.searchParams.set("startMs", String(startMs));
+  url.searchParams.set("windowMs", String(endMs - startMs));
+  return { url: `${url.pathname}${url.search}`, startMs, endMs };
+}
+
+async function fetchSubtitleText(url) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch(url, { credentials: "same-origin" });
+      const text = await response.text();
+      if (response.ok) {
+        return text;
+      }
+      let detail = "";
+      try {
+        const payload = JSON.parse(text);
+        detail = payload.message || payload.error || "";
+      } catch {
+        detail = text.trim();
+      }
+      lastError = new Error(detail || `Subtitle request failed (${response.status})`);
+      if (response.status < 500 || attempt >= 2) {
+        throw lastError;
+      }
+    } catch (error) {
+      lastError = error;
+      if (attempt >= 2) {
+        throw error;
+      }
+    }
+    await sleep(750 * (attempt + 1));
+  }
+  throw lastError || new Error("Subtitle request failed");
+}
+
+async function loadActiveSubtitle(index = currentSubtitleIndex()) {
+  if (index < 0 || index !== currentSubtitleIndex()) {
+    setSubtitleLoadStatus("");
+    return;
+  }
+  if (el.player.readyState < HTMLMediaElement.HAVE_METADATA) {
+    return;
+  }
+  const entry = state.subtitleTrackWindows[index];
+  if (!entry) return;
+
+  const request = subtitleTrackRequest(entry.subtitle);
+  const currentMs = Math.max(0, Math.floor((Number(el.player.currentTime) || 0) * 1000));
+  const loadedWindowIsCurrent = Boolean(
+    entry.objectUrl
+    && (!entry.subtitle.embedded
+      || (currentMs >= entry.startMs && currentMs < entry.endMs - SUBTITLE_WINDOW_LEAD_MS)),
+  );
+  if (loadedWindowIsCurrent) {
+    setActiveSubtitle(index);
+    return;
+  }
+
+  const generation = state.subtitleLoadGeneration;
+  if (entry.loadingUrl === request.url && entry.loadingGeneration === generation) {
+    return entry.loadingPromise;
+  }
+  const label = entry.subtitle.label
+    || entry.subtitle.displayTitle
+    || entry.subtitle.language
+    || "subtitles";
+  setSubtitleLoadStatus(`Loading ${label}...`);
+  entry.loadingUrl = request.url;
+  entry.loadingGeneration = generation;
+  entry.loadingPromise = (async () => {
+    try {
+      const text = await fetchSubtitleText(request.url);
+      if (generation !== state.subtitleLoadGeneration || index !== currentSubtitleIndex()) {
+        return;
+      }
+      const objectUrl = URL.createObjectURL(new Blob([text], { type: "text/vtt" }));
+      if (entry.objectUrl) {
+        URL.revokeObjectURL(entry.objectUrl);
+      }
+      entry.objectUrl = objectUrl;
+      entry.startMs = request.startMs;
+      entry.endMs = request.endMs;
+      entry.track.src = objectUrl;
+      disableAllTextTracks();
+      entry.track.track.mode = "showing";
+      setSubtitleLoadStatus("");
+    } catch (error) {
+      if (generation === state.subtitleLoadGeneration && index === currentSubtitleIndex()) {
+        setSubtitleLoadStatus(`Could not load ${label}. Select it again to retry.`, true);
+      }
+      throw error;
+    } finally {
+      if (entry.loadingGeneration === generation) {
+        entry.loadingUrl = null;
+        entry.loadingPromise = null;
+      }
+    }
+  })();
+  return entry.loadingPromise;
+}
+
+function refreshActiveSubtitleWindow() {
+  const index = currentSubtitleIndex();
+  if (index < 0) return;
+  const entry = state.subtitleTrackWindows[index];
+  if (entry?.loadingPromise && entry.loadingGeneration === state.subtitleLoadGeneration) {
+    return;
+  }
+  loadActiveSubtitle(index).catch(() => {});
 }
 
 function configureSubtitles(item) {
@@ -2836,15 +2981,23 @@ function configureSubtitles(item) {
 
     const track = document.createElement("track");
     track.kind = subtitle.forced ? "subtitles" : "subtitles";
-    track.src = subtitle.subtitleUrl;
     track.srclang = subtitle.srclang || "und";
     track.label = option.textContent;
     track.addEventListener("load", reapplyActiveSubtitle);
     state.subtitleTrackElements[index] = track;
+    state.subtitleTrackWindows[index] = {
+      subtitle,
+      track,
+      objectUrl: null,
+      startMs: null,
+      endMs: null,
+      loadingUrl: null,
+      loadingGeneration: -1,
+      loadingPromise: null,
+    };
     el.player.append(track);
   });
   el.subtitleSelect.value = selectedIndex >= 0 ? String(selectedIndex) : "-1";
-  reapplyActiveSubtitle();
 }
 
 function compatibilityTranscodeRequired(item) {
@@ -3040,7 +3193,6 @@ function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } =
   const preparedStreamUrl = playerStreamUrl(streamUrl);
   const isHlsStream = new URL(preparedStreamUrl, window.location.origin).searchParams.get("format") === "hls";
   const applyResume = () => {
-    reapplyActiveSubtitle();
     if ((isHlsStream || resumeTime > 0) && Number.isFinite(resumeTime)) {
       try {
         el.player.currentTime = Math.max(0, resumeTime);
@@ -3048,6 +3200,7 @@ function loadPlayerSource(item, streamUrl, { resumeTime = 0, autoplay = true } =
         // Some streams reject seeking until more metadata arrives.
       }
     }
+    requestAnimationFrame(refreshActiveSubtitleWindow);
     if (autoplay) {
       el.player.play().catch(() => {});
     }
@@ -3765,7 +3918,9 @@ el.playerDialog.addEventListener("close", async () => {
 el.subtitleSelect.addEventListener("change", () => {
   const index = Number(el.subtitleSelect.value);
   const item = state.playerItem;
+  state.subtitleLoadGeneration += 1;
   setActiveSubtitle(index);
+  loadActiveSubtitle(index).catch(() => {});
   rememberSubtitlePreference(item, index);
   state.subtitleSelectionPromise = state.subtitleSelectionPromise
     .catch(() => {})
@@ -3817,10 +3972,12 @@ el.player.addEventListener("timeupdate", () => {
   rememberLocalProgress(item, playbackTimeMs(), playbackDurationMs(item));
   updatePlayerStartOverControl();
   updatePlatformPlaybackPosition();
+  refreshActiveSubtitleWindow();
 });
 el.player.addEventListener("loadedmetadata", () => updatePlatformPlaybackPosition({ force: true }));
 el.player.addEventListener("durationchange", () => updatePlatformPlaybackPosition({ force: true }));
 el.player.addEventListener("ratechange", () => updatePlatformPlaybackPosition({ force: true }));
+el.player.addEventListener("seeked", refreshActiveSubtitleWindow);
 el.player.addEventListener("enterpictureinpicture", activatePlatformPlaybackSession);
 el.player.addEventListener("webkitpresentationmodechanged", activatePlatformPlaybackSession);
 el.player.addEventListener("ended", () => {

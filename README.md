@@ -25,6 +25,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Previous/next episode navigation with optional persisted autoplay and a cancellable Up Next countdown.
 - Persistent 0.75x to 2x playback speed that survives source changes and browser restarts.
 - Persistent per-item subtitle selection from Plex subtitle streams and sidecar subtitle files, including an explicit remembered Off choice.
+- Lazy, cached embedded-subtitle windows that follow playback and seeking without scanning every language track.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
 - Persistent offline browser saves that are preferred before any remote stream and remain until explicitly deleted or browser storage is cleared.
@@ -41,6 +42,25 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.24.5
+
+**Added**
+
+- Added a visible subtitle loading and failure status inside the web player.
+- Added persistent server-side WebVTT caching for embedded subtitle windows.
+
+**Improved**
+
+- Embedded subtitles now seek directly to a timestamp-preserving window around the current playback position instead of scanning the entire video before showing the first cue.
+- The player loads only the selected subtitle language and automatically prepares a new overlapping window before playback reaches the end of the current one.
+- Subtitle loading waits until the saved resume position has been applied, making resumed movies and episodes substantially faster to subtitle.
+- Failed subtitle requests retry automatically while the current video continues playing.
+
+**Fixed**
+
+- Fixed embedded subtitles silently failing with a timeout on large MKV movies and TV episodes.
+- Fixed Safari potentially starting extraction for multiple embedded languages even though only one subtitle track was selected.
 
 ### 0.24.4
 

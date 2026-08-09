@@ -1312,6 +1312,23 @@ select:focus-visible {
   width: 82px;
 }
 
+.subtitle-load-status {
+  max-width: min(240px, 38vw);
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subtitle-load-status.error {
+  color: var(--danger);
+}
+
+.subtitle-load-status[hidden] {
+  display: none;
+}
+
 .player-controls .secondary-button {
   min-height: 32px;
   padding: 0 12px;
