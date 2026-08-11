@@ -25,7 +25,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Previous/next episode navigation with optional persisted autoplay and a cancellable Up Next countdown.
 - Per-episode Skip Intro controls backed by native Plex markers or cached Chromaprint audio matching across a season.
 - Persistent 0.75x to 2x playback speed that survives source changes and browser restarts.
-- Persistent per-item subtitle selection from Plex subtitle streams and sidecar subtitle files, including an explicit remembered Off choice.
+- Available-subtitle chooser for movies and episodes, with Plex, embedded, saved sidecar, and OpenSubtitles tracks plus an explicit remembered Off choice.
 - Lazy, cached embedded-subtitle windows that follow playback and seeking without scanning every language track.
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
@@ -43,6 +43,22 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.25.2
+
+**Added**
+
+- The movie and episode subtitle window now lists every available Plex, embedded, saved sidecar, and OpenSubtitles track before offering a search for a new one.
+- Added an explicit Off row and a clear selected state, with the current track pinned at the top of long subtitle lists.
+
+**Improved**
+
+- Selecting an available subtitle now takes effect immediately in an open player and persists for future playback.
+- Opening the subtitle chooser uses already-warmed metadata and only contacts OpenSubtitles after Search is selected, making the window appear faster.
+
+**Fixed**
+
+- Fixed Details > Subtitles showing only the OpenSubtitles search instead of the tracks already saved for the movie or episode.
 
 ### 0.25.1
 

@@ -78,6 +78,8 @@ const state = {
   deviceObjectUrls: [],
   subtitleItem: null,
   subtitleResults: [],
+  subtitleDialogRequestId: 0,
+  subtitleSelectionBusy: false,
 };
 
 const LOCAL_PROGRESS_KEY = "plex-open-web-progress-v1";
@@ -228,6 +230,9 @@ const el = {
   player: document.querySelector("#player"),
   subtitleDialog: document.querySelector("#subtitle-dialog"),
   subtitleClose: document.querySelector("#subtitle-close"),
+  subtitleSavedCount: document.querySelector("#subtitle-saved-count"),
+  subtitleSavedStatus: document.querySelector("#subtitle-saved-status"),
+  subtitleSavedList: document.querySelector("#subtitle-saved-list"),
   subtitleForm: document.querySelector("#subtitle-form"),
   subtitleLanguage: document.querySelector("#subtitle-language"),
   subtitleQuery: document.querySelector("#subtitle-query"),
@@ -3735,6 +3740,117 @@ function setSubtitleStatus(message = "", kind = "") {
   el.subtitleStatus.dataset.kind = kind;
 }
 
+function setSavedSubtitleStatus(message = "", kind = "") {
+  el.subtitleSavedStatus.textContent = message;
+  el.subtitleSavedStatus.dataset.kind = kind;
+}
+
+function availableSubtitleLabel(subtitle, index) {
+  return subtitle?.label
+    || subtitle?.displayTitle
+    || subtitle?.language
+    || subtitle?.title
+    || `Subtitle ${index + 1}`;
+}
+
+function availableSubtitleMeta(subtitle) {
+  const source = subtitle?.source === "embedded"
+    ? "Embedded"
+    : subtitle?.source === "opensubtitles"
+      ? "OpenSubtitles"
+      : subtitle?.source === "local"
+        ? "Saved file"
+        : subtitle?.external
+          ? "Plex sidecar"
+          : "Plex track";
+  return [
+    source,
+    subtitle?.codec ? String(subtitle.codec).toUpperCase() : "",
+    subtitle?.forced ? "Forced" : "",
+    subtitle?.hearingImpaired ? "SDH" : "",
+  ].filter(Boolean).join(" • ");
+}
+
+function renderAvailableSubtitles(item) {
+  const subtitles = supportedSubtitles(item);
+  const selectedIndex = preferredSubtitleIndex(item, subtitles);
+  const trackLabel = subtitles.length === 1 ? "1 track" : `${subtitles.length} tracks`;
+  el.subtitleSavedCount.textContent = trackLabel;
+  el.subtitleSavedList.replaceChildren();
+
+  const offChoice = { index: -1, label: "Off", meta: "No subtitles" };
+  const subtitleChoices = subtitles.map((subtitle, index) => ({
+    index,
+    label: availableSubtitleLabel(subtitle, index),
+    meta: availableSubtitleMeta(subtitle),
+  }));
+  const selectedChoice = subtitleChoices.find((choice) => choice.index === selectedIndex);
+  const choices = selectedChoice
+    ? [selectedChoice, offChoice, ...subtitleChoices.filter((choice) => choice !== selectedChoice)]
+    : [offChoice, ...subtitleChoices];
+  const fragment = document.createDocumentFragment();
+  for (const choice of choices) {
+    const selected = choice.index === selectedIndex;
+    const row = document.createElement("article");
+    row.className = "subtitle-saved-option";
+    row.dataset.selected = String(selected);
+
+    const copy = document.createElement("div");
+    const label = document.createElement("strong");
+    label.textContent = choice.label;
+    const meta = document.createElement("p");
+    meta.textContent = choice.meta;
+    copy.append(label, meta);
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = selected ? "mini-primary" : "mini-secondary";
+    button.textContent = selected ? "Selected" : "Select";
+    button.disabled = selected || state.subtitleSelectionBusy;
+    button.setAttribute("aria-pressed", String(selected));
+    button.addEventListener("click", () => selectAvailableSubtitle(item, choice.index));
+    row.append(copy, button);
+    fragment.append(row);
+  }
+  el.subtitleSavedList.append(fragment);
+}
+
+function applySubtitleChoiceToPlayer(item) {
+  if (!state.playerItem || String(state.playerItem.ratingKey) !== String(item?.ratingKey)) return;
+  state.playerItem.subtitles = item.subtitles;
+  state.subtitleLoadGeneration += 1;
+  configureSubtitles(state.playerItem);
+  const selectedIndex = currentSubtitleIndex();
+  setActiveSubtitle(selectedIndex);
+  loadActiveSubtitle(selectedIndex).catch(() => {});
+}
+
+async function selectAvailableSubtitle(item, index) {
+  if (!item?.ratingKey || state.subtitleSelectionBusy) return;
+  const subtitles = supportedSubtitles(item);
+  if (index >= subtitles.length) return;
+
+  state.subtitleSelectionBusy = true;
+  rememberSubtitlePreference(item, index, subtitles);
+  renderAvailableSubtitles(item);
+  applySubtitleChoiceToPlayer(item);
+  setSavedSubtitleStatus("Saving selection...");
+  try {
+    const result = await persistSubtitleSelection(item, index);
+    setSavedSubtitleStatus(
+      result.plexSaved ? "Selection saved to Plex." : "Selection saved in this browser.",
+      "success",
+    );
+  } catch (error) {
+    setSavedSubtitleStatus(`Selected here, but Plex could not remember it: ${error.message}`, "error");
+  } finally {
+    state.subtitleSelectionBusy = false;
+    if (String(state.subtitleItem?.ratingKey) === String(item.ratingKey)) {
+      renderAvailableSubtitles(item);
+    }
+  }
+}
+
 function subtitleResultMeta(result) {
   return [
     result.languageName,
@@ -3796,15 +3912,27 @@ async function searchSubtitles() {
 }
 
 async function openSubtitleDialog(item) {
+  const requestId = ++state.subtitleDialogRequestId;
   state.subtitleItem = item;
   state.subtitleResults = [];
   el.subtitleQuery.value = subtitleSearchTitle(item);
   el.subtitleResults.innerHTML = "";
   setSubtitleStatus("");
+  renderAvailableSubtitles(item);
+  setSavedSubtitleStatus(item._hydrated ? "" : "Loading available subtitles...");
   if (!el.subtitleDialog.open) {
     el.subtitleDialog.showModal();
   }
-  await searchSubtitles();
+  await hydrateItem(item);
+  if (
+    requestId !== state.subtitleDialogRequestId
+    || String(state.subtitleItem?.ratingKey) !== String(item.ratingKey)
+  ) return;
+  renderAvailableSubtitles(item);
+  setSavedSubtitleStatus(
+    item._metadataFailedAt ? "Could not refresh available subtitles." : "",
+    item._metadataFailedAt ? "error" : "",
+  );
 }
 
 async function downloadSubtitle(result, button) {
@@ -3829,6 +3957,7 @@ async function downloadSubtitle(result, button) {
         state.playerItem.subtitles = item.subtitles;
         configureSubtitles(state.playerItem);
       }
+      renderAvailableSubtitles(item);
     }
     setSubtitleStatus(`Saved ${data.savedName || "subtitle"}.`, "success");
     button.textContent = "Saved";

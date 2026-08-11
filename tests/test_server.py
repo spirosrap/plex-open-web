@@ -381,7 +381,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.25.1", responses[0][1]["version"])
+        self.assertEqual("0.25.2", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -397,7 +397,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.25.1", responses[0][1]["version"])
+        self.assertEqual("0.25.2", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
@@ -1530,6 +1530,37 @@ class SubtitleSelectionTests(unittest.TestCase):
         self.assertEqual(400, responses[0][0])
         self.assertEqual("subtitle_stream_not_found", responses[0][1]["error"])
         self.assertEqual([], plex.open_calls)
+
+
+class SubtitleDialogTests(unittest.TestCase):
+    def test_details_dialog_lists_and_selects_existing_subtitle_tracks(self):
+        html = (server.ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        render_start = source.index("function renderAvailableSubtitles(item)")
+        render_end = source.index("function applySubtitleChoiceToPlayer", render_start)
+        render_source = source[render_start:render_end]
+        select_start = source.index("async function selectAvailableSubtitle")
+        select_end = source.index("function subtitleResultMeta", select_start)
+        select_source = source[select_start:select_end]
+
+        self.assertIn('id="subtitle-saved-list"', html)
+        self.assertIn('id="subtitle-saved-status"', html)
+        self.assertIn("supportedSubtitles(item)", render_source)
+        self.assertIn('label: "Off"', render_source)
+        self.assertIn("preferredSubtitleIndex(item, subtitles)", render_source)
+        self.assertIn("[selectedChoice, offChoice", render_source)
+        self.assertIn("rememberSubtitlePreference(item, index, subtitles)", select_source)
+        self.assertIn("persistSubtitleSelection(item, index)", select_source)
+
+    def test_opening_subtitle_dialog_hydrates_tracks_without_auto_searching(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index("async function openSubtitleDialog(item)")
+        end = source.index("async function downloadSubtitle", start)
+        dialog_source = source[start:end]
+
+        self.assertIn("renderAvailableSubtitles(item)", dialog_source)
+        self.assertIn("await hydrateItem(item)", dialog_source)
+        self.assertNotIn("searchSubtitles()", dialog_source)
 
 
 class EmbeddedSubtitleTests(unittest.TestCase):

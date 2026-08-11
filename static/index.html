@@ -272,22 +272,38 @@
     <dialog id="subtitle-dialog" class="subtitle-dialog">
       <header class="subtitle-head">
         <div>
-          <p>OpenSubtitles</p>
-          <h2>Find subtitles</h2>
+          <p>Subtitles</p>
+          <h2>Choose subtitles</h2>
         </div>
         <button id="subtitle-close" class="icon-button" aria-label="Close">x</button>
       </header>
-      <form id="subtitle-form" class="subtitle-form">
-        <select id="subtitle-language" aria-label="Language">
-          <option value="el">Greek</option>
-          <option value="en">English</option>
-          <option value="all">All languages</option>
-        </select>
-        <input id="subtitle-query" type="search" placeholder="Title or release" autocomplete="off" />
-        <button type="submit" class="primary-button">Search</button>
-      </form>
-      <div id="subtitle-status" class="subtitle-status" aria-live="polite"></div>
-      <section id="subtitle-results" class="subtitle-results" aria-live="polite"></section>
+      <section class="subtitle-available" aria-labelledby="subtitle-available-heading">
+        <div class="subtitle-section-heading">
+          <h3 id="subtitle-available-heading">Available subtitles</h3>
+          <span id="subtitle-saved-count" class="subtitle-count"></span>
+        </div>
+        <div id="subtitle-saved-status" class="subtitle-saved-status" aria-live="polite"></div>
+        <div id="subtitle-saved-list" class="subtitle-saved-list"></div>
+      </section>
+      <section class="subtitle-search" aria-labelledby="subtitle-search-heading">
+        <div class="subtitle-section-heading subtitle-search-heading">
+          <div>
+            <p>OpenSubtitles</p>
+            <h3 id="subtitle-search-heading">Find new subtitles</h3>
+          </div>
+        </div>
+        <form id="subtitle-form" class="subtitle-form">
+          <select id="subtitle-language" aria-label="Language">
+            <option value="el">Greek</option>
+            <option value="en">English</option>
+            <option value="all">All languages</option>
+          </select>
+          <input id="subtitle-query" type="search" placeholder="Title or release" autocomplete="off" />
+          <button type="submit" class="primary-button">Search</button>
+        </form>
+        <div id="subtitle-status" class="subtitle-status" aria-live="polite"></div>
+        <section id="subtitle-results" class="subtitle-results" aria-live="polite"></section>
+      </section>
     </dialog>
 
     <script src="/app.js?v=__APP_VERSION__" type="module"></script>
