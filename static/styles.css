@@ -275,6 +275,10 @@ select:focus-visible {
   border-color: var(--active-border);
 }
 
+.device-downloads-button {
+  border-color: var(--line);
+}
+
 .library-button span,
 .library-button small {
   display: block;
@@ -681,7 +685,9 @@ select:focus-visible {
 .collection-dialog,
 .collection-name-dialog,
 .player-dialog,
-.subtitle-dialog {
+.subtitle-dialog,
+.device-downloads-dialog,
+.device-downloads-confirm {
   width: min(900px, calc(100vw - 28px));
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -696,8 +702,230 @@ select:focus-visible {
 .collection-dialog::backdrop,
 .collection-name-dialog::backdrop,
 .player-dialog::backdrop,
-.subtitle-dialog::backdrop {
+.subtitle-dialog::backdrop,
+.device-downloads-dialog::backdrop,
+.device-downloads-confirm::backdrop {
   background: var(--backdrop);
+}
+
+.device-downloads-dialog {
+  width: min(760px, calc(100vw - 28px));
+  max-height: calc(100dvh - 28px);
+  overflow: hidden;
+}
+
+.device-downloads-dialog[open] {
+  display: grid;
+  grid-template-rows: auto auto auto auto minmax(120px, 1fr) auto;
+}
+
+.device-downloads-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.device-downloads-head p {
+  margin: 0 0 5px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.device-downloads-head h2 {
+  margin: 0;
+  font-size: 24px;
+  line-height: 1.1;
+}
+
+.device-storage-overview {
+  display: grid;
+  gap: 10px;
+  margin: 18px -16px 0;
+  padding: 14px 16px;
+  border-block: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+.device-storage-overview > div:first-child {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.device-storage-overview strong {
+  font-size: 16px;
+}
+
+.device-storage-overview span {
+  color: var(--muted);
+  font-size: 13px;
+  text-align: right;
+}
+
+.device-storage-meter {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--progress-track);
+}
+
+.device-storage-meter span {
+  display: block;
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-2);
+  transition: width 160ms ease;
+}
+
+.device-downloads-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-top: 14px;
+}
+
+.device-downloads-toolbar > div {
+  display: flex;
+  gap: 8px;
+}
+
+.device-downloads-toolbar button {
+  min-height: 38px;
+  padding: 0 13px;
+}
+
+.device-downloads-toolbar strong {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.device-downloads-status {
+  min-height: 24px;
+  padding-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.device-downloads-status[data-kind="error"] {
+  color: var(--danger);
+}
+
+.device-downloads-status[data-kind="success"] {
+  color: var(--accent-2);
+}
+
+.device-downloads-list {
+  min-height: 0;
+  overflow: auto;
+  border-block: 1px solid var(--line);
+}
+
+.device-download-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 70px;
+  padding: 10px 4px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.device-download-row:last-child {
+  border-bottom: 0;
+}
+
+.device-download-row:has(input:checked) {
+  background: var(--playback-background);
+}
+
+.device-download-row input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.device-download-copy {
+  min-width: 0;
+}
+
+.device-download-copy strong,
+.device-download-copy span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-download-copy strong {
+  font-size: 15px;
+}
+
+.device-download-copy span {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.device-download-size {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.device-downloads-empty {
+  margin: 0;
+  padding: 28px 4px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.device-downloads-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  padding-top: 14px;
+}
+
+.device-downloads-actions button {
+  min-height: 42px;
+}
+
+.device-downloads-confirm {
+  width: min(480px, calc(100vw - 28px));
+}
+
+.device-downloads-confirm h2 {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.15;
+}
+
+.device-downloads-confirm p {
+  margin: 14px 0 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.device-downloads-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.device-downloads-confirm-actions button {
+  min-width: 104px;
+  min-height: 42px;
 }
 
 .media-delete-dialog {
@@ -1634,6 +1862,34 @@ select:focus-visible {
   .library-button small {
     display: inline;
     margin: 0 0 0 6px;
+  }
+
+  .device-storage-overview > div:first-child {
+    display: grid;
+    gap: 4px;
+  }
+
+  .device-storage-overview span {
+    text-align: left;
+  }
+
+  .device-downloads-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .device-downloads-toolbar > div {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .device-download-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .device-download-size {
+    grid-column: 2;
+    font-size: 13px;
   }
 
   .sidebar-footer {

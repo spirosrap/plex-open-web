@@ -381,7 +381,7 @@ class PerformancePathTests(unittest.TestCase):
             handler.api_bootstrap("GET", {})
 
         self.assertEqual(200, responses[0][0])
-        self.assertEqual("0.25.2", responses[0][1]["version"])
+        self.assertEqual("0.26.0", responses[0][1]["version"])
         self.assertTrue(responses[0][1]["authenticated"])
         self.assertEqual(["101"], responses[0][1]["ratingKeys"])
         self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
@@ -397,7 +397,7 @@ class PerformancePathTests(unittest.TestCase):
 
         self.assertEqual(200, responses[0][0])
         self.assertFalse(responses[0][1]["authenticated"])
-        self.assertEqual("0.25.2", responses[0][1]["version"])
+        self.assertEqual("0.26.0", responses[0][1]["version"])
         self.assertEqual([], plex.xml_calls)
 
     def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
@@ -1530,6 +1530,49 @@ class SubtitleSelectionTests(unittest.TestCase):
         self.assertEqual(400, responses[0][0])
         self.assertEqual("subtitle_stream_not_found", responses[0][1]["error"])
         self.assertEqual([], plex.open_calls)
+
+
+class DeviceDownloadsDialogTests(unittest.TestCase):
+    def test_download_manager_exposes_storage_selection_and_confirmation_controls(self):
+        html = (server.ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        for element_id in (
+            "device-downloads",
+            "device-downloads-dialog",
+            "device-downloads-list",
+            "device-downloads-select-all",
+            "device-downloads-remove",
+            "device-downloads-confirm",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("navigator.storage?.estimate?.()", source)
+        self.assertIn("state.deviceDownloadSelection", source)
+        self.assertIn("confirmDeviceDownloadRemoval", source)
+        self.assertIn("Your Plex library, original media, and prepared server streams will not be changed.", source)
+
+    def test_offline_inventory_counts_actual_files_and_duplicate_generations(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index("async function deviceDownloadInventory()")
+        end = source.index("async function deviceStorageEstimate()", start)
+        inventory = source[start:end]
+
+        self.assertIn("groupDeviceCacheEntries(entries)", inventory)
+        self.assertIn("listDeviceRootFiles(root)", inventory)
+        self.assertIn("deviceFileBytes(root, name)", inventory)
+        self.assertIn('name.startsWith(`${id}-`)', inventory)
+        self.assertIn("sizes.reduce((total, size) => total + size, 0)", inventory)
+
+    def test_offline_save_and_delete_refresh_the_sidebar_summary(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        save_start = source.index("async function saveDevicePlayback")
+        save_end = source.index("function revokeDeviceObjectUrls", save_start)
+        delete_start = source.index("async function deleteDevicePlayback")
+        delete_end = source.index("function setDeviceDownloadsStatus", delete_start)
+
+        self.assertIn("await refreshDeviceDownloadsSummary()", source[save_start:save_end])
+        self.assertIn("deviceDownloadInventory()", source[delete_start:delete_end])
+        self.assertIn("await refreshDeviceDownloadsSummary()", source[delete_start:delete_end])
 
 
 class SubtitleDialogTests(unittest.TestCase):

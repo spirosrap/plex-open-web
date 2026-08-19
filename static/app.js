@@ -76,6 +76,12 @@ const state = {
   subtitleSelectionPromise: Promise.resolve(),
   deviceSaveInProgress: false,
   deviceObjectUrls: [],
+  deviceDownloads: [],
+  deviceDownloadSelection: new Set(),
+  deviceDownloadsLoading: false,
+  deviceDownloadsDeleting: false,
+  deviceDownloadsSummary: null,
+  deviceDownloadsStorage: null,
   subtitleItem: null,
   subtitleResults: [],
   subtitleDialogRequestId: 0,
@@ -131,6 +137,8 @@ const el = {
   loginTheme: document.querySelector("#login-theme"),
   password: document.querySelector("#password"),
   libraries: document.querySelector("#libraries"),
+  deviceDownloads: document.querySelector("#device-downloads"),
+  deviceDownloadsSummary: document.querySelector("#device-downloads-summary"),
   logout: document.querySelector("#logout"),
   appVersion: document.querySelector("#app-version"),
   appTheme: document.querySelector("#app-theme"),
@@ -167,6 +175,23 @@ const el = {
   detailsRefreshMetadata: document.querySelector("#details-refresh-metadata"),
   detailsDeleteMedia: document.querySelector("#details-delete-media"),
   detailsClose: document.querySelector("#details-close"),
+  deviceDownloadsDialog: document.querySelector("#device-downloads-dialog"),
+  deviceDownloadsClose: document.querySelector("#device-downloads-close"),
+  deviceDownloadsTotal: document.querySelector("#device-downloads-total"),
+  deviceDownloadsFree: document.querySelector("#device-downloads-free"),
+  deviceDownloadsMeter: document.querySelector("#device-downloads-meter"),
+  deviceDownloadsSelectAll: document.querySelector("#device-downloads-select-all"),
+  deviceDownloadsClear: document.querySelector("#device-downloads-clear"),
+  deviceDownloadsSelection: document.querySelector("#device-downloads-selection"),
+  deviceDownloadsStatus: document.querySelector("#device-downloads-status"),
+  deviceDownloadsList: document.querySelector("#device-downloads-list"),
+  deviceDownloadsDone: document.querySelector("#device-downloads-done"),
+  deviceDownloadsRemove: document.querySelector("#device-downloads-remove"),
+  deviceDownloadsConfirm: document.querySelector("#device-downloads-confirm"),
+  deviceDownloadsConfirmTitle: document.querySelector("#device-downloads-confirm-title"),
+  deviceDownloadsConfirmMessage: document.querySelector("#device-downloads-confirm-message"),
+  deviceDownloadsConfirmCancel: document.querySelector("#device-downloads-confirm-cancel"),
+  deviceDownloadsConfirmRemove: document.querySelector("#device-downloads-confirm-remove"),
   matchDialog: document.querySelector("#match-dialog"),
   matchTitle: document.querySelector("#match-title"),
   matchForm: document.querySelector("#match-form"),
@@ -409,6 +434,25 @@ function formatPlaybackPosition(timeMs) {
     : `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
+function formatBytes(bytes) {
+  const safeBytes = Math.max(0, Number(bytes) || 0);
+  if (safeBytes < 1024) return `${Math.round(safeBytes)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = safeBytes;
+  let unit = -1;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+}
+
+function formatSavedDate(savedAt) {
+  const timestamp = Number(savedAt) || 0;
+  if (!timestamp) return "Saved date unavailable";
+  return `Saved ${new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(timestamp)}`;
+}
+
 function progressPercent(item) {
   const durationMs = Number(item?.duration || item?.media?.duration || 0);
   const offsetMs = resumeTimeMsFor(item);
@@ -480,6 +524,8 @@ function renderLibraries() {
     button.addEventListener("click", () => selectLibrary(library.key));
     el.libraries.append(button);
   }
+  renderDeviceDownloadsButton();
+  el.libraries.append(el.deviceDownloads);
   updateScanButton();
   updateSurpriseButton();
 }
@@ -748,6 +794,7 @@ async function loadLibraries() {
   syncBrowseControls();
   persistBrowsePreferences();
   renderLibraries();
+  refreshDeviceDownloadsSummary().catch(() => {});
   if (!state.selectedLibrary) {
     renderItems([]);
     return true;
@@ -2532,9 +2579,151 @@ async function listDeviceCacheEntries(root = null) {
   return entries;
 }
 
+async function listDeviceRootFiles(root) {
+  const names = [];
+  for await (const [name, handle] of root.entries()) {
+    if (handle.kind === "file") names.push(name);
+  }
+  return names;
+}
+
+function deviceDownloadGroupKey(metadata) {
+  if (!metadata?.invalid && metadata?.ratingKey) return `rating:${metadata.ratingKey}`;
+  if (!metadata?.invalid && metadata?.id) return `id:${metadata.id}`;
+  return `metadata:${metadata?.metaFile || crypto.randomUUID()}`;
+}
+
+function groupDeviceCacheEntries(entries) {
+  const groups = new Map();
+  for (const metadata of entries) {
+    const key = deviceDownloadGroupKey(metadata);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(metadata);
+  }
+  return [...groups.entries()].map(([key, metadataEntries]) => {
+    metadataEntries.sort((a, b) => (
+      Number(Boolean(a.invalid)) - Number(Boolean(b.invalid))
+      || (Number(b.savedAt) || 0) - (Number(a.savedAt) || 0)
+    ));
+    const primary = metadataEntries[0];
+    return { key, primary, metadataEntries };
+  });
+}
+
+function deviceMetadataFileNames(metadata) {
+  const names = [metadata?.videoFile, metadata?.posterFile, metadata?.metaFile];
+  for (const subtitle of metadata?.subtitles || []) names.push(subtitle.file);
+  return names.filter(Boolean);
+}
+
+function deviceMetadataCacheIds(metadata) {
+  const ids = [];
+  if (metadata?.id) ids.push(String(metadata.id));
+  if (metadata?.metaFile?.endsWith(".json")) ids.push(metadata.metaFile.slice(0, -5));
+  return [...new Set(ids.filter(Boolean))];
+}
+
+async function deviceFileBytes(root, name) {
+  try {
+    return (await (await root.getFileHandle(name)).getFile()).size;
+  } catch (error) {
+    if (error?.name === "NotFoundError") return 0;
+    throw error;
+  }
+}
+
+async function deviceDownloadInventory() {
+  if (!deviceStorageSupported()) return [];
+  const root = await deviceStorageRoot();
+  const [entries, rootNames] = await Promise.all([
+    listDeviceCacheEntries(root),
+    listDeviceRootFiles(root),
+  ]);
+  const downloads = await Promise.all(groupDeviceCacheEntries(entries).map(async (group) => {
+    const names = new Set(group.metadataEntries.flatMap(deviceMetadataFileNames));
+    const cacheIds = group.metadataEntries.flatMap(deviceMetadataCacheIds);
+    for (const name of rootNames) {
+      if (cacheIds.some((id) => name === `${id}.json` || name.startsWith(`${id}-`) || name.startsWith(`${id}.tmp`))) {
+        names.add(name);
+      }
+    }
+    const fileNames = [...names];
+    const sizes = await Promise.all(fileNames.map((name) => deviceFileBytes(root, name)));
+    const sizeByName = new Map(fileNames.map((name, index) => [name, sizes[index]]));
+    const primary = group.primary;
+    const actualVideoBytes = sizeByName.get(primary?.videoFile) || 0;
+    const expectedVideoBytes = Number(primary?.videoBytes || 0);
+    return {
+      key: group.key,
+      ratingKey: primary?.ratingKey ? String(primary.ratingKey) : "",
+      title: primary?.title || "Damaged download record",
+      savedAt: Number(primary?.savedAt) || 0,
+      subtitleCount: Array.isArray(primary?.subtitles) ? primary.subtitles.length : 0,
+      bytes: sizes.reduce((total, size) => total + size, 0),
+      ready: !primary?.invalid
+        && actualVideoBytes > 0
+        && (!expectedVideoBytes || actualVideoBytes === expectedVideoBytes),
+      metadataEntries: group.metadataEntries,
+      fileNames,
+    };
+  }));
+  return downloads.sort((a, b) => b.savedAt - a.savedAt || a.title.localeCompare(b.title));
+}
+
+async function deviceStorageEstimate() {
+  try {
+    const estimate = await navigator.storage?.estimate?.();
+    const usage = Math.max(0, Number(estimate?.usage) || 0);
+    const quota = Math.max(0, Number(estimate?.quota) || 0);
+    return { usage, quota, available: Math.max(0, quota - usage) };
+  } catch {
+    return { usage: 0, quota: 0, available: 0 };
+  }
+}
+
+function renderDeviceDownloadsButton() {
+  if (!el.deviceDownloads) return;
+  const supported = deviceStorageSupported();
+  el.deviceDownloads.hidden = !supported;
+  el.deviceDownloads.dataset.active = el.deviceDownloadsDialog?.open ? "true" : "false";
+  if (!supported) return;
+  const summary = state.deviceDownloadsSummary;
+  if (!summary) {
+    el.deviceDownloadsSummary.textContent = "This browser";
+  } else if (summary.error) {
+    el.deviceDownloadsSummary.textContent = "Unavailable";
+  } else if (summary.count > 0) {
+    el.deviceDownloadsSummary.textContent = `${summary.count} saved - ${formatBytes(summary.bytes)}`;
+  } else {
+    el.deviceDownloadsSummary.textContent = "No saved titles";
+  }
+}
+
+async function refreshDeviceDownloadsSummary() {
+  if (!deviceStorageSupported()) {
+    state.deviceDownloadsSummary = null;
+    renderDeviceDownloadsButton();
+    return;
+  }
+  try {
+    const entries = await listDeviceCacheEntries();
+    const groups = groupDeviceCacheEntries(entries).filter(({ primary }) => !primary.invalid && primary.videoFile);
+    state.deviceDownloadsSummary = {
+      count: groups.length,
+      bytes: groups.reduce((total, { primary }) => total + Math.max(0, Number(primary.bytes) || 0), 0),
+    };
+  } catch (error) {
+    state.deviceDownloadsSummary = { count: 0, bytes: 0, error: error.message };
+  }
+  renderDeviceDownloadsButton();
+}
+
 async function deleteDeviceMetadataEntry(root, metadata) {
   if (metadata?.videoFile) {
     await removeDeviceEntry(root, metadata.videoFile);
+  }
+  if (metadata?.posterFile) {
+    await removeDeviceEntry(root, metadata.posterFile);
   }
   for (const subtitle of metadata?.subtitles || []) {
     if (subtitle.file) {
@@ -2716,6 +2905,7 @@ async function saveDevicePlayback(item = state.playerItem) {
     }
     await refreshDevicePlayback(item);
     updateDeviceControls(item);
+    await refreshDeviceDownloadsSummary();
     await switchToDevicePlayback(item);
   } catch (error) {
     if (!metadataCommitted) {
@@ -2792,12 +2982,191 @@ async function deleteDevicePlayback(item = state.playerItem) {
     revokeDeviceObjectUrls();
     loadPlayerSource(item, fallbackUrl, { resumeTime, autoplay });
   }
-  const metadata = await readDeviceMetadata(item);
-  const id = deviceCacheIdFor(item);
   const root = await deviceStorageRoot();
-  await deleteDeviceMetadataEntry(root, metadata || { metaFile: deviceMetaFileName(id) });
+  const downloads = await deviceDownloadInventory();
+  const matches = downloads.filter((download) => download.ratingKey === String(item.ratingKey));
+  if (matches.length) {
+    for (const download of matches) await deleteDeviceDownloadGroup(root, download);
+  } else {
+    const metadata = await readDeviceMetadata(item);
+    const id = deviceCacheIdFor(item);
+    await deleteDeviceMetadataEntry(root, metadata || { metaFile: deviceMetaFileName(id) });
+  }
   await refreshDevicePlayback(item);
   updateDeviceControls(item);
+  await refreshDeviceDownloadsSummary();
+}
+
+function setDeviceDownloadsStatus(message = "", kind = "") {
+  el.deviceDownloadsStatus.textContent = message;
+  el.deviceDownloadsStatus.dataset.kind = kind;
+}
+
+function selectedDeviceDownloads() {
+  return state.deviceDownloads.filter((download) => state.deviceDownloadSelection.has(download.key));
+}
+
+function renderDeviceDownloadSelection() {
+  const selected = selectedDeviceDownloads();
+  const selectedBytes = selected.reduce((total, download) => total + download.bytes, 0);
+  el.deviceDownloadsSelection.textContent = selected.length
+    ? `${selected.length} selected - ${formatBytes(selectedBytes)}`
+    : "0 selected";
+  el.deviceDownloadsRemove.textContent = selected.length ? `Remove ${selected.length}` : "Remove selected";
+  el.deviceDownloadsRemove.disabled = !selected.length || state.deviceDownloadsDeleting;
+  el.deviceDownloadsClear.disabled = !selected.length || state.deviceDownloadsDeleting;
+}
+
+function renderDeviceDownloads() {
+  const downloads = state.deviceDownloads;
+  const activeKeys = new Set(downloads.map((download) => download.key));
+  state.deviceDownloadSelection = new Set(
+    [...state.deviceDownloadSelection].filter((key) => activeKeys.has(key)),
+  );
+  const readyDownloads = downloads.filter((download) => download.ready);
+  const totalBytes = downloads.reduce((total, download) => total + download.bytes, 0);
+  const countLabel = `${readyDownloads.length} ${readyDownloads.length === 1 ? "download" : "downloads"}`;
+  el.deviceDownloadsTotal.textContent = `${countLabel} - ${formatBytes(totalBytes)} used`;
+  const storage = state.deviceDownloadsStorage;
+  el.deviceDownloadsFree.textContent = storage?.available > 0
+    ? `${formatBytes(storage.available)} available`
+    : "";
+  const storagePercent = storage?.quota > 0 ? Math.min(100, (storage.usage / storage.quota) * 100) : 0;
+  el.deviceDownloadsMeter.style.width = `${storagePercent.toFixed(1)}%`;
+  el.deviceDownloadsSelectAll.disabled = !downloads.length || state.deviceDownloadsDeleting;
+
+  if (!downloads.length) {
+    el.deviceDownloadsList.innerHTML = '<p class="device-downloads-empty">No offline downloads in this browser.</p>';
+    renderDeviceDownloadSelection();
+    return;
+  }
+
+  el.deviceDownloadsList.innerHTML = downloads.map((download) => {
+    const subtitleLabel = download.subtitleCount
+      ? `${download.subtitleCount} ${download.subtitleCount === 1 ? "subtitle" : "subtitles"}`
+      : "No saved subtitles";
+    const details = [
+      formatSavedDate(download.savedAt),
+      subtitleLabel,
+      download.ready ? "" : "Needs cleanup",
+    ].filter(Boolean).join(" - ");
+    return `
+      <label class="device-download-row">
+        <input type="checkbox" data-download-key="${escapeAttr(download.key)}" ${state.deviceDownloadSelection.has(download.key) ? "checked" : ""}>
+        <span class="device-download-copy">
+          <strong>${escapeHtml(download.title)}</strong>
+          <span>${escapeHtml(details)}</span>
+        </span>
+        <span class="device-download-size">${escapeHtml(formatBytes(download.bytes))}</span>
+      </label>
+    `;
+  }).join("");
+  renderDeviceDownloadSelection();
+}
+
+async function loadDeviceDownloads({ successMessage = "" } = {}) {
+  if (!deviceStorageSupported()) return;
+  state.deviceDownloadsLoading = true;
+  setDeviceDownloadsStatus("Checking browser storage...");
+  try {
+    const [downloads, storage] = await Promise.all([
+      deviceDownloadInventory(),
+      deviceStorageEstimate(),
+    ]);
+    state.deviceDownloads = downloads;
+    state.deviceDownloadsStorage = storage;
+    const readyDownloads = downloads.filter((download) => download.ready);
+    state.deviceDownloadsSummary = {
+      count: readyDownloads.length,
+      bytes: downloads.reduce((total, download) => total + download.bytes, 0),
+    };
+    renderDeviceDownloadsButton();
+    renderDeviceDownloads();
+    const incomplete = downloads.length - readyDownloads.length;
+    if (successMessage) {
+      setDeviceDownloadsStatus(successMessage, "success");
+    } else if (incomplete) {
+      setDeviceDownloadsStatus(`${incomplete} incomplete ${incomplete === 1 ? "entry is" : "entries are"} ready for cleanup.`);
+    } else {
+      setDeviceDownloadsStatus("");
+    }
+  } catch (error) {
+    state.deviceDownloads = [];
+    state.deviceDownloadsStorage = null;
+    state.deviceDownloadsSummary = { count: 0, bytes: 0, error: error.message };
+    renderDeviceDownloadsButton();
+    renderDeviceDownloads();
+    setDeviceDownloadsStatus(`Could not read offline downloads: ${error.message}`, "error");
+  } finally {
+    state.deviceDownloadsLoading = false;
+  }
+}
+
+async function openDeviceDownloads() {
+  if (!deviceStorageSupported()) return;
+  state.deviceDownloadSelection.clear();
+  state.deviceDownloads = [];
+  state.deviceDownloadsStorage = null;
+  renderDeviceDownloads();
+  renderDeviceDownloadsButton();
+  if (!el.deviceDownloadsDialog.open) el.deviceDownloadsDialog.showModal();
+  renderDeviceDownloadsButton();
+  await loadDeviceDownloads();
+}
+
+function confirmDeviceDownloadRemoval() {
+  const selected = selectedDeviceDownloads();
+  if (!selected.length || state.deviceDownloadsDeleting) return;
+  const bytes = selected.reduce((total, download) => total + download.bytes, 0);
+  const countLabel = selected.length === 1 ? "1 download" : `${selected.length} downloads`;
+  el.deviceDownloadsConfirmTitle.textContent = `Remove ${countLabel}?`;
+  el.deviceDownloadsConfirmMessage.textContent = `Delete ${formatBytes(bytes)} from this browser? The selected local videos, subtitles, and offline records will be removed. Your Plex library, original media, and prepared server streams will not be changed.`;
+  if (!el.deviceDownloadsConfirm.open) el.deviceDownloadsConfirm.showModal();
+}
+
+async function deleteDeviceDownloadGroup(root, download) {
+  const metadataNames = new Set(download.metadataEntries.map((metadata) => metadata.metaFile).filter(Boolean));
+  const assetNames = download.fileNames.filter((name) => !metadataNames.has(name));
+  for (const name of assetNames) await removeDeviceEntry(root, name);
+  for (const name of metadataNames) await removeDeviceEntry(root, name);
+}
+
+async function removeSelectedDeviceDownloads() {
+  const selected = selectedDeviceDownloads();
+  if (!selected.length || state.deviceDownloadsDeleting) return;
+  state.deviceDownloadsDeleting = true;
+  el.deviceDownloadsConfirmRemove.disabled = true;
+  el.deviceDownloadsConfirmRemove.textContent = "Removing";
+  renderDeviceDownloadSelection();
+  const root = await deviceStorageRoot();
+  let removed = 0;
+  const failedKeys = new Set();
+  for (const download of selected) {
+    try {
+      await deleteDeviceDownloadGroup(root, download);
+      removed += 1;
+    } catch {
+      failedKeys.add(download.key);
+    }
+  }
+  state.deviceDownloadSelection = failedKeys;
+  state.deviceDownloadsDeleting = false;
+  el.deviceDownloadsConfirmRemove.disabled = false;
+  el.deviceDownloadsConfirmRemove.textContent = "Remove";
+  el.deviceDownloadsConfirm.close();
+
+  if (state.playerItem?.ratingKey && selected.some(
+    (download) => download.ratingKey === String(state.playerItem.ratingKey) && !failedKeys.has(download.key),
+  )) {
+    await refreshDevicePlayback(state.playerItem);
+    updateDeviceControls(state.playerItem);
+  }
+  const failed = failedKeys.size;
+  const message = failed
+    ? `Removed ${removed}; ${failed} could not be removed.`
+    : `Removed ${removed} ${removed === 1 ? "download" : "downloads"}.`;
+  await loadDeviceDownloads({ successMessage: failed ? "" : message });
+  if (failed) setDeviceDownloadsStatus(message, "error");
 }
 
 function clearSubtitleTracks() {
@@ -4026,6 +4395,54 @@ el.logout.addEventListener("click", async () => {
 
 el.loginTheme.addEventListener("change", () => applyTheme(el.loginTheme.value));
 el.appTheme.addEventListener("change", () => applyTheme(el.appTheme.value));
+el.deviceDownloads.addEventListener("click", () => {
+  openDeviceDownloads().catch((error) => {
+    setStatus(`Could not open downloads: ${error.message}`, "error");
+  });
+});
+el.deviceDownloadsClose.addEventListener("click", () => el.deviceDownloadsDialog.close());
+el.deviceDownloadsDone.addEventListener("click", () => el.deviceDownloadsDialog.close());
+el.deviceDownloadsDialog.addEventListener("cancel", (event) => {
+  if (state.deviceDownloadsDeleting) event.preventDefault();
+});
+el.deviceDownloadsDialog.addEventListener("close", () => {
+  state.deviceDownloadSelection.clear();
+  if (el.deviceDownloadsConfirm.open) el.deviceDownloadsConfirm.close();
+  renderDeviceDownloadsButton();
+});
+el.deviceDownloadsList.addEventListener("change", (event) => {
+  const input = event.target.closest("input[data-download-key]");
+  if (!input) return;
+  if (input.checked) {
+    state.deviceDownloadSelection.add(input.dataset.downloadKey);
+  } else {
+    state.deviceDownloadSelection.delete(input.dataset.downloadKey);
+  }
+  renderDeviceDownloadSelection();
+});
+el.deviceDownloadsSelectAll.addEventListener("click", () => {
+  state.deviceDownloadSelection = new Set(state.deviceDownloads.map((download) => download.key));
+  renderDeviceDownloads();
+});
+el.deviceDownloadsClear.addEventListener("click", () => {
+  state.deviceDownloadSelection.clear();
+  renderDeviceDownloads();
+});
+el.deviceDownloadsRemove.addEventListener("click", confirmDeviceDownloadRemoval);
+el.deviceDownloadsConfirmCancel.addEventListener("click", () => el.deviceDownloadsConfirm.close());
+el.deviceDownloadsConfirm.addEventListener("cancel", (event) => {
+  if (state.deviceDownloadsDeleting) event.preventDefault();
+});
+el.deviceDownloadsConfirmRemove.addEventListener("click", () => {
+  removeSelectedDeviceDownloads().catch((error) => {
+    state.deviceDownloadsDeleting = false;
+    el.deviceDownloadsConfirmRemove.disabled = false;
+    el.deviceDownloadsConfirmRemove.textContent = "Remove";
+    if (el.deviceDownloadsConfirm.open) el.deviceDownloadsConfirm.close();
+    renderDeviceDownloadSelection();
+    setDeviceDownloadsStatus(`Could not remove downloads: ${error.message}`, "error");
+  });
+});
 
 el.searchForm.addEventListener("submit", async (event) => {
   event.preventDefault();

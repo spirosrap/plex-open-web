@@ -30,6 +30,7 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 - Optional OpenSubtitles search/download. Downloads are saved beside the video as Plex-style sidecar files and are immediately available in this player.
 - Original media download as a ZIP containing the untouched video file and available subtitles.
 - Persistent offline browser saves that are preferred before any remote stream and remain until explicitly deleted or browser storage is cleared.
+- Browser-local Downloads hub with saved-title counts, actual per-title sizes, available storage, multi-select cleanup, and confirmation before removal.
 - Seekable, subtitle-synchronized Plex VOD playback for Safari and Apple-device browsers when video or audio conversion is required.
 - Background-safe iPhone HLS playback that keeps an active Picture-in-Picture session alive through screen lock.
 - Codec-aware FFmpeg fallback that converts unsupported video such as HEVC to H.264 and unsupported audio such as AC3 to AAC.
@@ -43,6 +44,26 @@ This is meant to avoid Plex cloud remote-access/client limits by using your own 
 ## Release notes
 
 Release notes cover user-facing changes and intentionally omit deployment-specific and private details.
+
+### 0.26.0
+
+**Added**
+
+- Added a permanent Downloads entry in the sidebar for inspecting offline movies and episodes saved in the current browser.
+- Added a responsive storage manager with saved-title count, actual per-title size, saved date, subtitle count, browser space available, and a storage-usage meter.
+- Added multi-select, Select all, Clear, selected-size totals, and a separate confirmation window before local copies are removed.
+
+**Improved**
+
+- The Downloads count and storage total refresh immediately after an offline save or deletion without reloading the app.
+- Long download lists scroll independently while selection controls and removal actions stay visible on desktop and mobile.
+- Offline inventory now reconciles metadata with the actual browser-private files, including duplicate generations and interrupted-download leftovers.
+
+**Fixed**
+
+- Fixed deleting one browser-offline copy potentially leaving an older generation, subtitle, poster, or temporary cache artifact behind.
+- Failed cleanup now keeps its offline record available for another attempt instead of hiding files that were not fully removed.
+- Damaged offline records can now be identified and removed from one central storage view without changing Plex media or prepared server streams.
 
 ### 0.25.2
 
